@@ -55,8 +55,16 @@ pnpm --dir web build
 
 1. Branch off `main`. Prefix by intent: `feat/`, `fix/`, `chore/`, `docs/`.
 2. Commit in English. The message states **the problem being solved**, not the diff.
-3. Open a pull request. `main` is protected: it only takes merges through a PR
-   with green checks.
+3. Open a pull request. GitHub cannot protect `main` here — branch protection
+   and rulesets both require Pro on a private repository — so the guard is a
+   local hook that refuses a direct push. Enable it once per clone:
+
+   ```bash
+   git config core.hooksPath .githooks
+   ```
+
+   It is client-side and `--no-verify` bypasses it. It stops the accident, not
+   the decision.
 4. Review the branch before merging. Reviewing your own code works better when
    you read the diff cold, from the pull request, not from the editor you wrote it in.
 5. Squash or merge, then delete the branch.
