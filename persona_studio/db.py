@@ -11,6 +11,7 @@ blob de cette taille coûte plus qu'il ne rapporte (sauvegarde tout-ou-rien,
 espace non rendu sans VACUUM, lecture en mémoire au lieu d'un envoi direct).
 La table `image` ne porte que les métadonnées ; le fichier vit dans data/images/.
 """
+
 from __future__ import annotations
 
 import os
