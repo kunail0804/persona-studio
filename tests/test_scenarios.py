@@ -176,3 +176,61 @@ def test_delete_scenario_frees_orphan_images_referenced_by_a_character_portrait(
     assert shared_image_id in remaining
     assert not db.image_path(orphan_image_id).exists()
     assert db.image_path(shared_image_id).exists()
+
+
+def test_delete_orphan_images_spares_an_image_referenced_by_scenario_background(
+    client: TestClient,
+) -> None:
+    """`scenario.background` is a fourth reference point: an image id, `'portrait'`, or NULL.
+
+    Nothing writes it yet, but the cleanup must already treat a real image id
+    there as a live reference, or a later pull request that does write it
+    would have this cleanup delete images and files still in use.
+    """
+    scenario_to_delete = _create_scenario(client, "À supprimer")
+    other_scenario = _create_scenario(client, "Fond conservé")
+    sentinel_scenario = _create_scenario(client, "Fond = portrait")
+
+    orphan_image_id = uuid.uuid4().hex
+    background_image_id = uuid.uuid4().hex
+    now = time.time()
+
+    with db.connect() as con:
+        con.execute(
+            "INSERT INTO image (id, prompt, instruction, created_at) VALUES (?, '', '', ?)",
+            (orphan_image_id, now),
+        )
+        con.execute(
+            "INSERT INTO image (id, prompt, instruction, created_at) VALUES (?, '', '', ?)",
+            (background_image_id, now),
+        )
+        # `scenario_to_delete` references the first image through its own
+        # portrait; deleting it should free that image. `other_scenario`
+        # references the second only through `background`, and survives.
+        # `sentinel_scenario` uses the `'portrait'` string, which is not an
+        # image id and must not be treated as one.
+        con.execute(
+            "UPDATE scenario SET portrait_id = ? WHERE id = ?",
+            (orphan_image_id, scenario_to_delete["id"]),
+        )
+        con.execute(
+            "UPDATE scenario SET background = ? WHERE id = ?",
+            (background_image_id, other_scenario["id"]),
+        )
+        con.execute(
+            "UPDATE scenario SET background = 'portrait' WHERE id = ?",
+            (sentinel_scenario["id"],),
+        )
+
+    db.image_path(orphan_image_id).write_bytes(b"fake-png")
+    db.image_path(background_image_id).write_bytes(b"fake-png")
+
+    response = client.delete(f"/api/scenarios/{scenario_to_delete['id']}")
+    assert response.status_code == 204
+
+    with db.connect() as con:
+        remaining = {row["id"] for row in con.execute("SELECT id FROM image").fetchall()}
+    assert orphan_image_id not in remaining
+    assert background_image_id in remaining
+    assert not db.image_path(orphan_image_id).exists()
+    assert db.image_path(background_image_id).exists()
