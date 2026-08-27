@@ -69,6 +69,35 @@ pnpm --dir web build
    you read the diff cold, from the pull request, not from the editor you wrote it in.
 5. Squash or merge, then delete the branch.
 
+## Pull requests
+
+The body has two headings and nothing else:
+
+```markdown
+## Summary
+
+- short bullet points, each a problem solved rather than a file touched
+
+## Testing
+
+- concrete checks with their outcome, or "Not run" and why
+```
+
+`.github/pull_request_template.md` already carries that shape, so a pull request
+opened from the GitHub UI or by an agent starts from it. Its HTML comments are
+guidance and are meant to be deleted, not filled in.
+
+Keep the Conventional Commits prefix in the title — this repository uses them,
+so `chore:`, `feat:` and `fix:` belong there. A title should be specific: the
+problem, not the area it lives in.
+
+This convention is borrowed from T3 Code, which reads a repository's template
+when one exists — first match wins among `.github/pull_request_template.md`,
+`.github/PULL_REQUEST_TEMPLATE.md`, then the same two names at the root and
+under `docs/`, up to 8 000 bytes — and otherwise falls back to exactly these two
+sections. Ours sits at the first path it looks for, so the tool and the template
+agree instead of pulling in different directions.
+
 ## Ground rules
 
 - **Code and identifiers in English.** Comments and documentation in English too.
