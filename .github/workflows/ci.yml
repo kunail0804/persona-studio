@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Only one run per ref; superseded runs are cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format check
+        run: uv run ruff format --check .
+
+      - name: Type check
+        run: uv run mypy
+
+      # There are no tests yet. pytest exits 5 when it collects nothing, which
+      # would fail the job, so exit 5 is accepted here — and only exit 5.
+      # Remove this guard as soon as the first test lands.
+      - name: Tests
+        run: uv run pytest -q || [ $? -eq 5 ]
+
+  web:
+    name: Web
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          # The action looks for package.json at the repository root by default;
+          # ours lives in web/, and carries the pinned pnpm version.
+          package_json_file: web/package.json
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Type check
+        run: pnpm exec tsc -b --noEmit
+
+      - name: Build
+        run: pnpm build
+
+  # The `secrets` context is not available in a job-level `if`, so whether the
+  # token exists is resolved here and passed down as an output. Without this the
+  # scan job would report success while having skipped its only real step — a
+  # green check that analysed nothing.
+  sonar-token:
+    name: Sonar token
+    runs-on: ubuntu-latest
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - id: check
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: echo "configured=${SONAR_TOKEN:+true}" >> "$GITHUB_OUTPUT"
+
+  sonar:
+    name: SonarQube Cloud
+    runs-on: ubuntu-latest
+    needs: [python, web, sonar-token]
+    # Reads as "Skipped" in the checks list until the token is set, instead of
+    # a misleading pass.
+    if: needs.sonar-token.outputs.configured == 'true'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Sonar uses the history to attribute issues to their commit.
+          fetch-depth: 0
+
+      - name: Scan
+        uses: SonarSource/sonarqube-scan-action@v8.2.1
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

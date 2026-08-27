@@ -1,0 +1,33 @@
+name: Feature
+description: A capability the application should gain
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What it does
+      description: Describe the behaviour from the point of view of someone playing.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why it earns its place
+      description: What is worse without it. Skip the obvious.
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: Done when
+      description: Observable conditions, not a task list.
+      placeholder: |
+        - ...
+        - ...
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Constraints, prior art in the previous version, open questions.

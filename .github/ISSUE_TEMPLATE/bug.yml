@@ -1,0 +1,30 @@
+name: Bug
+description: Something behaves differently from what it should
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What should happen
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Log lines, the failing request, the value on screen. Paths welcome.

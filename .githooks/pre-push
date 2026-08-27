@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Refuse a direct push to main.
+#
+# GitHub cannot enforce this: branch protection and rulesets both require Pro on
+# a private repository. This hook is the local stand-in. It is client-side and
+# `--no-verify` bypasses it, so it stops the accident, not a decision.
+#
+# Enabled per clone with:  git config core.hooksPath .githooks
+
+protected="main"
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+    if [ "$remote_ref" = "refs/heads/$protected" ]; then
+        echo "pre-push: direct push to '$protected' refused." >&2
+        echo "Open a pull request instead, or pass --no-verify if you mean it." >&2
+        exit 1
+    fi
+done
+exit 0
