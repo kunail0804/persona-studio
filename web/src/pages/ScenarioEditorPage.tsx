@@ -36,11 +36,11 @@ export function ScenarioEditorPage() {
   const [confirmDeleteScenario, setConfirmDeleteScenario] = useState(false);
   const [confirmDeleteCharacterId, setConfirmDeleteCharacterId] = useState<number | null>(null);
 
-  const load = useCallback(async (scenarioId: string) => {
+  const load = useCallback(async (scenarioId: string, signal?: AbortSignal) => {
     try {
       const [scenarioData, characterData] = await Promise.all([
-        getScenario(scenarioId),
-        listCharacters(scenarioId),
+        getScenario(scenarioId, signal),
+        listCharacters(scenarioId, signal),
       ]);
       setScenario(scenarioData);
       setTitle(scenarioData.title);
@@ -48,12 +48,22 @@ export function ScenarioEditorPage() {
       setCharacters(characterData);
       setError(null);
     } catch (err) {
+      // A stale request aborted by the effect cleanup below, because `id`
+      // changed again before it resolved — not a real failure to report.
+      if (err instanceof DOMException && err.name === "AbortError") return;
       setError(messageFor(err, "Impossible de charger le scénario."));
     }
   }, []);
 
   useEffect(() => {
-    if (id) void load(id);
+    if (!id) return;
+    // Cancels the previous id's request when `id` changes again before it
+    // resolves, so a slow response for a scenario the player has since
+    // navigated away from can't overwrite the state of the one now showing.
+    const controller = new AbortController();
+    // oxlint-disable-next-line react/set-state-in-effect -- fetch-on-mount: load() sets state after an await, not synchronously in the effect body.
+    void load(id, controller.signal);
+    return () => controller.abort();
   }, [id, load]);
 
   if (!id) {

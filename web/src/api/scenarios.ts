@@ -50,8 +50,8 @@ export function listScenarios(): Promise<ScenarioSummary[]> {
   return request("/scenarios", parseScenarioList);
 }
 
-export function getScenario(id: string): Promise<Scenario> {
-  return request(`/scenarios/${id}`, parseScenario);
+export function getScenario(id: string, signal?: AbortSignal): Promise<Scenario> {
+  return request(`/scenarios/${id}`, parseScenario, { signal });
 }
 
 export function createScenario(input: ScenarioInput): Promise<Scenario> {

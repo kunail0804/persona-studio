@@ -25,6 +25,7 @@ export function ScenarioListPage() {
   }
 
   useEffect(() => {
+    // oxlint-disable-next-line react/set-state-in-effect -- fetch-on-mount: loadScenarios() sets state after an await, not synchronously in the effect body.
     void loadScenarios();
   }, []);
 

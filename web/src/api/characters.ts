@@ -41,8 +41,8 @@ function parseCharacterList(data: unknown): Character[] {
   return expectArray(data, "characters").map((item: unknown) => parseCharacter(item));
 }
 
-export function listCharacters(scenarioId: string): Promise<Character[]> {
-  return request(`/scenarios/${scenarioId}/characters`, parseCharacterList);
+export function listCharacters(scenarioId: string, signal?: AbortSignal): Promise<Character[]> {
+  return request(`/scenarios/${scenarioId}/characters`, parseCharacterList, { signal });
 }
 
 export function createCharacter(scenarioId: string, input: CharacterInput): Promise<Character> {
