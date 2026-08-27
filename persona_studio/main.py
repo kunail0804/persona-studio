@@ -34,17 +34,37 @@ def health() -> dict[str, object]:
     return {"status": "ok", "schema": version}
 
 
-# Le front construit par Vite est servi tel quel. En dev, on passe plutôt par
-# `pnpm dev` sur :5173, qui relaie /api vers ce serveur.
-if WEB_DIST.is_dir():
-    app.mount("/assets", StaticFiles(directory=WEB_DIST / "assets"), name="assets")
+def is_reserved_path(full_path: str) -> bool:
+    """True for anything under `/api` or `/assets`, including the bare prefix itself.
+
+    FastAPI's `path` converter strips the leading slash, so the bare prefixes
+    arrive as the literal strings `"api"` and `"assets"` rather than `"api/"`
+    and `"assets/"` — a `startswith` check alone misses them.
+    """
+    return full_path in ("api", "assets") or full_path.startswith(("api/", "assets/"))
+
+
+def register_spa_fallback(app: FastAPI, web_dist: Path) -> None:
+    """Serve the built SPA: static assets under `/assets`, everything else `index.html`.
+
+    Only call this when `web_dist` exists, so a checkout without a front-end
+    build (e.g. CI's `python` job, which never runs `pnpm build`) never mounts
+    a route pointed at a missing directory.
+    """
+    app.mount("/assets", StaticFiles(directory=web_dist / "assets"), name="assets")
 
     @app.get("/{full_path:path}")
     def spa(full_path: str) -> FileResponse:
         # React Router owns client-side routes like /scenarios/<id>; without
         # this, a hard refresh or a shared link 404s instead of loading the
-        # app. Requests under /api or /assets that reached this far matched
-        # no real route, so they stay 404s rather than getting index.html.
-        if full_path.startswith("api/") or full_path.startswith("assets/"):
+        # app. Anything under /api or /assets that reached this far matched
+        # no real route, so it stays a 404 rather than getting index.html.
+        if is_reserved_path(full_path):
             raise HTTPException(status_code=404, detail="Not found")
-        return FileResponse(WEB_DIST / "index.html")
+        return FileResponse(web_dist / "index.html")
+
+
+# Le front construit par Vite est servi tel quel. En dev, on passe plutôt par
+# `pnpm dev` sur :5173, qui relaie /api vers ce serveur.
+if WEB_DIST.is_dir():
+    register_spa_fallback(app, WEB_DIST)
