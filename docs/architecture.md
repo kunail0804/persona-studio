@@ -6,8 +6,8 @@ reasoning below is what stays true, so this document records **why**, not what.
 ## What it is
 
 A local, single-user application for illustrated roleplay. A local LLM narrates
-and voices every character while you play the protagonist; a local image
-pipeline draws the scenes on demand. Nothing leaves the machine.
+and voices every character while the player takes the protagonist; a local
+image pipeline draws the scenes on demand. Nothing leaves the machine.
 
 ## Shape
 
