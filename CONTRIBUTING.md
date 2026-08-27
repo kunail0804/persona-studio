@@ -1,7 +1,8 @@
 # Contributing
 
-Private, single-developer project. These notes exist so a version of me six
-months from now can pick the work back up without rereading the source.
+Private, single-developer project, worked on with agents. These notes exist so
+that picking the work back up — months later, or by an agent that has never seen
+it — does not require reading the source first.
 
 ## Requirements
 
@@ -65,8 +66,10 @@ pnpm --dir web build
 
    It is client-side and `--no-verify` bypasses it. It stops the accident, not
    the decision.
-4. Review the branch before merging. Reviewing your own code works better when
-   you read the diff cold, from the pull request, not from the editor you wrote it in.
+4. Review the branch before merging, reading the diff cold from the pull
+   request rather than from the editor it was written in. An agent that did not
+   write the change is better placed for this than the one that did, so hand the
+   review to a fresh one where possible.
 5. Squash or merge, then delete the branch.
 
 ## Pull requests
