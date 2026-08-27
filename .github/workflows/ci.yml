@@ -33,11 +33,18 @@ jobs:
       - name: Type check
         run: uv run mypy
 
-      # There are no tests yet. pytest exits 5 when it collects nothing, which
-      # would fail the job, so exit 5 is accepted here — and only exit 5.
-      # Remove this guard as soon as the first test lands.
       - name: Tests
-        run: uv run pytest -q || [ $? -eq 5 ]
+        run: uv run pytest -q --cov --cov-report=xml
+
+      # The `sonar` job runs on its own runner, a separate machine with no
+      # access to this job's filesystem, so the report has to travel as an
+      # artifact rather than just sitting on disk for the scan step to read.
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          retention-days: 1
 
   web:
     name: Web
@@ -99,6 +106,11 @@ jobs:
         with:
           # Sonar uses the history to attribute issues to their commit.
           fetch-depth: 0
+
+      - name: Download coverage report
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-xml
 
       - name: Scan
         uses: SonarSource/sonarqube-scan-action@v8.2.1
