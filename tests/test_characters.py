@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -135,3 +136,27 @@ def test_removing_a_character_keeps_positions_contiguous(client: TestClient) -> 
     remaining = response.json()
     assert [row["name"] for row in remaining] == ["Bob", "Charlie"]
     assert [row["position"] for row in remaining] == [0, 1]
+
+
+def test_concurrent_creation_produces_contiguous_positions(client: TestClient) -> None:
+    """Eight requests racing for the same scenario must not read the same MAX(position) twice.
+
+    The read-then-insert version of `create_character` let two concurrent
+    requests see the same `MAX(position)` before either had written, handing
+    out duplicate positions instead of a contiguous run.
+    """
+    scenario = _create_scenario(client)
+
+    def create(_: int) -> int:
+        response = client.post(
+            f"/api/scenarios/{scenario['id']}/characters",
+            json={**CHARACTER_FIELDS, "name": "Racer"},
+        )
+        assert response.status_code == 201
+        position: int = response.json()["position"]
+        return position
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        positions = list(pool.map(create, range(8)))
+
+    assert sorted(positions) == list(range(8))

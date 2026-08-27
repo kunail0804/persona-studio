@@ -100,30 +100,36 @@ def list_characters(scenario_id: str) -> list[Character]:
 def create_character(scenario_id: str, body: CharacterInput) -> Character:
     with db.connect() as con:
         _require_scenario(con, scenario_id)
-        next_position = con.execute(
-            "SELECT COALESCE(MAX(position) + 1, 0) FROM character WHERE scenario_id = ?",
-            (scenario_id,),
-        ).fetchone()[0]
+        # The position is computed inside the INSERT itself, as a correlated
+        # subquery, so the read and the write are one statement under one
+        # write lock. A separate SELECT beforehand would let two concurrent
+        # requests both read the same MAX(position) before either had
+        # written, handing out duplicate positions.
         cursor = con.execute(
             """
             INSERT INTO character
                 (scenario_id, position, name, appearance, personality,
                  story, relationships, secrets)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (
+                :scenario_id,
+                (SELECT COALESCE(MAX(position) + 1, 0)
+                 FROM character WHERE scenario_id = :scenario_id),
+                :name, :appearance, :personality, :story, :relationships, :secrets
+            )
             """,
-            (
-                scenario_id,
-                next_position,
-                body.name,
-                body.appearance,
-                body.personality,
-                body.story,
-                body.relationships,
-                body.secrets,
-            ),
+            {
+                "scenario_id": scenario_id,
+                "name": body.name,
+                "appearance": body.appearance,
+                "personality": body.personality,
+                "story": body.story,
+                "relationships": body.relationships,
+                "secrets": body.secrets,
+            },
         )
         character_id = cursor.lastrowid
-        assert character_id is not None  # AUTOINCREMENT-less INTEGER PRIMARY KEY always sets it
+        if character_id is None:
+            raise HTTPException(status_code=500, detail="Character insert did not return an id")
         row = con.execute("SELECT * FROM character WHERE id = ?", (character_id,)).fetchone()
     return _character_from_row(row)
 
