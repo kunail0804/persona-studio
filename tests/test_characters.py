@@ -106,6 +106,21 @@ def test_reorder_rejects_an_order_that_is_not_a_permutation(client: TestClient) 
     assert response.status_code == 400
 
 
+def test_reorder_rejects_a_repeated_id(client: TestClient) -> None:
+    scenario = _create_scenario(client)
+    id_a = _create_character(client, scenario["id"], "Alice")["id"]
+    id_b = _create_character(client, scenario["id"], "Bob")["id"]
+
+    # `id_a` appears twice and the set of ids still matches — a set comparison
+    # alone would accept this, even though it is not "once each" as the
+    # route's own error message promises.
+    response = client.put(
+        f"/api/scenarios/{scenario['id']}/characters/order",
+        json={"order": [id_a, id_a, id_b]},
+    )
+    assert response.status_code == 400
+
+
 def test_removing_a_character_keeps_positions_contiguous(client: TestClient) -> None:
     scenario = _create_scenario(client)
     ids = [

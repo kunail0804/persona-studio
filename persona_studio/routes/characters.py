@@ -141,7 +141,9 @@ def reorder_characters(scenario_id: str, body: CharacterOrder) -> list[Character
                 "SELECT id FROM character WHERE scenario_id = ?", (scenario_id,)
             ).fetchall()
         }
-        if set(body.order) != existing_ids:
+        # A set comparison alone accepts a repeated id as long as the set of
+        # distinct ids still matches — the length check catches that case.
+        if len(body.order) != len(existing_ids) or set(body.order) != existing_ids:
             raise HTTPException(
                 status_code=400,
                 detail="The order must list exactly the scenario's current characters, once each",
