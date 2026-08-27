@@ -72,20 +72,35 @@ jobs:
       - name: Build
         run: pnpm build
 
+  # The `secrets` context is not available in a job-level `if`, so whether the
+  # token exists is resolved here and passed down as an output. Without this the
+  # scan job would report success while having skipped its only real step — a
+  # green check that analysed nothing.
+  sonar-token:
+    name: Sonar token
+    runs-on: ubuntu-latest
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - id: check
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: echo "configured=${SONAR_TOKEN:+true}" >> "$GITHUB_OUTPUT"
+
   sonar:
     name: SonarQube Cloud
     runs-on: ubuntu-latest
-    needs: [python, web]
+    needs: [python, web, sonar-token]
+    # Reads as "Skipped" in the checks list until the token is set, instead of
+    # a misleading pass.
+    if: needs.sonar-token.outputs.configured == 'true'
     steps:
       - uses: actions/checkout@v7
         with:
           # Sonar uses the history to attribute issues to their commit.
           fetch-depth: 0
 
-      # Skipped until SONAR_TOKEN exists on the repository, so a fork or a
-      # fresh clone does not fail on a missing secret.
       - name: Scan
-        if: env.SONAR_TOKEN != ''
-        uses: SonarSource/sonarqube-scan-action@v8
+        uses: SonarSource/sonarqube-scan-action@v8.2.1
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
