@@ -33,11 +33,8 @@ jobs:
       - name: Type check
         run: uv run mypy
 
-      # There are no tests yet. pytest exits 5 when it collects nothing, which
-      # would fail the job, so exit 5 is accepted here — and only exit 5.
-      # Remove this guard as soon as the first test lands.
       - name: Tests
-        run: uv run pytest -q || [ $? -eq 5 ]
+        run: uv run pytest -q
 
   web:
     name: Web

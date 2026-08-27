@@ -45,7 +45,7 @@ Run what CI runs, before opening a pull request:
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy
-uv run pytest -q          # exit code 5 is expected while there are no tests
+uv run pytest -q
 
 pnpm --dir web lint
 pnpm --dir web exec tsc -b --noEmit

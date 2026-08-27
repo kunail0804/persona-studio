@@ -240,5 +240,5 @@ def migrate() -> int:
         con.close()
 
 
-def image_path(image_id: str):
+def image_path(image_id: str) -> Path:
     return IMAGES_DIR / f"{image_id}.png"
