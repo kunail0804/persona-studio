@@ -118,3 +118,61 @@ def test_delete_scenario_frees_orphan_images_and_their_files(client: TestClient)
     assert shared_image_id in remaining
     assert not db.image_path(orphan_image_id).exists()
     assert db.image_path(shared_image_id).exists()
+
+
+def test_delete_scenario_frees_orphan_images_referenced_by_a_character_portrait(
+    client: TestClient,
+) -> None:
+    """The `character.portrait_id` branch of the orphan cleanup, exercised on its own.
+
+    A reviewer once deleted the `character.portrait_id` clause from
+    `delete_orphan_images` and the whole suite still passed, because every
+    existing test only ever populated `scenario.portrait_id`.
+    """
+    scenario = _create_scenario(client, "À supprimer")
+    other_scenario = _create_scenario(client, "À garder")
+
+    orphan_image_id = uuid.uuid4().hex
+    shared_image_id = uuid.uuid4().hex
+    now = time.time()
+
+    character = client.post(
+        f"/api/scenarios/{scenario['id']}/characters", json={"name": "Alice"}
+    ).json()
+    other_character = client.post(
+        f"/api/scenarios/{other_scenario['id']}/characters", json={"name": "Bob"}
+    ).json()
+
+    with db.connect() as con:
+        con.execute(
+            "INSERT INTO image (id, prompt, instruction, created_at) VALUES (?, '', '', ?)",
+            (orphan_image_id, now),
+        )
+        con.execute(
+            "INSERT INTO image (id, prompt, instruction, created_at) VALUES (?, '', '', ?)",
+            (shared_image_id, now),
+        )
+        # Only `character`, in the scenario about to be deleted, points at the
+        # first image. The second is pointed at by `other_character`, whose
+        # scenario survives the deletion below.
+        con.execute(
+            "UPDATE character SET portrait_id = ? WHERE id = ?",
+            (orphan_image_id, character["id"]),
+        )
+        con.execute(
+            "UPDATE character SET portrait_id = ? WHERE id = ?",
+            (shared_image_id, other_character["id"]),
+        )
+
+    db.image_path(orphan_image_id).write_bytes(b"fake-png")
+    db.image_path(shared_image_id).write_bytes(b"fake-png")
+
+    response = client.delete(f"/api/scenarios/{scenario['id']}")
+    assert response.status_code == 204
+
+    with db.connect() as con:
+        remaining = {row["id"] for row in con.execute("SELECT id FROM image").fetchall()}
+    assert orphan_image_id not in remaining
+    assert shared_image_id in remaining
+    assert not db.image_path(orphan_image_id).exists()
+    assert db.image_path(shared_image_id).exists()
