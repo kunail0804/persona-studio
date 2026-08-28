@@ -39,6 +39,9 @@ def test_defaults_when_nothing_is_stored(client: TestClient, installed_models) -
     assert body["num_ctx"] == settings.DEFAULT_NUM_CTX
     assert body["min_num_ctx"] == settings.MIN_NUM_CTX
     assert body["max_num_ctx"] == settings.MAX_NUM_CTX
+    assert body["history_window"] == settings.DEFAULT_HISTORY_WINDOW
+    assert body["min_history_window"] == settings.MIN_HISTORY_WINDOW
+    assert body["max_history_window"] == settings.MAX_HISTORY_WINDOW
     assert body["model_missing"] is False
     assert body["installed_models"] == ["qwen38-27b:Q6_K_XL"]
     assert body["ollama_error"] is None
@@ -55,16 +58,22 @@ def test_malformed_stored_settings_fall_back_to_defaults(
         con.execute(
             "INSERT INTO setting (key, value) VALUES (?, ?)", (settings.LLM_MODEL_KEY, "[1, 2]")
         )
+        con.execute(
+            "INSERT INTO setting (key, value) VALUES (?, ?)",
+            (settings.HISTORY_WINDOW_KEY, "not-json{"),
+        )
 
     body = client.get("/api/settings/llm").json()
     assert body["num_ctx"] == settings.DEFAULT_NUM_CTX
+    assert body["history_window"] == settings.DEFAULT_HISTORY_WINDOW
     assert body["model"] is None
 
 
-def test_stored_json_true_for_num_ctx_falls_back_to_the_default(
-    client: TestClient, installed_models
-) -> None:
-    """`bool` is a subclass of `int`: `True` must fall back, not pass for 1."""
+def test_stored_json_true_falls_back_to_the_default(client: TestClient, installed_models) -> None:
+    """`bool` is a subclass of `int`: `True` must fall back, not pass for 1.
+
+    Both bounded settings share one validator, so both get the guard.
+    """
     installed_models(["a:latest"])
     with db.connect() as con:
         con.execute(
@@ -74,20 +83,34 @@ def test_stored_json_true_for_num_ctx_falls_back_to_the_default(
     body = client.get("/api/settings/llm").json()
     assert body["num_ctx"] == settings.DEFAULT_NUM_CTX
 
+    with db.connect() as con:
+        con.execute("DELETE FROM setting WHERE key = ?", (settings.NUM_CTX_KEY,))
+        con.execute(
+            "INSERT INTO setting (key, value) VALUES (?, ?)",
+            (settings.HISTORY_WINDOW_KEY, "true"),
+        )
+
+    body = client.get("/api/settings/llm").json()
+    assert body["history_window"] == settings.DEFAULT_HISTORY_WINDOW
+
 
 def test_storing_and_reading_settings(client: TestClient, installed_models) -> None:
     installed_models(["qwen38-27b:Q6_K_XL"])
 
     response = client.put(
-        "/api/settings/llm", json={"model": "qwen38-27b:Q6_K_XL", "num_ctx": 16384}
+        "/api/settings/llm",
+        json={"model": "qwen38-27b:Q6_K_XL", "num_ctx": 16384, "history_window": 50},
     )
     assert response.status_code == 200
     body = response.json()
     assert body["model"] == "qwen38-27b:Q6_K_XL"
     assert body["num_ctx"] == 16384
+    assert body["history_window"] == 50
     assert body["model_missing"] is False
 
-    assert client.get("/api/settings/llm").json()["num_ctx"] == 16384
+    read_back = client.get("/api/settings/llm").json()
+    assert read_back["num_ctx"] == 16384
+    assert read_back["history_window"] == 50
 
 
 def test_clearing_the_model_removes_the_stored_value(client: TestClient, installed_models) -> None:
@@ -95,7 +118,9 @@ def test_clearing_the_model_removes_the_stored_value(client: TestClient, install
     with db.connect() as con:
         settings.set_llm_model(con, "a:latest")
 
-    response = client.put("/api/settings/llm", json={"model": None, "num_ctx": 8192})
+    response = client.put(
+        "/api/settings/llm", json={"model": None, "num_ctx": 8192, "history_window": 20}
+    )
     assert response.status_code == 200
     assert response.json()["model"] is None
     with db.connect() as con:
@@ -108,7 +133,20 @@ def test_rejects_a_num_ctx_outside_the_accepted_bounds(
 ) -> None:
     installed_models(["a:latest"])
     for num_ctx in [0, 100, settings.MAX_NUM_CTX + 1]:
-        response = client.put("/api/settings/llm", json={"model": None, "num_ctx": num_ctx})
+        response = client.put(
+            "/api/settings/llm", json={"model": None, "num_ctx": num_ctx, "history_window": 20}
+        )
+        assert response.status_code == 422
+
+
+def test_rejects_a_history_window_outside_the_accepted_bounds(
+    client: TestClient, installed_models
+) -> None:
+    installed_models(["a:latest"])
+    for window in [0, 1, settings.MAX_HISTORY_WINDOW + 1]:
+        response = client.put(
+            "/api/settings/llm", json={"model": None, "num_ctx": 8192, "history_window": window}
+        )
         assert response.status_code == 422
 
 
@@ -148,7 +186,9 @@ def test_unreachable_ollama_reports_the_real_error_and_keeps_the_setting(
 
     # A save must not fail, and must not empty the stored model, when Ollama
     # is down.
-    response = client.put("/api/settings/llm", json={"model": "kept:latest", "num_ctx": 8192})
+    response = client.put(
+        "/api/settings/llm", json={"model": "kept:latest", "num_ctx": 8192, "history_window": 20}
+    )
     assert response.status_code == 200
     assert response.json()["model"] == "kept:latest"
     with db.connect() as con:

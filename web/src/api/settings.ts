@@ -4,9 +4,12 @@ import { expectArray, expectBoolean, expectInteger, expectString, isRecord } fro
 export interface LlmSettings {
   model: string | null;
   numCtx: number;
+  historyWindow: number;
   /** Bounds the backend enforces on write; the page reads them, never copies them. */
   minNumCtx: number;
   maxNumCtx: number;
+  minHistoryWindow: number;
+  maxHistoryWindow: number;
   /** null when Ollama could not be asked — "not installed" is then unknown. */
   installedModels: string[] | null;
   modelMissing: boolean | null;
@@ -16,6 +19,7 @@ export interface LlmSettings {
 export interface LlmSettingsInput {
   model: string | null;
   numCtx: number;
+  historyWindow: number;
 }
 
 function parseLlmSettings(data: unknown): LlmSettings {
@@ -24,8 +28,11 @@ function parseLlmSettings(data: unknown): LlmSettings {
   return {
     model: data.model === null ? null : expectString(data.model, "model"),
     numCtx: expectInteger(data.num_ctx, "num_ctx"),
+    historyWindow: expectInteger(data.history_window, "history_window"),
     minNumCtx: expectInteger(data.min_num_ctx, "min_num_ctx"),
     maxNumCtx: expectInteger(data.max_num_ctx, "max_num_ctx"),
+    minHistoryWindow: expectInteger(data.min_history_window, "min_history_window"),
+    maxHistoryWindow: expectInteger(data.max_history_window, "max_history_window"),
     installedModels:
       installed === null
         ? null
@@ -45,6 +52,10 @@ export function getLlmSettings(signal?: AbortSignal): Promise<LlmSettings> {
 export function updateLlmSettings(input: LlmSettingsInput): Promise<LlmSettings> {
   return request("/settings/llm", parseLlmSettings, {
     method: "PUT",
-    body: JSON.stringify({ model: input.model, num_ctx: input.numCtx }),
+    body: JSON.stringify({
+      model: input.model,
+      num_ctx: input.numCtx,
+      history_window: input.historyWindow,
+    }),
   });
 }

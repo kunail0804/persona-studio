@@ -13,6 +13,11 @@ function messageFor(error: unknown, fallback: string): string {
   return error instanceof ApiError ? error.detail : fallback;
 }
 
+function parseBoundedInt(value: string, min: number, max: number): number | null {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= min && parsed <= max ? parsed : null;
+}
+
 export function SettingsPage() {
   const [personas, setPersonas] = useState<Persona[]>([]);
   const [llm, setLlm] = useState<LlmSettings | null>(null);
@@ -23,6 +28,7 @@ export function SettingsPage() {
 
   const [model, setModel] = useState<string | null>(null);
   const [numCtx, setNumCtx] = useState("");
+  const [historyWindow, setHistoryWindow] = useState("");
   const [savingLlm, setSavingLlm] = useState(false);
 
   const load = useCallback(async (signal?: AbortSignal) => {
@@ -32,6 +38,7 @@ export function SettingsPage() {
       setLlm(llmData);
       setModel(llmData.model);
       setNumCtx(String(llmData.numCtx));
+      setHistoryWindow(String(llmData.historyWindow));
       setError(null);
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") return;
@@ -92,19 +99,29 @@ export function SettingsPage() {
 
   async function handleSaveLlm() {
     if (!llm) return;
-    const parsed = Number(numCtx);
-    if (!Number.isInteger(parsed) || parsed < llm.minNumCtx || parsed > llm.maxNumCtx) {
+    const parsedNumCtx = parseBoundedInt(numCtx, llm.minNumCtx, llm.maxNumCtx);
+    const parsedHistoryWindow = parseBoundedInt(
+      historyWindow,
+      llm.minHistoryWindow,
+      llm.maxHistoryWindow,
+    );
+    if (parsedNumCtx === null || parsedHistoryWindow === null) {
       setError(
-        `La fenêtre de contexte doit être un nombre entier entre ${llm.minNumCtx} et ${llm.maxNumCtx.toLocaleString("fr-FR")}.`,
+        `La fenêtre de contexte doit être un nombre entier entre ${llm.minNumCtx} et ${llm.maxNumCtx}, et la fenêtre d'historique un nombre entier entre ${llm.minHistoryWindow} et ${llm.maxHistoryWindow}.`,
       );
       return;
     }
     try {
       setSavingLlm(true);
-      const updated = await updateLlmSettings({ model, numCtx: parsed });
+      const updated = await updateLlmSettings({
+        model,
+        numCtx: parsedNumCtx,
+        historyWindow: parsedHistoryWindow,
+      });
       setLlm(updated);
       setModel(updated.model);
       setNumCtx(String(updated.numCtx));
+      setHistoryWindow(String(updated.historyWindow));
       setError(null);
     } catch (err) {
       setError(messageFor(err, "Impossible d'enregistrer les paramètres."));
@@ -199,6 +216,14 @@ export function SettingsPage() {
           type="number"
           value={numCtx}
           onChange={(event) => setNumCtx(event.target.value)}
+        />
+
+        <TextField
+          label="Fenêtre d'historique (messages)"
+          hint="Seuls les messages les plus récents sont envoyés au narrateur à chaque tour."
+          type="number"
+          value={historyWindow}
+          onChange={(event) => setHistoryWindow(event.target.value)}
         />
 
         <div className="flex justify-end">
