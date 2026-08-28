@@ -318,10 +318,16 @@ def load_active_persona(con: sqlite3.Connection) -> PromptPersona | None:
 def load_history(con: sqlite3.Connection, instance_id: str, window: int) -> list[HistoryMessage]:
     """The last `window` text messages of a party, oldest first.
 
+    Raises ValueError when the window is below 1: SQLite reads a non-positive
+    LIMIT as no limit at all, so clamping would silently return the entire
+    history. A bad window is a caller bug to surface, not input to forgive.
+
     `kind = 'text'` in the WHERE clause is the single place that keeps image
     messages away from the narrator; the pure functions must not repeat the
     guard.
     """
+    if window < 1:
+        raise ValueError(f"History window must be at least 1, got {window}")
     rows = con.execute(
         "SELECT id, role, content, ooc FROM message "
         "WHERE instance_id = ? AND kind = 'text' "

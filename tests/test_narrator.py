@@ -307,6 +307,22 @@ def test_window_returns_the_last_messages_oldest_first(connection: sqlite3.Conne
     assert messages[0].ooc is False
 
 
+@pytest.mark.parametrize("window", [0, -1])
+def test_load_history_rejects_a_window_below_one(
+    connection: sqlite3.Connection, window: int
+) -> None:
+    """A non-positive window is a caller bug: raise naming the value, never clamp.
+
+    SQLite reads a negative LIMIT as no limit at all, so an unguarded window
+    would silently return the entire history.
+    """
+    instance_id = _new_instance(connection)
+    specs = [("user" if i % 2 == 0 else "assistant", "text", f"m{i}", 0) for i in range(30)]
+    _insert_messages(connection, instance_id, specs)
+    with pytest.raises(ValueError, match=str(window)):
+        load_history(connection, instance_id, window)
+
+
 def test_image_messages_never_reach_the_narrator(connection: sqlite3.Connection) -> None:
     instance_id = _new_instance(connection)
     specs = [
