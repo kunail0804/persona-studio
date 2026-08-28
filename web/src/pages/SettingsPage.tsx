@@ -107,7 +107,7 @@ export function SettingsPage() {
     );
     if (parsedNumCtx === null || parsedHistoryWindow === null) {
       setError(
-        `La fenêtre de contexte doit être un nombre entier entre ${llm.minNumCtx} et ${llm.maxNumCtx}, et la fenêtre d'historique un nombre entier entre ${llm.minHistoryWindow} et ${llm.maxHistoryWindow}.`,
+        `La fenêtre de contexte doit être un nombre entier entre ${llm.minNumCtx} et ${llm.maxNumCtx.toLocaleString("fr-FR")}, et la fenêtre d'historique un nombre entier entre ${llm.minHistoryWindow} et ${llm.maxHistoryWindow.toLocaleString("fr-FR")}.`,
       );
       return;
     }
