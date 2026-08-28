@@ -11,7 +11,12 @@ from persona_studio import db, ollama, settings
 
 
 @pytest.fixture(autouse=True)
-def _clean_settings():
+def _clean_settings(client: TestClient) -> None:
+    """The setting table is global state in the shared test database.
+
+    Depends on `client` so the app's startup migration has run first — the
+    tables must exist even when this file runs alone.
+    """
     with db.connect() as con:
         con.execute("DELETE FROM setting")
 
