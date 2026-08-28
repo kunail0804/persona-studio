@@ -9,12 +9,6 @@ import { ConfirmDialog } from "../components/ConfirmDialog";
 import { PersonaForm } from "../components/PersonaForm";
 import { TextField } from "../components/TextField";
 
-// Mirrors the bounds the backend accepts; it stays the authority via its 422s.
-const MIN_NUM_CTX = 512;
-const MAX_NUM_CTX = 1_048_576;
-
-const NUM_CTX_MESSAGE = `La fenêtre de contexte doit être un nombre entier entre ${MIN_NUM_CTX} et ${MAX_NUM_CTX.toLocaleString("fr-FR")}.`;
-
 function messageFor(error: unknown, fallback: string): string {
   return error instanceof ApiError ? error.detail : fallback;
 }
@@ -97,9 +91,12 @@ export function SettingsPage() {
   }
 
   async function handleSaveLlm() {
+    if (!llm) return;
     const parsed = Number(numCtx);
-    if (!Number.isInteger(parsed) || parsed < MIN_NUM_CTX || parsed > MAX_NUM_CTX) {
-      setError(NUM_CTX_MESSAGE);
+    if (!Number.isInteger(parsed) || parsed < llm.minNumCtx || parsed > llm.maxNumCtx) {
+      setError(
+        `La fenêtre de contexte doit être un nombre entier entre ${llm.minNumCtx} et ${llm.maxNumCtx.toLocaleString("fr-FR")}.`,
+      );
       return;
     }
     try {

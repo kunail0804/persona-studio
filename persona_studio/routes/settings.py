@@ -19,6 +19,11 @@ router = APIRouter(tags=["settings"])
 class LlmSettings(BaseModel):
     model: str | None
     num_ctx: int
+    # The accepted bounds travel with the response so the client never
+    # hand-copies them. Defaults, not constructor arguments: the constants in
+    # `settings` stay the single owner.
+    min_num_ctx: int = settings.MIN_NUM_CTX
+    max_num_ctx: int = settings.MAX_NUM_CTX
     # None when Ollama could not be asked: "not installed" is then unknown,
     # not false.
     installed_models: list[str] | None

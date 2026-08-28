@@ -37,6 +37,8 @@ def test_defaults_when_nothing_is_stored(client: TestClient, installed_models) -
     body = client.get("/api/settings/llm").json()
     assert body["model"] is None
     assert body["num_ctx"] == settings.DEFAULT_NUM_CTX
+    assert body["min_num_ctx"] == settings.MIN_NUM_CTX
+    assert body["max_num_ctx"] == settings.MAX_NUM_CTX
     assert body["model_missing"] is False
     assert body["installed_models"] == ["qwen38-27b:Q6_K_XL"]
     assert body["ollama_error"] is None

@@ -4,6 +4,9 @@ import { expectArray, expectBoolean, expectInteger, expectString, isRecord } fro
 export interface LlmSettings {
   model: string | null;
   numCtx: number;
+  /** Bounds the backend enforces on write; the page reads them, never copies them. */
+  minNumCtx: number;
+  maxNumCtx: number;
   /** null when Ollama could not be asked — "not installed" is then unknown. */
   installedModels: string[] | null;
   modelMissing: boolean | null;
@@ -21,6 +24,8 @@ function parseLlmSettings(data: unknown): LlmSettings {
   return {
     model: data.model === null ? null : expectString(data.model, "model"),
     numCtx: expectInteger(data.num_ctx, "num_ctx"),
+    minNumCtx: expectInteger(data.min_num_ctx, "min_num_ctx"),
+    maxNumCtx: expectInteger(data.max_num_ctx, "max_num_ctx"),
     installedModels:
       installed === null
         ? null
