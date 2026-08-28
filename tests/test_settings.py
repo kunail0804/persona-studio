@@ -69,10 +69,24 @@ def test_malformed_stored_settings_fall_back_to_defaults(
     assert body["model"] is None
 
 
-def test_stored_json_true_falls_back_to_the_default(client: TestClient, installed_models) -> None:
-    """`bool` is a subclass of `int`: `True` must fall back, not pass for 1.
+def test_bounded_int_validator_rejects_bool_even_inside_the_range() -> None:
+    """`bool` is a subclass of `int`: `True` must not pass for 1.
 
-    Both bounded settings share one validator, so both get the guard.
+    Pinned on the shared validator with bounds where 1 sits inside the range.
+    The settings-level minima (512, 2) reject `True == 1` on range alone, so
+    only this test fails when the bool branch is deleted.
+    """
+    assert settings._valid_bounded_int(True, 1, 5) is False
+    assert settings._valid_bounded_int(1, 1, 5) is True
+
+
+def test_stored_json_true_falls_back_to_the_default(client: TestClient, installed_models) -> None:
+    """A stored `true` falls back to the default, end to end.
+
+    Wiring, not the guard itself: this proves the value read from the table
+    goes through the validator. `True == 1` is also below every minimum here,
+    so this test holds on range rejection alone — the bool branch is pinned
+    by `test_bounded_int_validator_rejects_bool_even_inside_the_range`.
     """
     installed_models(["a:latest"])
     with db.connect() as con:
