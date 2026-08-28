@@ -28,6 +28,13 @@ export function expectInteger(value: unknown, field: string): number {
   return num;
 }
 
+export function expectBoolean(value: unknown, field: string): boolean {
+  if (typeof value !== "boolean") {
+    throw new Error(`Expected a boolean for "${field}"`);
+  }
+  return value;
+}
+
 export function expectArray(value: unknown, field: string): unknown[] {
   if (!Array.isArray(value)) {
     throw new Error(`Expected an array for "${field}"`);
