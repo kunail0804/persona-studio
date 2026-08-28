@@ -121,9 +121,6 @@ def test_populated_scenario_produces_the_exact_prompt() -> None:
         "- End every reply on something the player can answer: a question, a "
         "decision, or a situation that awaits their character.\n"
         "\n"
-        "What happened earlier:\n"
-        f"{SUMMARY}\n"
-        "\n"
         "Scenario: The Drowned City\n"
         "\n"
         "Synopsis:\n"
@@ -153,7 +150,10 @@ def test_populated_scenario_produces_the_exact_prompt() -> None:
         "\n"
         "Name: Marco\n"
         "Appearance: Tall, greying beard, navy coat.\n"
-        "Personality: Charming, evasive."
+        "Personality: Charming, evasive.\n"
+        "\n"
+        "What happened earlier:\n"
+        f"{SUMMARY}"
     )
     assert build_system_prompt(FULL_SCENARIO, PERSONA, SUMMARY) == expected
 

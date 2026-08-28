@@ -169,17 +169,18 @@ def build_system_prompt(
     omitted rather than sent blank — the omission is `_section`'s job, not a
     chain of ifs here. With no active persona the protagonist section is absent
     and the rest of the prompt is byte-for-byte what it would have been with
-    one.
+    one. The summary comes last: it is recent state that continues into the
+    history messages which follow the system prompt, not scenario definition.
     """
     sections = [
         _intro(),
-        _section("What happened earlier:", summary),
         _field("Scenario", scenario.title),
         _section("Synopsis:", scenario.synopsis),
         _section("World rules:", scenario.world_rules),
         _section("Story arcs:", scenario.arcs),
         _protagonist_section(persona) if persona is not None else "",
         _characters_section(scenario.characters),
+        _section("What happened earlier:", summary),
     ]
     return "\n\n".join(section for section in sections if section)
 
