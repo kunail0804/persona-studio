@@ -59,6 +59,20 @@ def test_malformed_stored_settings_fall_back_to_defaults(
     assert body["model"] is None
 
 
+def test_stored_json_true_for_num_ctx_falls_back_to_the_default(
+    client: TestClient, installed_models
+) -> None:
+    """`bool` is a subclass of `int`: `True` must fall back, not pass for 1."""
+    installed_models(["a:latest"])
+    with db.connect() as con:
+        con.execute(
+            "INSERT INTO setting (key, value) VALUES (?, ?)", (settings.NUM_CTX_KEY, "true")
+        )
+
+    body = client.get("/api/settings/llm").json()
+    assert body["num_ctx"] == settings.DEFAULT_NUM_CTX
+
+
 def test_storing_and_reading_settings(client: TestClient, installed_models) -> None:
     installed_models(["qwen38-27b:Q6_K_XL"])
 
