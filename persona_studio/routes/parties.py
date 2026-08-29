@@ -17,6 +17,7 @@ from __future__ import annotations
 import sqlite3
 import time
 import uuid
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -28,7 +29,7 @@ router = APIRouter(tags=["parties"])
 
 class PartyMessage(BaseModel):
     id: int
-    role: str
+    role: Literal["user", "assistant"]
     content: str
     ts: float
 
