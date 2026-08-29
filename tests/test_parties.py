@@ -144,6 +144,30 @@ def test_no_model_configured_is_400_and_writes_nothing(client: TestClient) -> No
     assert _party_counts(scenario_id) == (0, 0)
 
 
+def test_scenario_deleted_during_generation_is_404_and_writes_nothing(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    scenario_id = _create_scenario(client)
+    _configure_model("test-model")
+
+    def delete_scenario_then_reply(
+        model: str, messages: list[dict[str, str]], num_ctx: int
+    ) -> str:
+        with db.connect() as con:
+            con.execute("DELETE FROM scenario WHERE id = ?", (scenario_id,))
+        return OPENING
+
+    monkeypatch.setattr(parties_routes.ollama, "chat", delete_scenario_then_reply)
+
+    response = client.post(f"/api/scenarios/{scenario_id}/parties", json={"label": ""})
+
+    assert response.status_code == 404
+    assert "deleted while the opening scene was being generated" in response.json()["detail"]
+    # The rollback already held; the point here is that the surfaced error is a
+    # 404 and the no-write guarantee survived it.
+    assert _party_counts(scenario_id) == (0, 0)
+
+
 # --- A successful create -------------------------------------------------------
 
 

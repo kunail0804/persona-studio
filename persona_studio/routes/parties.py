@@ -133,17 +133,26 @@ def create_party(scenario_id: str, body: PartyInput) -> PartySummary:
 
     now = time.time()
     party_id = uuid.uuid4().hex
-    with db.connect() as con:
-        con.execute(
-            "INSERT INTO instance (id, scenario_id, label, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (party_id, scenario_id, body.label.strip() or scenario_row["title"], now, now),
-        )
-        con.execute(
-            "INSERT INTO message (instance_id, role, kind, content, ts) "
-            "VALUES (?, 'assistant', 'text', ?, ?)",
-            (party_id, opening, now),
-        )
+    try:
+        with db.connect() as con:
+            con.execute(
+                "INSERT INTO instance (id, scenario_id, label, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (party_id, scenario_id, body.label.strip() or scenario_row["title"], now, now),
+            )
+            con.execute(
+                "INSERT INTO message (instance_id, role, kind, content, ts) "
+                "VALUES (?, 'assistant', 'text', ?, ?)",
+                (party_id, opening, now),
+            )
+    except sqlite3.IntegrityError as exc:
+        # 404, not 409: the scenario the party would belong to is genuinely
+        # gone, so the caller's next sensible move is to stop, not to retry.
+        raise HTTPException(
+            status_code=404,
+            detail=f"Scenario {scenario_id!r} was deleted while the opening scene "
+            "was being generated.",
+        ) from exc
     return PartySummary(
         id=party_id,
         scenario_id=scenario_id,
