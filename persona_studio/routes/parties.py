@@ -67,6 +67,14 @@ def _party_from_row(row: sqlite3.Row) -> PartySummary:
     )
 
 
+def _party_label(raw: str, scenario_title: str) -> str:
+    """The stored label: the stripped input, or the scenario title when blank.
+
+    One rule for create and rename alike: a blank name in a list is useless.
+    """
+    return raw.strip() or scenario_title
+
+
 def _get_scenario_row(con: sqlite3.Connection, scenario_id: str) -> sqlite3.Row:
     row = con.execute("SELECT id, title FROM scenario WHERE id = ?", (scenario_id,)).fetchone()
     if row is None:
@@ -138,7 +146,7 @@ def create_party(scenario_id: str, body: PartyInput) -> PartySummary:
             con.execute(
                 "INSERT INTO instance (id, scenario_id, label, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, ?)",
-                (party_id, scenario_id, body.label.strip() or scenario_row["title"], now, now),
+                (party_id, scenario_id, _party_label(body.label, scenario_row["title"]), now, now),
             )
             con.execute(
                 "INSERT INTO message (instance_id, role, kind, content, ts) "
@@ -157,7 +165,7 @@ def create_party(scenario_id: str, body: PartyInput) -> PartySummary:
         id=party_id,
         scenario_id=scenario_id,
         scenario_title=scenario_row["title"],
-        label=body.label.strip() or scenario_row["title"],
+        label=_party_label(body.label, scenario_row["title"]),
         created_at=now,
         updated_at=now,
     )
@@ -201,10 +209,11 @@ def get_party(party_id: str) -> Party:
 @router.patch("/parties/{party_id}", response_model=PartySummary)
 def rename_party(party_id: str, body: PartyInput) -> PartySummary:
     with db.connect() as con:
-        _get_party_row(con, party_id)
+        existing = _get_party_row(con, party_id)
+        label = _party_label(body.label, existing["scenario_title"])
         # A rename is metadata, not story activity: `updated_at` stays put, so
         # renaming never reorders the most-recently-active list.
-        con.execute("UPDATE instance SET label = ? WHERE id = ?", (body.label, party_id))
+        con.execute("UPDATE instance SET label = ? WHERE id = ?", (label, party_id))
         row = _get_party_row(con, party_id)
     return _party_from_row(row)
 

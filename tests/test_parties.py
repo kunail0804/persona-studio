@@ -150,9 +150,7 @@ def test_scenario_deleted_during_generation_is_404_and_writes_nothing(
     scenario_id = _create_scenario(client)
     _configure_model("test-model")
 
-    def delete_scenario_then_reply(
-        model: str, messages: list[dict[str, str]], num_ctx: int
-    ) -> str:
+    def delete_scenario_then_reply(model: str, messages: list[dict[str, str]], num_ctx: int) -> str:
         with db.connect() as con:
             con.execute("DELETE FROM scenario WHERE id = ?", (scenario_id,))
         return OPENING
@@ -268,6 +266,29 @@ def test_rename_changes_the_label_without_touching_updated_at(
     listed = [party["id"] for party in client.get("/api/parties").json()]
     mine = [party_id for party_id in listed if party_id in {older, newer}]
     assert mine == [newer, older]
+
+
+def test_rename_to_blank_falls_back_to_the_scenario_title(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    scenario_id = _create_scenario(client, "La Cité Noyée")
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+
+    for blank in ("", "   "):
+        response = client.patch(f"/api/parties/{party_id}", json={"label": blank})
+
+        assert response.status_code == 200
+        assert response.json()["label"] == "La Cité Noyée"
+
+
+def test_rename_stores_the_sent_label_stripped(client: TestClient, monkeypatch: Any) -> None:
+    scenario_id = _create_scenario(client, "La Cité Noyée")
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+
+    response = client.patch(f"/api/parties/{party_id}", json={"label": "  Campagne d'Ash  "})
+
+    assert response.status_code == 200
+    assert response.json()["label"] == "Campagne d'Ash"
 
 
 def test_delete_removes_the_party_and_its_messages(client: TestClient, monkeypatch: Any) -> None:
