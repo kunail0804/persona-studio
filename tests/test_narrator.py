@@ -16,12 +16,14 @@ from fastapi.testclient import TestClient
 
 from persona_studio import db, settings
 from persona_studio.narrator import (
+    OPENING_INSTRUCTION,
     HistoryMessage,
     PromptCharacter,
     PromptPersona,
     PromptScenario,
     build_chat_messages,
     build_history,
+    build_opening_messages,
     build_system_prompt,
     context_usage,
     estimate_tokens,
@@ -242,6 +244,21 @@ def test_build_chat_messages_puts_the_system_prompt_first() -> None:
     assert messages[0]["role"] == "system"
     assert messages[0]["content"] == build_system_prompt(TITLE_ONLY, None)
     assert messages[1] == {"role": "user", "content": "Hello."}
+
+
+def test_build_opening_messages_is_system_prompt_then_system_direction() -> None:
+    """The opening direction is a system message, not a played turn: nothing has
+    happened in the story yet, so there is no turn to play."""
+    messages = build_opening_messages(FULL_SCENARIO, PERSONA)
+    assert messages == [
+        {"role": "system", "content": build_system_prompt(FULL_SCENARIO, PERSONA)},
+        {"role": "system", "content": OPENING_INSTRUCTION},
+    ]
+
+
+def test_opening_instruction_directs_without_playing_the_protagonist() -> None:
+    assert "opening scene" in OPENING_INSTRUCTION
+    assert "Do not act" in OPENING_INSTRUCTION
 
 
 def test_estimate_tokens_grows_with_content() -> None:

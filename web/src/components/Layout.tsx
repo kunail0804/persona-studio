@@ -7,9 +7,14 @@ export function Layout() {
         <Link to="/" className="text-lg font-semibold tracking-tight">
           Persona Studio
         </Link>
-        <Link to="/settings" className="text-sm text-neutral-400 hover:text-neutral-100">
-          Paramètres
-        </Link>
+        <div className="flex items-center gap-6">
+          <Link to="/parties" className="text-sm text-neutral-400 hover:text-neutral-100">
+            Parties
+          </Link>
+          <Link to="/settings" className="text-sm text-neutral-400 hover:text-neutral-100">
+            Paramètres
+          </Link>
+        </div>
       </header>
       <main className="mx-auto max-w-3xl px-6 py-8">
         <Outlet />
