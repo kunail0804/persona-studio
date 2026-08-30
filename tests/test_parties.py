@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import uuid
 from collections.abc import Iterator
 from typing import Any
 
+import anyio
 from fastapi.testclient import TestClient
 
 from persona_studio import db, settings
@@ -429,6 +431,92 @@ def test_partial_reply_survives_a_client_hangup(client: TestClient, monkeypatch:
     messages = _party_message_rows(party_id)
     assert [m["role"] for m in messages] == ["assistant", "user", "assistant"]
     assert messages[-1]["content"] == "Le guide sourit et "
+
+
+def test_cancellation_during_an_outstanding_pull_persists_the_partial(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """The real hang-up Starlette delivers is a task cancellation raised while
+    the frame awaits inside `anyio.to_thread.run_sync` — not the GeneratorExit
+    at a suspended yield that `test_partial_reply_survives_a_client_hangup`
+    stages. Here a real anyio scope is cancelled while a fragment pull is
+    outstanding — the worker thread blocked mid-pull on an event — and two
+    guards the route relies on are pinned:
+
+    - the partial is persisted inside the shielded scope (shield=True): with
+      the shield gone, the persist await re-raises the still-delivered
+      cancellation before the worker thread even starts, and no row appears;
+    - the unwind does not wait for the pull (abandon_on_cancel=True): the
+      task group exits while the pull is still in flight. With it False,
+      anyio defers the cancellation until the pull returns — so the pull must
+      finish before the group can exit, and `pull_finished` is already set.
+
+    Because the finally's `stream.close()` then runs while the worker thread
+    is inside `next()`, it raises `ValueError: generator already executing` —
+    the race the `except ValueError` guard exists to swallow.
+
+    Every wait is bounded, so a failing run ends instead of deadlocking on a
+    blocked worker thread.
+    """
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    first_fragment = "Le guide sourit et "
+
+    # Signal plumbing between the test and the stub's worker thread:
+    # `pull_started` says a pull is outstanding, `release_pull` unblocks it,
+    # `pull_finished` says the pull is over.
+    pull_started = threading.Event()
+    pull_finished = threading.Event()
+    release_pull = threading.Event()
+    unblock_timeout = 5.0
+
+    def fake_chat_stream(model: str, messages: list[dict[str, str]], num_ctx: int) -> Iterator[str]:
+        yield first_fragment
+        # The second pull announces itself, then blocks mid-pull: the
+        # cancellation must land here, not between fragments.
+        pull_started.set()
+        release_pull.wait(unblock_timeout)
+        pull_finished.set()
+        yield "tend la main."
+
+    monkeypatch.setattr(parties_routes.ollama, "chat_stream", fake_chat_stream)
+
+    ctx = parties_routes._prepare_turn(party_id, parties_routes.TurnInput(content="Je le suis."))
+
+    async def run_turn() -> None:
+        async with anyio.create_task_group() as tg:
+
+            async def consume() -> None:
+                stream = parties_routes._turn_events(ctx)
+                first = await stream.__anext__()
+                assert json.loads(first) == {"delta": first_fragment}
+                # This await is cancelled while its worker thread sits blocked
+                # mid-pull; the unwinding runs the shielded persist.
+                await stream.__anext__()
+
+            async def cancel_when_pull_is_outstanding() -> None:
+                # Wait on a worker thread — the event loop must stay free —
+                # for the signal that a pull is blocked mid-stream, then
+                # cancel the response task exactly while it is outstanding.
+                await anyio.to_thread.run_sync(pull_started.wait, unblock_timeout)
+                tg.cancel_scope.cancel()
+
+            tg.start_soon(consume)
+            tg.start_soon(cancel_when_pull_is_outstanding)
+
+        # The task group has exited while the pull is still blocked: the
+        # unwind abandoned it rather than waiting for it.
+        assert not pull_finished.is_set()
+
+        release_pull.set()
+        assert pull_finished.wait(unblock_timeout)
+
+    anyio.run(run_turn)
+
+    # The partial — the first fragment only — was persisted as the reply.
+    messages = _party_message_rows(party_id)
+    assert [m["role"] for m in messages] == ["assistant", "user", "assistant"]
+    assert messages[-1]["content"] == first_fragment
 
 
 def test_empty_reply_appends_nothing(client: TestClient, monkeypatch: Any) -> None:
