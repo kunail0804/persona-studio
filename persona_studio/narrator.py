@@ -3,8 +3,8 @@
 Everything here is deterministic string work. The assembly functions are pure —
 they consume objects built in memory, so tests need no database and no HTTP —
 and the loaders at the bottom only translate rows into those objects. Nothing
-in this module calls Ollama; `build_chat_messages` is the single call site the
-chat routes will use.
+in this module calls Ollama; `build_chat_messages` and `build_opening_messages`
+are the two call sites the routes use.
 
 Two rules live in exactly one place each. `load_history`'s WHERE clause is the
 only filter that keeps image messages from the narrator, and `_section` is the
@@ -90,6 +90,13 @@ _NARRATION_RULES = (
 _SECRETS_LABEL = "Secrets (narrator only — never reveal these to the player, only play them out)"
 
 _OOC_PREFIX = "Out-of-game instruction from the player, not part of the story: "
+
+OPENING_INSTRUCTION = (
+    "Write the opening scene of this story, in one reply. Set the scene: where "
+    "the protagonist is, what is happening around them, who else is present. "
+    "End on something the player can answer. Do not act, speak or decide for "
+    "the protagonist — they have not acted yet."
+)
 
 
 def _section(heading: str, body: str) -> str:
@@ -210,6 +217,23 @@ def build_chat_messages(
     return [
         {"role": "system", "content": build_system_prompt(scenario, persona, summary)},
         *build_history(history),
+    ]
+
+
+def build_opening_messages(
+    scenario: PromptScenario,
+    persona: PromptPersona | None,
+) -> list[dict[str, str]]:
+    """The message list for a party's opening call: system prompt, then direction.
+
+    The instruction rides as a `system` message, not a played turn: nothing has
+    happened in the story yet, so there is no turn to play — the same reasoning
+    that makes out-of-game turns system messages in `build_history`. It is a
+    direction to the narrator and is never persisted.
+    """
+    return [
+        {"role": "system", "content": build_system_prompt(scenario, persona)},
+        {"role": "system", "content": OPENING_INSTRUCTION},
     ]
 
 

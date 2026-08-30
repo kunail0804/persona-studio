@@ -9,6 +9,7 @@ import {
   updateCharacter,
 } from "../api/characters";
 import { ApiError } from "../api/client";
+import { createParty } from "../api/parties";
 import type { Scenario } from "../api/scenarios";
 import { deleteScenario, getScenario, updateScenario } from "../api/scenarios";
 import { Button } from "../components/Button";
@@ -31,6 +32,7 @@ export function ScenarioEditorPage() {
   const [title, setTitle] = useState("");
   const [synopsis, setSynopsis] = useState("");
   const [saving, setSaving] = useState(false);
+  const [starting, setStarting] = useState(false);
   const [addingCharacter, setAddingCharacter] = useState(false);
   const [editingCharacterId, setEditingCharacterId] = useState<number | null>(null);
   const [confirmDeleteScenario, setConfirmDeleteScenario] = useState(false);
@@ -83,6 +85,20 @@ export function ScenarioEditorPage() {
       setError(messageFor(err, "Impossible d'enregistrer le scénario."));
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleStartParty() {
+    // The opening scene is generated server-side before the party exists, so
+    // this call can take minutes on a local model: the button stays disabled
+    // and the page says so instead of looking frozen.
+    setStarting(true);
+    try {
+      const party = await createParty(scenarioId);
+      navigate(`/parties/${party.id}`);
+    } catch (err) {
+      setError(messageFor(err, "Impossible de démarrer la partie."));
+      setStarting(false);
     }
   }
 
@@ -150,6 +166,12 @@ export function ScenarioEditorPage() {
   return (
     <div className="flex flex-col gap-8">
       {error ? <p className="text-sm text-red-400">{error}</p> : null}
+      {starting ? (
+        <p className="text-sm text-neutral-400">
+          La scène d'ouverture est en cours de génération. Un modèle local peut
+          prendre de quelques secondes à plusieurs minutes.
+        </p>
+      ) : null}
 
       <section className="flex flex-col gap-3">
         <TextField label="Titre" value={title} onChange={(event) => setTitle(event.target.value)} />
@@ -162,9 +184,14 @@ export function ScenarioEditorPage() {
           <Button variant="danger" onClick={() => setConfirmDeleteScenario(true)}>
             Supprimer le scénario
           </Button>
-          <Button onClick={() => void handleSave()} disabled={saving}>
-            Enregistrer
-          </Button>
+          <div className="flex gap-2">
+            <Button onClick={() => void handleStartParty()} disabled={starting || saving}>
+              {starting ? "Génération…" : "Jouer"}
+            </Button>
+            <Button onClick={() => void handleSave()} disabled={saving || starting}>
+              Enregistrer
+            </Button>
+          </div>
         </div>
       </section>
 
