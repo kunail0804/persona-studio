@@ -1,15 +1,19 @@
 """Tests for the party routes.
 
-Ollama is never called from a test: `ollama.chat` is stubbed where the route
-looks it up. `parties.py` does `from .. import ollama` and resolves
-`ollama.chat` at call time, so patching the attribute on that module takes
-effect. The configured model is written straight to the `setting` table — the
-settings PUT route would call the real `ollama.list_models`.
+Ollama is never called from a test: `ollama.chat` and `ollama.chat_stream` are
+stubbed where the route looks them up. `parties.py` does `from .. import
+ollama` and resolves the functions at call time, so patching the attribute on
+that module takes effect. The configured model is written straight to the
+`setting` table — the settings PUT route would call the real
+`ollama.list_models`.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import uuid
+from collections.abc import Iterator
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -43,6 +47,27 @@ def _stub_chat(
         return reply
 
     monkeypatch.setattr(parties_routes.ollama, "chat", fake_chat)
+    return calls
+
+
+def _stub_chat_stream(
+    monkeypatch: Any, replies: list[str] | None = None, error: Exception | None = None
+) -> list[dict[str, Any]]:
+    """Replace `ollama.chat_stream` with a recording stub; return the calls.
+
+    The stub yields the fragments in order, then raises `error` if one was
+    given — the shape a stream dying mid-turn has from the route's side.
+    """
+    calls: list[dict[str, Any]] = []
+
+    def fake_chat_stream(model: str, messages: list[dict[str, str]], num_ctx: int) -> Iterator[str]:
+        calls.append({"model": model, "messages": messages, "num_ctx": num_ctx})
+        if replies is not None:
+            yield from replies
+        if error is not None:
+            raise error
+
+    monkeypatch.setattr(parties_routes.ollama, "chat_stream", fake_chat_stream)
     return calls
 
 
@@ -308,3 +333,219 @@ def test_unknown_party_and_scenario_ids_are_404(client: TestClient) -> None:
     assert client.patch(f"/api/parties/{missing}", json={"label": "x"}).status_code == 404
     assert client.delete(f"/api/parties/{missing}").status_code == 404
     assert client.post(f"/api/scenarios/{missing}/parties", json={"label": ""}).status_code == 404
+
+
+# --- Playing a turn -------------------------------------------------------------
+
+
+def _send_turn(client: TestClient, party_id: str, content: str) -> Any:
+    return client.post(f"/api/parties/{party_id}/messages", json={"content": content})
+
+
+def _ndjson_events(text: str) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def _party_message_rows(party_id: str) -> list[dict[str, Any]]:
+    with db.connect() as con:
+        rows = con.execute(
+            "SELECT id, role, content FROM message WHERE instance_id = ? ORDER BY id",
+            (party_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def test_turn_is_persisted_before_generation(client: TestClient, monkeypatch: Any) -> None:
+    """Issue #9's first criterion, observed from inside the generation itself:
+    a stream stub that reads the database when it starts sees the player's
+    turn already there and no reply yet. An insert moved after the generation
+    call would show only the opening here."""
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    observed: list[list[str]] = []
+
+    def spy_stream(model: str, messages: list[dict[str, str]], num_ctx: int) -> Iterator[str]:
+        # The real `chat_stream` is a generator factory: the call itself cannot
+        # fail, the error surfaces on the first pull. The stub models that —
+        # the database is read from the first pull, not from the call.
+        observed.append([m["role"] for m in _party_message_rows(party_id)])
+        raise OllamaError("Ollama died on the first token")
+        yield ""  # never reached; its presence is what makes this a generator
+
+    monkeypatch.setattr(parties_routes.ollama, "chat_stream", spy_stream)
+
+    response = _send_turn(client, party_id, "J'entre dans le port.")
+
+    assert response.status_code == 200
+    assert observed == [["assistant", "user"]]
+    assert [m["role"] for m in _party_message_rows(party_id)] == ["assistant", "user"]
+    assert _party_message_rows(party_id)[-1]["content"] == "J'entre dans le port."
+
+
+def test_partial_reply_survives_a_broken_stream(client: TestClient, monkeypatch: Any) -> None:
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    reason = (
+        "Ollama is unreachable at http://localhost:11434: "
+        "peer closed connection without sending complete message body"
+    )
+    _stub_chat_stream(monkeypatch, replies=["Le guide ", "sourit."], error=OllamaError(reason))
+
+    response = _send_turn(client, party_id, "Je m'approche.")
+
+    assert response.status_code == 200
+    events = _ndjson_events(response.text)
+    assert events[0] == {"delta": "Le guide "}
+    assert events[1] == {"delta": "sourit."}
+    # The error line carries the real reason, not "something failed".
+    assert events[2] == {"error": reason}
+    # The partial was persisted, and the final line says which message it is.
+    assert events[3]["done"] is True
+    messages = _party_message_rows(party_id)
+    assert [m["role"] for m in messages] == ["assistant", "user", "assistant"]
+    assert messages[-1]["content"] == "Le guide sourit."
+    assert events[3]["message_id"] == messages[-1]["id"]
+
+
+def test_partial_reply_survives_a_client_hangup(client: TestClient, monkeypatch: Any) -> None:
+    """TestClient cannot stage a real mid-stream disconnect, so the generator
+    is disposed the way Starlette's finalizer disposes it: consumed up to the
+    first fragment, then aclose()d — a GeneratorExit at the yield, which skips
+    everything but the `finally` that persists the partial."""
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    _stub_chat_stream(monkeypatch, replies=["Le guide sourit et ", "tend la main."])
+
+    ctx = parties_routes._prepare_turn(party_id, parties_routes.TurnInput(content="Je le suis."))
+
+    async def hang_up_after_first_fragment() -> None:
+        stream = parties_routes._turn_events(ctx)
+        first = await stream.__anext__()
+        assert json.loads(first) == {"delta": "Le guide sourit et "}
+        await stream.aclose()
+
+    asyncio.run(hang_up_after_first_fragment())
+
+    messages = _party_message_rows(party_id)
+    assert [m["role"] for m in messages] == ["assistant", "user", "assistant"]
+    assert messages[-1]["content"] == "Le guide sourit et "
+
+
+def test_empty_reply_appends_nothing(client: TestClient, monkeypatch: Any) -> None:
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    _stub_chat_stream(monkeypatch, replies=[])
+
+    response = _send_turn(client, party_id, "Tour sans réponse.")
+
+    assert response.status_code == 200
+    assert _ndjson_events(response.text) == [{"done": True, "message_id": None}]
+    # The player's turn stays — it was persisted on purpose. No assistant row.
+    assert [m["role"] for m in _party_message_rows(party_id)] == ["assistant", "user"]
+
+
+def test_whitespace_reply_appends_nothing(client: TestClient, monkeypatch: Any) -> None:
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    _stub_chat_stream(monkeypatch, replies=["  ", "\n\t"])
+
+    response = _send_turn(client, party_id, "Tour sans réponse.")
+
+    assert response.status_code == 200
+    # Whitespace fragments ride the stream; only the database row is skipped.
+    assert _ndjson_events(response.text)[-1] == {"done": True, "message_id": None}
+    assert [m["role"] for m in _party_message_rows(party_id)] == ["assistant", "user"]
+
+
+def test_turn_sends_the_system_prompt_the_history_and_the_turn(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    scenario_id = _create_scenario(client, "La Cité Noyée")
+    _configure_model("test-model", num_ctx=2048)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    calls = _stub_chat_stream(monkeypatch, replies=["Bien."])
+
+    _send_turn(client, party_id, "J'avance dans le brouillard.")
+
+    assert len(calls) == 1
+    assert calls[0]["model"] == "test-model"
+    assert calls[0]["num_ctx"] == 2048
+    messages = calls[0]["messages"]
+    assert messages[0]["role"] == "system"
+    assert "Scenario: La Cité Noyée" in messages[0]["content"]
+    # The history: the opening, then the turn just persisted — loaded after
+    # the insert, not hand-appended.
+    assert messages[1] == {"role": "assistant", "content": OPENING}
+    assert messages[-1] == {"role": "user", "content": "J'avance dans le brouillard."}
+
+
+def test_history_window_limits_the_messages_sent(client: TestClient, monkeypatch: Any) -> None:
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    _stub_chat_stream(monkeypatch, replies=["Réponse 1."])
+    _send_turn(client, party_id, "Tour 1.")
+    _stub_chat_stream(monkeypatch, replies=["Réponse 2."])
+    _send_turn(client, party_id, "Tour 2.")
+    with db.connect() as con:
+        settings.set_history_window(con, 2)
+    calls = _stub_chat_stream(monkeypatch, replies=["Réponse 3."])
+
+    _send_turn(client, party_id, "Tour 3.")
+
+    messages = calls[0]["messages"]
+    assert len(messages) == 3  # the system prompt, plus the last two only
+    assert messages[0]["role"] == "system"
+    assert messages[1] == {"role": "assistant", "content": "Réponse 2."}
+    assert messages[2] == {"role": "user", "content": "Tour 3."}
+
+
+def test_turn_bumps_updated_at_but_rename_does_not(client: TestClient, monkeypatch: Any) -> None:
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    with db.connect() as con:
+        con.execute("UPDATE instance SET updated_at = 1000.0 WHERE id = ?", (party_id,))
+
+    _stub_chat_stream(monkeypatch, replies=["Bien."])
+    _send_turn(client, party_id, "Un vrai tour.")
+
+    updated_after_turn = client.get(f"/api/parties/{party_id}").json()["updated_at"]
+    assert updated_after_turn > 1000.0
+
+    client.patch(f"/api/parties/{party_id}", json={"label": "Nouveau nom"})
+
+    assert client.get(f"/api/parties/{party_id}").json()["updated_at"] == updated_after_turn
+
+
+def test_blank_turn_is_400_and_writes_nothing(client: TestClient, monkeypatch: Any) -> None:
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    before = _message_count_for_party(party_id)
+
+    for blank in ("", "   \n\t "):
+        response = _send_turn(client, party_id, blank)
+        assert response.status_code == 400
+        assert response.json()["detail"] == "A turn cannot be empty."
+
+    assert _message_count_for_party(party_id) == before
+
+
+def test_turn_without_model_is_400_and_writes_nothing(client: TestClient, monkeypatch: Any) -> None:
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    _configure_model(None)
+    before = _message_count_for_party(party_id)
+
+    response = _send_turn(client, party_id, "Un tour.")
+
+    assert response.status_code == 400
+    assert "settings" in response.json()["detail"]
+    assert _message_count_for_party(party_id) == before
+
+
+def test_turn_on_unknown_party_is_404(client: TestClient) -> None:
+    missing = uuid.uuid4().hex
+
+    response = _send_turn(client, missing, "Un tour.")
+
+    assert response.status_code == 404
+    assert client.get(f"/api/parties/{missing}").status_code == 404

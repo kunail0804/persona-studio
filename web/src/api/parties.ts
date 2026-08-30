@@ -1,4 +1,4 @@
-import { request, requestVoid } from "./client";
+import { request, requestVoid, streamNdjson } from "./client";
 import { expectArray, expectNumber, expectString, isRecord } from "./validate";
 
 export type PartyRole = "user" | "assistant";
@@ -92,4 +92,45 @@ export function renameParty(id: string, label: string): Promise<PartySummary> {
 
 export function deleteParty(id: string): Promise<void> {
   return requestVoid(`/parties/${id}`, { method: "DELETE" });
+}
+
+/** One line of a turn's NDJSON stream, narrowed to what the server sends. */
+export type TurnEvent =
+  | { kind: "delta"; text: string }
+  | { kind: "error"; message: string }
+  | { kind: "done"; messageId: number | null };
+
+function parseTurnEvent(data: unknown): TurnEvent {
+  if (!isRecord(data)) throw new Error("Expected a turn event object");
+  if (typeof data.delta === "string") {
+    return { kind: "delta", text: data.delta };
+  }
+  if (typeof data.error === "string") {
+    return { kind: "error", message: data.error };
+  }
+  if (data.done === true) {
+    return {
+      kind: "done",
+      messageId: data.message_id === null ? null : expectNumber(data.message_id, "message_id"),
+    };
+  }
+  throw new Error("Unexpected turn event shape");
+}
+
+/**
+ * Plays one turn: resolves once the response headers arrive (the player's
+ * turn is persisted server-side by then), hands each stream event to
+ * `onEvent`, and resolves for good after the final `done` line. Aborting
+ * `signal` rejects with an AbortError; whatever the server had already
+ * streamed is persisted there either way.
+ */
+export async function sendTurn(
+  id: string,
+  content: string,
+  onEvent: (event: TurnEvent) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  await streamNdjson(`/parties/${id}/messages`, { content }, signal, (data: unknown) =>
+    onEvent(parseTurnEvent(data)),
+  );
 }
