@@ -42,12 +42,28 @@ def _configure(con: sqlite3.Connection) -> None:
 
 
 @contextmanager
-def connect() -> Iterator[sqlite3.Connection]:
-    """Connexion transactionnelle : commit en sortie normale, rollback sur erreur."""
+def connect(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+    """Connexion transactionnelle : commit en sortie normale, rollback sur erreur.
+
+    With `immediate=True` the transaction starts with BEGIN IMMEDIATE, taking
+    the write lock before the first read instead of at the first write. A
+    read-check-write sequence — read a value, decide, write from it — is only
+    correct if no other writer can commit between the read and the write: on
+    the default deferred transaction, SQLite defers the write lock to the
+    first INSERT/UPDATE, and whatever was read can be stale by then. Writers
+    that only read or only write keep the default, which never blocks.
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     try:
         _configure(con)
+        if immediate:
+            # Legacy isolation_level would auto-begin a deferred transaction
+            # at the first DML, so hand control over: with isolation_level
+            # disabled the explicit BEGIN IMMEDIATE is the whole transaction,
+            # and `with con:` still commits (or rolls back) it at exit.
+            con.isolation_level = None
+            con.execute("BEGIN IMMEDIATE")
         with con:
             yield con
     finally:

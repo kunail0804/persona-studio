@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
+import sys
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from typing import Any
 
 import anyio
@@ -1084,3 +1087,210 @@ def test_editing_and_regenerating_run_the_shared_stream_contract(
     assert calls[0]["model"] == "test-model"
     assert calls[0]["num_ctx"] == 4096
     assert "Scenario: La Cité Noyée" in calls[0]["messages"][0]["content"]
+
+
+# --- The archive race ------------------------------------------------------------
+#
+# The archive branch of `_set_message_text` is a read-check-write: it saves the
+# text it read from `message.content` moments earlier. These tests open that
+# window on purpose and drive a writer through it, so the interleaving is
+# deterministic instead of left to the scheduler — a threaded test that loses
+# the edit 7 times out of 30 proves nothing. The window sits immediately after
+# the `SELECT content FROM message` read, which is exactly where another
+# writer's commit used to be archived over.
+
+_WAIT_TIMEOUT = 5.0
+# Long enough for a local edit transaction to commit many times over, short
+# enough that the fix's blocked writer never approaches its 5 s busy_timeout.
+_EDIT_WINDOW = 0.5
+# When the write lock is held, the second regeneration cannot reach the window
+# at all; the gate gives up waiting for it after this long.
+_GATE_TIMEOUT = 2.0
+
+_RACE_SQL = "SELECT content FROM message"
+
+_WINDOW_GATE: _ArchiveGate | None = None
+
+
+class _ArchiveGate:
+    """A synchronisation point parked inside the archive window.
+
+    Threads arriving through `_WindowConnection` park here until the gate lets
+    them: with `expected=1` the test closes the window itself through
+    `window_close`, with `expected=2` the two racing writers are released
+    together. Every wait is bounded, so a broken run ends instead of hanging
+    the suite.
+    """
+
+    def __init__(self, expected: int) -> None:
+        self._expected = expected
+        self._arrivals = 0
+        self._lock = threading.Lock()
+        self._all_arrived = threading.Event()
+        self.window_open = threading.Event()
+        self.window_close = threading.Event()
+
+    def arrive(self) -> None:
+        global _WINDOW_GATE
+        with self._lock:
+            self._arrivals += 1
+            arrived_last = self._arrivals >= self._expected
+        if self._expected == 1:
+            self.window_open.set()
+            self.window_close.wait(_WAIT_TIMEOUT)
+        else:
+            if arrived_last:
+                self._all_arrived.set()
+            self._all_arrived.wait(_GATE_TIMEOUT)
+        # One-shot: once released, later statements and later connections must
+        # run freely, or the test's own verification reads would park too.
+        with self._lock:
+            _WINDOW_GATE = None
+
+
+class _WindowConnection(sqlite3.Connection):
+    """Connection that parks in the archive window when a gate is armed.
+
+    The park lands after `SELECT content FROM message` has returned — the
+    moment the archive branch holds a text another writer may already have
+    replaced.
+    """
+
+    def execute(self, sql: str, parameters: Sequence[Any] = ()) -> sqlite3.Cursor:
+        cursor = super().execute(sql, parameters)
+        gate = _WINDOW_GATE
+        if gate is not None and sql.lstrip().startswith(_RACE_SQL):
+            gate.arrive()
+        return cursor
+
+
+@contextmanager
+def _traced_connect(**kwargs: Any) -> Iterator[sqlite3.Connection]:
+    """`db.connect` with `_WindowConnection` as the connection factory.
+
+    Mirrors `db.connect`'s body — including the `immediate` transaction mode —
+    because the real signature carries no factory parameter to inject.
+    """
+    con = sqlite3.connect(db.DB_PATH, factory=_WindowConnection)
+    try:
+        db._configure(con)
+        if kwargs.get("immediate"):
+            con.isolation_level = None
+            con.execute("BEGIN IMMEDIATE")
+        with con:
+            yield con
+    finally:
+        con.close()
+
+
+def _run_in_thread(fn: Callable[..., Any], *args: Any) -> tuple[threading.Thread, list[Exception]]:
+    """Run `fn` on a thread, collecting anything it raises for the test to assert."""
+    errors: list[Exception] = []
+
+    def target() -> None:
+        try:
+            fn(*args)
+        except Exception as exc:  # noqa: BLE001 - the test asserts on what happened
+            errors.append(exc)
+
+    thread = threading.Thread(target=target)
+    thread.start()
+    return thread, errors
+
+
+def test_edit_committing_in_the_archive_window_is_not_lost(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """An edit committing between the archive read and the archive INSERT used
+    to be lost: the regeneration archived the pre-edit text it had read and
+    its final `UPDATE message` then overwrote the edit, leaving the edited
+    text nowhere. The window below opens right after that read and the edit
+    commits inside it — deterministically.
+
+    With the write lock held from before the read, the edit can no longer land
+    inside the window: it waits for the regeneration to commit and applies
+    after it, so the edited text survives as the message's active text.
+    """
+    scenario_id = _create_scenario(client)
+    party = _create_party(client, scenario_id, monkeypatch)
+    party_id = party["id"]
+    message_id = _opening_message_id(client, party["id"])
+    edited = "La porte est condamnée."
+    regenerated = "Le quai s'éveille, différent."
+
+    gate = _ArchiveGate(expected=1)
+    monkeypatch.setattr(sys.modules[__name__], "_WINDOW_GATE", gate)
+    monkeypatch.setattr(db, "connect", _traced_connect)
+
+    persist_thread, persist_errors = _run_in_thread(
+        parties_routes._persist_regenerated, message_id, party_id, regenerated
+    )
+    assert gate.window_open.wait(_WAIT_TIMEOUT), "the archive read never reached its window"
+
+    edit_thread, edit_errors = _run_in_thread(
+        parties_routes.edit_message,
+        party_id,
+        message_id,
+        parties_routes.MessageEditInput(content=edited),
+    )
+    # Under the bug the edit commits inside the window and this join returns
+    # at once; under the fix the edit is blocked by the write lock the
+    # regeneration already holds, so the join times out. Either way the window
+    # then closes and the outcome is what the assertions below judge.
+    edit_thread.join(_EDIT_WINDOW)
+    gate.window_close.set()
+
+    persist_thread.join(_WAIT_TIMEOUT)
+    assert not persist_thread.is_alive(), "the regeneration never completed"
+    assert persist_errors == []
+
+    edit_thread.join(_WAIT_TIMEOUT)
+    assert not edit_thread.is_alive(), "the edit never completed"
+    assert edit_errors == []
+
+    variants = _variant_rows(message_id)
+    survived = _message_content(message_id) == edited or any(
+        v["content"] == edited for v in variants
+    )
+    assert survived, (
+        "the edit was lost: "
+        f"message.content={_message_content(message_id)!r}, "
+        f"variants={[v['content'] for v in variants]!r}"
+    )
+    _assert_invariant(message_id)
+
+
+def test_two_regenerations_racing_the_window_archive_the_original_once(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """Two regenerations that both read `already_archived = False` used to
+    archive the same text twice — a duplicate entry in the navigator. Both
+    threads here read inside the same window, deterministically.
+
+    With the write lock held from before the read, the second regeneration
+    only runs once the first has committed and finds the archive already
+    there: the original is archived exactly once.
+    """
+    scenario_id = _create_scenario(client)
+    party = _create_party(client, scenario_id, monkeypatch)
+    party_id = party["id"]
+    message_id = _opening_message_id(client, party["id"])
+
+    gate = _ArchiveGate(expected=2)
+    monkeypatch.setattr(sys.modules[__name__], "_WINDOW_GATE", gate)
+    monkeypatch.setattr(db, "connect", _traced_connect)
+
+    first, first_errors = _run_in_thread(
+        parties_routes._persist_regenerated, message_id, party_id, "Nouvelle un."
+    )
+    second, second_errors = _run_in_thread(
+        parties_routes._persist_regenerated, message_id, party_id, "Nouvelle deux."
+    )
+    first.join(_WAIT_TIMEOUT + _GATE_TIMEOUT)
+    second.join(_WAIT_TIMEOUT + _GATE_TIMEOUT)
+    assert not first.is_alive() and not second.is_alive(), "a regeneration never completed"
+    assert first_errors == [] and second_errors == []
+
+    originals = [v for v in _variant_rows(message_id) if v["content"] == OPENING]
+    assert len(originals) == 1, f"the original reply was archived {len(originals)} times"
+    _assert_invariant(message_id)

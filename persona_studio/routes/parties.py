@@ -546,7 +546,17 @@ def _persist_regenerated(message_id: int, party_id: str, text: str) -> int | Non
     """
     if not text.strip():
         return None
-    with db.connect() as con:
+    # The archive inside `_set_message_text` is a read-check-write: the text it
+    # saves is the one read from `message.content` moments earlier. SQLite
+    # takes the write lock at the first INSERT, not at that read, so on a
+    # deferred transaction an edit could commit in between — the pre-edit text
+    # would be archived over it and the edited text would exist nowhere. The
+    # write lock must therefore be held from before the read: the edit then
+    # either committed before it (and is archived) or waits and lands after
+    # the commit (and stays the active text); it can no longer fall into the
+    # gap. The same lock also keeps two concurrent regenerations from both
+    # seeing `already_archived = False` and archiving the original twice.
+    with db.connect(immediate=True) as con:
         _set_message_text(con, message_id, text, archive_current=True)
         con.execute("UPDATE instance SET updated_at = ? WHERE id = ?", (time.time(), party_id))
     return message_id
