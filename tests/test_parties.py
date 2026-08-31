@@ -1630,7 +1630,7 @@ def test_frontier_advances_and_the_prompt_carries_the_summary(
     assert "Résumé de la digue." not in sent[0]["content"]  # the old summary was empty
     assert sent[-1] == {
         "role": "user",
-        "content": "Now write the JSON object summarising the messages above.",
+        "content": "Now write the JSON object summarizing the messages above.",
     }
     compressed = [m["content"] for m in sent[1:-1]]
     assert opening in compressed

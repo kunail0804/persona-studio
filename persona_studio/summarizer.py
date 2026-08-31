@@ -11,9 +11,9 @@ The shape of the job, and why:
 - **Off the request path.** `schedule` runs after a reply is persisted, checks
   the trigger with one cheap query, and either returns or spawns a daemon
   thread that does the model call and the write. The player's stream closes on
-  the model's last token, never on the summariser's.
+  the model's last token, never on the summarizer's.
 - **One at a time per party.** A per-party lock, acquired without blocking: a
-  second trigger while one summarisation runs is skipped, not queued. The
+  second trigger while one summarization runs is skipped, not queued. The
   lock table is in-process by design — this application runs as a single
   uvicorn process, so a process-local lock is the whole mutual exclusion the
   design needs — and it is swept after each job so it cannot grow without
@@ -52,7 +52,7 @@ _SUMMARY_SYSTEM = (
     "the JSON object, nothing before or after it."
 )
 
-_SUMMARY_ASK = "Now write the JSON object summarising the messages above."
+_SUMMARY_ASK = "Now write the JSON object summarizing the messages above."
 
 
 @dataclass(frozen=True)
@@ -83,7 +83,7 @@ _locks_guard = threading.Lock()
 def _lock_for(party_id: str) -> threading.Lock | None:
     """The party's lock, acquired without blocking.
 
-    None means a summarisation for this party is already running and this
+    None means a summarization for this party is already running and this
     trigger is skipped, not queued: the condition that made it necessary is
     still true, so the next turn will trigger again.
     """
@@ -110,7 +110,7 @@ def _sweep_locks() -> None:
 
 
 def schedule(party_id: str) -> None:
-    """Start a summarisation if the trigger is met; return immediately.
+    """Start a summarization if the trigger is met; return immediately.
 
     Called after a reply is persisted, and only then. The trigger: the number
     of uncovered text messages — those with `id > summary_upto` — exceeds the
@@ -125,7 +125,9 @@ def schedule(party_id: str) -> None:
     lock = _lock_for(party_id)
     if lock is None:
         return
-    threading.Thread(target=_run, args=(plan, lock), daemon=True, name="rolling-summary").start()
+    threading.Thread(
+        target=_run, args=(plan, lock), daemon=True, name=f"rolling-summary-{party_id[:8]}"
+    ).start()
 
 
 def _plan(con: sqlite3.Connection, party_id: str) -> _SummaryPlan | None:
@@ -200,7 +202,7 @@ def _summary_messages(plan: _SummaryPlan) -> list[dict[str, str]]:
         f"Current world state:\n{json.dumps(plan.world_state, ensure_ascii=False)}"
     )
     # The compressed messages themselves ride in the call: they are what is
-    # being summarised. `build_history` keeps out-of-game turns as system
+    # being summarized. `build_history` keeps out-of-game turns as system
     # messages, exactly as the narrator's prompt does.
     return [
         {"role": "system", "content": system},
@@ -269,13 +271,17 @@ def _commit(
 ) -> bool:
     """Write the new summary, or discard it if the frontier moved backwards.
 
-    Between the job's read and this write, new turns can arrive — that is
-    normal and harmless, because the frontier only advances over messages
-    that already existed when the range was chosen. What is not harmless is
-    committing a frontier older than the stored one, which would un-cover
-    messages another job already summarised. The write therefore runs in an
-    IMMEDIATE transaction — the write lock is held from before the re-read —
-    and a stored frontier past the one this job computed discards the result.
+    Every caller through `schedule()` holds the per-party lock, so two
+    scheduled jobs for the same party cannot race here. The IMMEDIATE
+    transaction and the frontier re-read exist for the caller that is not
+    behind that lock — `_commit` invoked directly, as the tests do and a
+    future maintenance path (an admin "resummarize now", a backfill) might.
+    Committing a frontier older than the stored one would un-cover messages
+    the summary already replaced, which is what the re-read discards.
+
+    Between the job's read and this write, new turns can also arrive — that
+    is normal and harmless, because the frontier only advances over messages
+    that already existed when the range was chosen.
 
     A missing `world_state` in the model's answer keeps the previous one.
     """
