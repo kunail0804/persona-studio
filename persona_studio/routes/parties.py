@@ -40,14 +40,14 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Generator, Iterator
 from dataclasses import dataclass
 from functools import partial
-from typing import Literal
+from typing import Any, Literal
 
 import anyio.to_thread
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from .. import db, narrator, ollama, settings
+from .. import db, narrator, ollama, settings, summarizer
 
 router = APIRouter(tags=["parties"])
 
@@ -77,6 +77,9 @@ class PartySummary(BaseModel):
 
 class Party(PartySummary):
     messages: list[PartyMessage]
+    summary_text: str
+    summary_upto: int | None
+    world_state: dict[str, Any]
 
 
 class PartyInput(BaseModel):
@@ -97,7 +100,8 @@ class VariantInput(BaseModel):
 
 _SUMMARY_COLUMNS = (
     "instance.id, instance.scenario_id, instance.label, "
-    "instance.created_at, instance.updated_at, scenario.title AS scenario_title"
+    "instance.created_at, instance.updated_at, scenario.title AS scenario_title, "
+    "instance.summary_text, instance.summary_upto, instance.world_state"
 )
 
 
@@ -354,6 +358,11 @@ def get_party(party_id: str) -> Party:
         label=row["label"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        # Read-only for now: making the summary editable is a separate,
+        # highly rated feature (see issue #14's notes).
+        summary_text=row["summary_text"],
+        summary_upto=row["summary_upto"],
+        world_state=summarizer.parse_world_state(row["world_state"]),
         messages=[
             PartyMessage(
                 id=m["id"],
@@ -451,7 +460,10 @@ class _TurnContext:
     `persist` is what becomes of the accumulated text once the stream ends —
     appending a reply for a played turn, replacing an archived one for a
     regeneration — so one async generator serves both callers without knowing
-    which it is running.
+    which it is running. `summary` is the rolling summary standing in for the
+    covered history, and `summarize` says whether the end of this stream may
+    trigger one: a played turn appends to the story, a regeneration replaces
+    an existing text and leaves the covered range exactly as it was.
     """
 
     party_id: str
@@ -459,7 +471,9 @@ class _TurnContext:
     scenario: narrator.PromptScenario
     persona: narrator.PromptPersona | None
     history: list[narrator.HistoryMessage]
+    summary: str
     num_ctx: int
+    summarize: bool
     persist: Callable[[str], int | None]
 
 
@@ -502,14 +516,23 @@ def _prepare_turn(party_id: str, body: TurnInput) -> _TurnContext:
         con.execute("UPDATE instance SET updated_at = ? WHERE id = ?", (now, party_id))
         # Loaded after the insert, so the turn just persisted rides in the
         # history exactly as the model should see it — never hand-appended.
-        history = narrator.load_history(con, party_id, settings.get_history_window(con))
+        # `after_id` is the summary frontier: the summarised messages are
+        # covered by `summary_text` and must not be re-sent verbatim.
+        history = narrator.load_history(
+            con,
+            party_id,
+            settings.get_history_window(con),
+            after_id=party["summary_upto"],
+        )
     return _TurnContext(
         party_id=party_id,
         model=model,
         scenario=scenario,
         persona=persona,
         history=history,
+        summary=party["summary_text"],
         num_ctx=num_ctx,
+        summarize=True,
         persist=partial(_persist_reply, party_id),
     )
 
@@ -584,7 +607,11 @@ def _prepare_regenerate(party_id: str, message_id: int) -> _TurnContext:
         persona = narrator.load_active_persona(con)
         num_ctx = settings.get_num_ctx(con)
         history = narrator.load_history(
-            con, party_id, settings.get_history_window(con), before_id=message_id
+            con,
+            party_id,
+            settings.get_history_window(con),
+            before_id=message_id,
+            after_id=party["summary_upto"],
         )
     return _TurnContext(
         party_id=party_id,
@@ -592,7 +619,9 @@ def _prepare_regenerate(party_id: str, message_id: int) -> _TurnContext:
         scenario=scenario,
         persona=persona,
         history=history,
+        summary=party["summary_text"],
         num_ctx=num_ctx,
+        summarize=False,
         persist=partial(_persist_regenerated, message_id, party_id),
     )
 
@@ -623,7 +652,7 @@ async def _turn_events(ctx: _TurnContext) -> AsyncIterator[str]:
     An error line carries the real reason, so the interface can say what
     happened instead of "something failed".
     """
-    messages = narrator.build_chat_messages(ctx.scenario, ctx.persona, ctx.history)
+    messages = narrator.build_chat_messages(ctx.scenario, ctx.persona, ctx.history, ctx.summary)
     fragments: list[str] = []
     message_id: int | None = None
     stream: Generator[str] | None = None
@@ -651,6 +680,12 @@ async def _turn_events(ctx: _TurnContext) -> AsyncIterator[str]:
         # lost. The write is one fast statement, so letting it finish is safe.
         with anyio.CancelScope(shield=True):
             message_id = await anyio.to_thread.run_sync(ctx.persist, "".join(fragments))
+            # Only after a persisted reply, and only for a played turn: the
+            # scheduler checks the trigger and returns immediately — the model
+            # call runs on its own thread, so the stream below closes on the
+            # narrator's last token, never on the summariser's.
+            if message_id is not None and ctx.summarize:
+                await anyio.to_thread.run_sync(summarizer.schedule, ctx.party_id)
         if stream is not None:
             try:
                 # Stop pulling Ollama when the stream is being abandoned; a

@@ -260,6 +260,36 @@ export function PartyPage() {
         <p className="text-sm text-neutral-500">Scénario&nbsp;: {party.scenarioTitle}</p>
       </div>
       {error ? <p className="text-sm text-red-400">{error}</p> : null}
+      <details className="rounded-lg border border-neutral-800 bg-neutral-900 p-4 text-sm">
+        <summary className="cursor-pointer text-neutral-400 select-none">
+          Résumé et état du monde
+        </summary>
+        <div className="mt-3 flex flex-col gap-3">
+          <div>
+            <p className="text-xs font-medium uppercase tracking-wide text-neutral-500">Résumé</p>
+            {party.summaryText ? (
+              <p className="mt-1 whitespace-pre-wrap text-neutral-300">{party.summaryText}</p>
+            ) : (
+              <p className="mt-1 text-neutral-500">
+                Aucun résumé pour l'instant — il apparaît quand l'histoire dépasse la fenêtre de
+                mémoire.
+              </p>
+            )}
+          </div>
+          <div>
+            <p className="text-xs font-medium uppercase tracking-wide text-neutral-500">
+              État du monde
+            </p>
+            {Object.keys(party.worldState).length > 0 ? (
+              <pre className="mt-1 overflow-x-auto whitespace-pre-wrap text-neutral-300">
+                {JSON.stringify(party.worldState, null, 2)}
+              </pre>
+            ) : (
+              <p className="mt-1 text-neutral-500">Aucun état établi pour l'instant.</p>
+            )}
+          </div>
+        </div>
+      </details>
       {party.messages.length === 0 && pending === null ? (
         <p className="text-neutral-500">Aucun message pour l'instant.</p>
       ) : null}

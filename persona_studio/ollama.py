@@ -66,11 +66,15 @@ def list_models() -> list[str]:
     return sorted(names)
 
 
-def chat(model: str, messages: list[dict[str, str]], num_ctx: int) -> str:
+def chat(
+    model: str, messages: list[dict[str, str]], num_ctx: int, *, format: str | None = None
+) -> str:
     """Send a chat completion and return the assistant's message content.
 
     The options payload is assembled here, once: callers pass `num_ctx`, never
-    hand-built options.
+    hand-built options. `format` is Ollama's response-format hint — `"json"`
+    asks the model for a JSON answer — and defaults to absent, so every
+    existing caller keeps sending exactly what it sent before.
     """
     payload: dict[str, Any] = {
         "model": model,
@@ -78,6 +82,8 @@ def chat(model: str, messages: list[dict[str, str]], num_ctx: int) -> str:
         "stream": False,
         "options": {"num_ctx": num_ctx},
     }
+    if format is not None:
+        payload["format"] = format
     data = _request_json("POST", "/api/chat", payload)
     if not isinstance(data, dict) or not isinstance(data.get("message"), dict):
         raise OllamaError("Unexpected /api/chat response shape")

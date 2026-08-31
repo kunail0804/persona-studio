@@ -22,14 +22,25 @@ from contextlib import contextmanager
 from typing import Any
 
 import anyio
+import pytest
 from fastapi.testclient import TestClient
 
-from persona_studio import db, settings
+from persona_studio import db, settings, summarizer
 from persona_studio.narrator import OPENING_INSTRUCTION
 from persona_studio.ollama import OllamaError, OllamaUnreachable
 from persona_studio.routes import parties as parties_routes
 
 OPENING = "The harbour gate looms ahead, barnacled and half open. What do you do?"
+
+
+@pytest.fixture(autouse=True)
+def _default_history_window(client: TestClient) -> Iterator[None]:
+    """The suite shares one database, and a window left low by a summariser
+    test would make unrelated turns trigger background jobs mid-test. Depends
+    on `client` because only its startup runs the migration."""
+    _set_window(settings.DEFAULT_HISTORY_WINDOW)
+    yield
+    _set_window(settings.DEFAULT_HISTORY_WINDOW)
 
 
 def _configure_model(model: str | None, num_ctx: int | None = None) -> None:
@@ -581,6 +592,13 @@ def test_history_window_limits_the_messages_sent(client: TestClient, monkeypatch
     with db.connect() as con:
         settings.set_history_window(con, 2)
     calls = _stub_chat_stream(monkeypatch, replies=["Réponse 3."])
+    # Six text messages are now uncovered — past the window — so this turn
+    # also schedules a background summarisation. Stub its model call and wait
+    # for the job to finish, so no daemon thread ever reaches the real
+    # Ollama after the stubs are undone.
+    summary_calls = _stub_summary_chat(
+        monkeypatch, reply=json.dumps({"summary": "Résumé.", "world_state": {}})
+    )
 
     _send_turn(client, party_id, "Tour 3.")
 
@@ -589,6 +607,8 @@ def test_history_window_limits_the_messages_sent(client: TestClient, monkeypatch
     assert messages[0]["role"] == "system"
     assert messages[1] == {"role": "assistant", "content": "Réponse 2."}
     assert messages[2] == {"role": "user", "content": "Tour 3."}
+    assert _wait_until(lambda: len(summary_calls) == 1)
+    assert _wait_unlocked(party_id)
 
 
 def test_turn_bumps_updated_at_but_rename_does_not(client: TestClient, monkeypatch: Any) -> None:
@@ -1294,3 +1314,473 @@ def test_two_regenerations_racing_the_window_archive_the_original_once(
     originals = [v for v in _variant_rows(message_id) if v["content"] == OPENING]
     assert len(originals) == 1, f"the original reply was archived {len(originals)} times"
     _assert_invariant(message_id)
+
+
+# --- The rolling summary (issue #14) ---------------------------------------------
+#
+# The summariser runs on a background thread. Every wait below is bounded, so
+# a failing run ends instead of hanging the suite, and every test waits for
+# the job it started to leave `summarizer._locks` before returning — a daemon
+# thread that outlives its stubs would reach the real Ollama.
+
+
+def _set_window(window: int) -> None:
+    with db.connect() as con:
+        settings.set_history_window(con, window)
+
+
+def _fill_party(party_id: str, count: int, marker: str) -> list[int]:
+    """Insert `count` text messages past the opening; return all message ids."""
+    with db.connect() as con:
+        existing = con.execute(
+            "SELECT id FROM message WHERE instance_id = ? ORDER BY id", (party_id,)
+        ).fetchall()
+        ids = [row["id"] for row in existing]
+        for i in range(count):
+            role = "user" if i % 2 == 0 else "assistant"
+            cursor = con.execute(
+                "INSERT INTO message (instance_id, role, kind, content, ts) "
+                "VALUES (?, ?, 'text', ?, ?)",
+                (party_id, role, f"{marker} {i}.", 0.0),
+            )
+            assert cursor.lastrowid is not None
+            ids.append(cursor.lastrowid)
+    return ids
+
+
+def _set_summary(party_id: str, text: str, upto: int | None, world_state: str) -> None:
+    with db.connect() as con:
+        con.execute(
+            "UPDATE instance SET summary_text = ?, summary_upto = ?, world_state = ? WHERE id = ?",
+            (text, upto, world_state, party_id),
+        )
+
+
+def _summary_state(party_id: str) -> tuple[str, int | None, str]:
+    """(summary_text, summary_upto, world_state) as stored, raw."""
+    with db.connect() as con:
+        row = con.execute(
+            "SELECT summary_text, summary_upto, world_state FROM instance WHERE id = ?",
+            (party_id,),
+        ).fetchone()
+    assert row is not None
+    return row["summary_text"], row["summary_upto"], row["world_state"]
+
+
+def _summary_reply(summary: str, world_state: dict[str, Any] | None = None) -> str:
+    payload: dict[str, Any] = {"summary": summary}
+    if world_state is not None:
+        payload["world_state"] = world_state
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _stub_summary_chat(
+    monkeypatch: Any,
+    reply: str | None = None,
+    error: Exception | None = None,
+) -> list[dict[str, Any]]:
+    """Replace `ollama.chat` with a stub that recognises the summariser's call.
+
+    The summariser is the only caller that passes `format="json"`; the stub
+    records every call so a test can count them.
+    """
+    calls: list[dict[str, Any]] = []
+
+    def fake_chat(
+        model: str, messages: list[dict[str, str]], num_ctx: int, *, format: str | None = None
+    ) -> str:
+        calls.append({"model": model, "messages": messages, "num_ctx": num_ctx, "format": format})
+        if error is not None:
+            raise error
+        assert reply is not None
+        return reply
+
+    monkeypatch.setattr(parties_routes.ollama, "chat", fake_chat)
+    return calls
+
+
+def _wait_until(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _wait_unlocked(party_id: str, timeout: float = 5.0) -> bool:
+    """Wait until no summarisation for this party holds its lock any more.
+
+    Callers must first establish that a job started — a stub call recorded,
+    the party seen in `_locks`, or its summary already committed. The lock is
+    taken in `schedule` and given back, swept out of the map, when the job
+    ends; a job fast enough to finish between two polls is never seen holding
+    it, so absence is the only reliable end signal here.
+    """
+    return _wait_until(lambda: party_id not in summarizer._locks, timeout)
+
+
+def test_summarisation_never_blocks_the_turn(client: TestClient, monkeypatch: Any) -> None:
+    """Issue #14's first criterion, observed from both sides: the summariser
+    blocks on an event inside its model call, and the turn's response still
+    completes fully — every NDJSON line included — before the event is ever
+    set. A scheduler that ran the model call inline would deadlock here."""
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    _fill_party(party_id, 3, "Ancien")
+    _set_window(2)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_chat(
+        model: str, messages: list[dict[str, str]], num_ctx: int, *, format: str | None = None
+    ) -> str:
+        entered.set()
+        release.wait(5.0)
+        return _summary_reply("Résumé bloquant.", {"lieu": "port"})
+
+    monkeypatch.setattr(parties_routes.ollama, "chat", blocking_chat)
+    _stub_chat_stream(monkeypatch, replies=["Réponse."])
+
+    response = _send_turn(client, party_id, "Tour 1.")
+
+    assert response.status_code == 200
+    events = _ndjson_events(response.text)
+    assert events[0] == {"delta": "Réponse."}
+    assert events[-1]["done"] is True
+    # The summariser is now parked inside its model call — the whole response
+    # arrived while it was still in there, and the test has not released it.
+    # Nothing was committed either: a scheduler that ran the model call on the
+    # request path would have come back from it (event timeout) before the
+    # response could finish.
+    assert entered.wait(5.0)
+    assert not release.is_set()
+    assert _summary_state(party_id)[0] == ""
+
+    release.set()
+    assert _wait_unlocked(party_id)
+    text, upto, _ = _summary_state(party_id)
+    assert text == "Résumé bloquant."
+    assert upto is not None
+
+
+def test_second_trigger_while_one_runs_is_skipped(client: TestClient, monkeypatch: Any) -> None:
+    """Issue #14's second criterion, one party at a time: a trigger that
+    arrives while a summarisation for the same party is running is skipped,
+    not queued — the condition stays true, so the next turn re-triggers."""
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    _fill_party(party_id, 3, "Ancien")
+    _set_window(2)
+    release = threading.Event()
+    calls: list[dict[str, Any]] = []
+
+    def blocking_chat(
+        model: str, messages: list[dict[str, str]], num_ctx: int, *, format: str | None = None
+    ) -> str:
+        calls.append({"model": model, "messages": messages, "num_ctx": num_ctx, "format": format})
+        release.wait(5.0)
+        return _summary_reply("Résumé unique.")
+
+    monkeypatch.setattr(parties_routes.ollama, "chat", blocking_chat)
+
+    summarizer.schedule(party_id)
+    assert _wait_until(lambda: len(calls) == 1)
+    # The first job is still inside its model call: the second trigger must
+    # not start a second one.
+    summarizer.schedule(party_id)
+    assert len(calls) == 1
+
+    release.set()
+    assert _wait_unlocked(party_id)
+
+
+def test_two_parties_do_not_block_each_other(client: TestClient, monkeypatch: Any) -> None:
+    """The lock is per party: a blocked summarisation for one party leaves
+    another party's summarisation free to run and commit."""
+    scenario_id = _create_scenario(client)
+    party_a = _create_party(client, scenario_id, monkeypatch)["id"]
+    party_b = _create_party(client, scenario_id, monkeypatch)["id"]
+    _fill_party(party_a, 3, "PA")
+    _fill_party(party_b, 3, "PB")
+    _set_window(2)
+    release_a = threading.Event()
+
+    def chat_by_party(
+        model: str, messages: list[dict[str, str]], num_ctx: int, *, format: str | None = None
+    ) -> str:
+        if "PA" in json.dumps(messages):
+            release_a.wait(5.0)
+            return _summary_reply("Résumé A.")
+        return _summary_reply("Résumé B.")
+
+    monkeypatch.setattr(parties_routes.ollama, "chat", chat_by_party)
+
+    summarizer.schedule(party_a)
+    assert _wait_until(lambda: party_a in summarizer._locks)
+    summarizer.schedule(party_b)
+
+    # B committed while A was still blocked; A commits once released.
+    assert _wait_until(lambda: _summary_state(party_b)[0] == "Résumé B.")
+    assert _wait_unlocked(party_b)
+    assert _summary_state(party_a)[0] == ""
+    release_a.set()
+    assert _wait_unlocked(party_a)
+    assert _summary_state(party_a)[0] == "Résumé A."
+
+
+def test_failed_summarisation_keeps_the_previous_summary_then_retries(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """Issue #14's third criterion, both halves: an unreachable Ollama leaves
+    `summary_text`, `summary_upto` and `world_state` exactly as they were,
+    and the next turn — no retry state, the trigger is still true — updates
+    them."""
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    _fill_party(party_id, 3, "Ancien")
+    _set_window(2)
+    _set_summary(party_id, "Ancien résumé.", None, '{"lieu": "port"}')
+
+    failed = threading.Event()
+
+    def failing_chat(
+        model: str, messages: list[dict[str, str]], num_ctx: int, *, format: str | None = None
+    ) -> str:
+        failed.set()
+        raise OllamaUnreachable(
+            "Ollama is unreachable at http://localhost:11434: connection refused"
+        )
+
+    monkeypatch.setattr(parties_routes.ollama, "chat", failing_chat)
+    summarizer.schedule(party_id)
+    assert failed.wait(5.0)
+    assert _wait_until(lambda: party_id not in summarizer._locks)
+    assert _summary_state(party_id) == ("Ancien résumé.", None, '{"lieu": "port"}')
+
+    # The automatic retry: the next turn's reply re-triggers the job, which
+    # now answers — without a `world_state`, so the previous one is kept.
+    _stub_chat_stream(monkeypatch, replies=["Réponse."])
+    _stub_summary_chat(monkeypatch, reply=_summary_reply("Résumé après échec."))
+    _send_turn(client, party_id, "Tour suivant.")
+
+    assert _wait_until(lambda: _summary_state(party_id)[0] == "Résumé après échec.")
+    text, upto, world_raw = _summary_state(party_id)
+    assert text == "Résumé après échec."
+    assert upto is not None
+    assert json.loads(world_raw) == {"lieu": "port"}
+
+
+def test_unparseable_summaries_change_nothing(client: TestClient, monkeypatch: Any) -> None:
+    """A local model will answer wrong sometimes, and each wrong shape is a
+    job failure, not a crash: not JSON, not an object, or no usable summary —
+    all leave the stored state exactly as it was."""
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    _fill_party(party_id, 3, "Ancien")
+    _set_window(2)
+    _set_summary(party_id, "Ancien résumé.", None, '{"lieu": "port"}')
+
+    unparseable = [
+        "pas du tout du JSON",
+        '["un", "tableau"]',
+        json.dumps({"world_state": {"lieu": "port"}}),
+        json.dumps({"summary": "   "}),
+        json.dumps({"summary": "Résumé.", "world_state": "pas un objet"}),
+    ]
+    for expected_reply in unparseable:
+        calls = _stub_summary_chat(monkeypatch, reply=expected_reply)
+        summarizer.schedule(party_id)
+        assert _wait_until(lambda calls=calls: len(calls) == 1)
+        assert _wait_until(lambda: party_id not in summarizer._locks)
+        assert _summary_state(party_id) == ("Ancien résumé.", None, '{"lieu": "port"}')
+        calls.clear()
+
+
+def test_frontier_advances_and_the_prompt_carries_the_summary(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """The frontier lands on the last compressed message's id, and the next
+    turn's prompt carries the summary while the covered messages are gone —
+    asserted on the messages handed to Ollama, not only on the database."""
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    ids = _fill_party(party_id, 3, "Ancien")
+    opening = _message_content(ids[0])
+    _set_window(2)
+    calls = _stub_summary_chat(
+        monkeypatch, reply=_summary_reply("Résumé de la digue.", {"lieu": "quai"})
+    )
+
+    summarizer.schedule(party_id)
+
+    assert _wait_until(lambda: len(calls) == 1)
+    assert _wait_unlocked(party_id)
+    assert calls[0]["format"] == "json"
+    # Four uncovered messages, window 2: the two oldest are compressed, and
+    # the frontier is the second message's id.
+    text, upto, world_raw = _summary_state(party_id)
+    assert text == "Résumé de la digue."
+    assert upto == ids[1]
+    assert json.loads(world_raw) == {"lieu": "quai"}
+    # The call itself carried the compressed messages and the prior memory,
+    # ending on the user instruction that asks for the answer.
+    sent = calls[0]["messages"]
+    assert sent[0]["role"] == "system"
+    assert "Résumé de la digue." not in sent[0]["content"]  # the old summary was empty
+    assert sent[-1] == {
+        "role": "user",
+        "content": "Now write the JSON object summarising the messages above.",
+    }
+    compressed = [m["content"] for m in sent[1:-1]]
+    assert opening in compressed
+    assert "Ancien 0." in compressed
+    assert not any("Ancien 1." in c or "Ancien 2." in c for c in compressed)
+
+    # The next turn: the summary rides in the system prompt, the covered
+    # messages no longer ride in the history. The turn crosses the window
+    # again, so stub the summariser with a failure and wait for that job too.
+    second_calls = _stub_summary_chat(monkeypatch, error=OllamaError("not under test"))
+    stream_calls = _stub_chat_stream(monkeypatch, replies=["Réponse."])
+    _send_turn(client, party_id, "Tour après résumé.")
+    messages = stream_calls[0]["messages"]
+    assert "Résumé de la digue." in messages[0]["content"]
+    history_contents = [m["content"] for m in messages[1:]]
+    assert history_contents == ["Ancien 2.", "Tour après résumé."]
+    assert opening not in history_contents
+    assert "Ancien 1." not in history_contents
+    assert _wait_until(lambda: len(second_calls) == 1)
+    assert _wait_unlocked(party_id)
+
+
+def test_party_under_the_trigger_never_calls_the_summariser(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """Under the trigger, nothing runs at all: a short party's turns never
+    reach the summariser's model call. The schedule runs before the response's
+    final line, so a zero here is not a race."""
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    _set_window(settings.DEFAULT_HISTORY_WINDOW)
+    calls = _stub_summary_chat(monkeypatch, reply=_summary_reply("Résumé."))
+    _stub_chat_stream(monkeypatch, replies=["Réponse."])
+
+    response = _send_turn(client, party_id, "Premier tour.")
+
+    assert response.status_code == 200
+    assert _ndjson_events(response.text)[-1]["done"] is True
+    assert calls == []
+    assert party_id not in summarizer._locks
+
+
+def test_get_party_serves_the_summary_and_the_world_state(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """Issue #14's fourth criterion, read-only: the summary, its frontier and
+    the world state are visible on the party the page loads."""
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    ids = _fill_party(party_id, 1, "Ancien")
+    _set_summary(party_id, "Le héros a trouvé la clé.", ids[0], '{"lieu": "tour"}')
+
+    body = client.get(f"/api/parties/{party_id}").json()
+    assert body["summary_text"] == "Le héros a trouvé la clé."
+    assert body["summary_upto"] == ids[0]
+    assert body["world_state"] == {"lieu": "tour"}
+
+    # A fresh party starts empty, in response shape and not raw JSON.
+    fresh = _create_party(client, scenario_id, monkeypatch)["id"]
+    fresh_body = client.get(f"/api/parties/{fresh}").json()
+    assert fresh_body["summary_text"] == ""
+    assert fresh_body["summary_upto"] is None
+    assert fresh_body["world_state"] == {}
+
+
+def test_a_result_behind_the_stored_frontier_is_discarded(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """A job that read before another one committed must not move the frontier
+    backwards: its result is discarded inside the IMMEDIATE transaction that
+    re-reads `summary_upto`."""
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    ids = _fill_party(party_id, 2, "Ancien")
+    _set_summary(party_id, "Résumé en place.", ids[1], '{"lieu": "port"}')
+
+    # A stale job computed a frontier below the stored one: discarded.
+    applied = summarizer._commit(
+        party_id,
+        frontier=ids[0],
+        summary_text="Résumé périmé.",
+        world_state=None,
+        previous_world_state={"lieu": "port"},
+    )
+    assert applied is False
+    assert _summary_state(party_id) == ("Résumé en place.", ids[1], '{"lieu": "port"}')
+
+    # A frontier at or past the stored one commits.
+    applied = summarizer._commit(
+        party_id,
+        frontier=ids[1],
+        summary_text="Résumé à jour.",
+        world_state={"lieu": "quai"},
+        previous_world_state={"lieu": "port"},
+    )
+    assert applied is True
+    text, upto, world_raw = _summary_state(party_id)
+    assert text == "Résumé à jour."
+    assert upto == ids[1]
+    assert json.loads(world_raw) == {"lieu": "quai"}
+
+
+def test_the_summary_parser_tolerates_no_shape_but_its_own() -> None:
+    assert summarizer._parse_reply("pas du tout du JSON") is None
+    assert summarizer._parse_reply('["un", "tableau"]') is None
+    assert summarizer._parse_reply('{"world_state": {}}') is None
+    assert summarizer._parse_reply('{"summary": "   "}') is None
+    assert summarizer._parse_reply('{"summary": "s", "world_state": "pas un objet"}') is None
+    # A missing world_state is not a failure: the previous one is kept.
+    assert summarizer._parse_reply('{"summary": "s"}') == ("s", None)
+    assert summarizer._parse_reply('{"summary": "s", "world_state": {}}') == ("s", {})
+
+
+def test_schedule_without_a_party_a_model_or_a_readable_world_state_does_nothing(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """An unknown party, a missing model and a hand-corrupted `world_state`
+    are all quiet no-ops, never errors."""
+    calls = _stub_summary_chat(monkeypatch, reply=_summary_reply("Résumé."))
+    summarizer.schedule("no-such-party")
+    assert calls == []
+
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    _fill_party(party_id, 3, "Ancien")
+    _set_window(2)
+    _configure_model(None)
+    summarizer.schedule(party_id)
+    assert calls == []
+    assert party_id not in summarizer._locks
+    assert _summary_state(party_id) == ("", None, "{}")
+
+    _configure_model("test-model")
+    assert summarizer.parse_world_state("pas du JSON") == {}
+    assert summarizer.parse_world_state('["un tableau"]') == {}
+
+
+def test_a_commit_for_a_deleted_party_is_a_quiet_no(client: TestClient, monkeypatch: Any) -> None:
+    """A party deleted while its summary job ran leaves nothing to update."""
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    ids = _fill_party(party_id, 1, "Ancien")
+    client.delete(f"/api/parties/{party_id}")
+
+    applied = summarizer._commit(
+        party_id,
+        frontier=ids[0],
+        summary_text="Résumé orphelin.",
+        world_state={"lieu": "port"},
+        previous_world_state={},
+    )
+
+    assert applied is False

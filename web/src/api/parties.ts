@@ -1,5 +1,13 @@
 import { request, requestVoid, streamNdjson } from "./client";
-import { expectArray, expectBoolean, expectInteger, expectNumber, expectString, isRecord } from "./validate";
+import {
+  expectArray,
+  expectBoolean,
+  expectInteger,
+  expectNumber,
+  expectRecord,
+  expectString,
+  isRecord,
+} from "./validate";
 
 export type PartyRole = "user" | "assistant";
 
@@ -28,6 +36,9 @@ export interface PartySummary {
 
 export interface Party extends PartySummary {
   messages: PartyMessage[];
+  summaryText: string;
+  summaryUpto: number | null;
+  worldState: Record<string, unknown>;
 }
 
 function parsePartyRole(value: unknown, field: string): PartyRole {
@@ -77,6 +88,9 @@ function parseParty(data: unknown): Party {
   if (!isRecord(data)) throw new Error("Expected a party object");
   return {
     ...summary,
+    summaryText: expectString(data.summary_text, "summary_text"),
+    summaryUpto: data.summary_upto === null ? null : expectInteger(data.summary_upto, "summary_upto"),
+    worldState: expectRecord(data.world_state, "world_state"),
     messages: expectArray(data.messages, "messages").map((item: unknown) =>
       parsePartyMessage(item),
     ),

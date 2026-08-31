@@ -345,6 +345,7 @@ def load_history(
     instance_id: str,
     window: int,
     before_id: int | None = None,
+    after_id: int | None = None,
 ) -> list[HistoryMessage]:
     """The last `window` text messages of a party, oldest first.
 
@@ -353,6 +354,12 @@ def load_history(
     reply being replaced: with the old reply still in the prompt, the model
     reads its own text as history and writes a continuation instead of an
     alternative.
+
+    With `after_id`, only messages strictly after that id are read. The turn
+    passes the rolling summary's frontier (`instance.summary_upto`), so the
+    messages the summary already stands in for are never re-sent. The two
+    bounds compose: the regenerate path can ask for the window as it stood
+    before a reply *and* after the summary frontier.
 
     Raises ValueError when the window is below 1: SQLite reads a non-positive
     LIMIT as no limit at all, so clamping would silently return the entire
@@ -369,6 +376,9 @@ def load_history(
     if before_id is not None:
         where += " AND id < ?"
         parameters.append(before_id)
+    if after_id is not None:
+        where += " AND id > ?"
+        parameters.append(after_id)
     rows = con.execute(
         f"SELECT id, role, content, ooc FROM message WHERE {where} ORDER BY id DESC LIMIT ?",
         (*parameters, window),
