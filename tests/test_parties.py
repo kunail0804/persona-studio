@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 import uuid
 from collections.abc import Iterator
 from typing import Any
@@ -637,3 +638,449 @@ def test_turn_on_unknown_party_is_404(client: TestClient) -> None:
 
     assert response.status_code == 404
     assert client.get(f"/api/parties/{missing}").status_code == 404
+
+
+# --- Editing, regenerating, variants --------------------------------------------
+#
+# The variant invariant, asserted directly against the database after every
+# path in this section: a message with no variant rows has exactly one text
+# (`message.content`); a message with variant rows has exactly one with
+# `active = 1` and `message.content` equals it.
+
+
+def _regenerate(client: TestClient, party_id: str, message_id: int) -> Any:
+    return client.post(f"/api/parties/{party_id}/messages/{message_id}/regenerate")
+
+
+def _opening_message_id(client: TestClient, party_id: str) -> int:
+    detail = client.get(f"/api/parties/{party_id}")
+    assert detail.status_code == 200
+    return detail.json()["messages"][0]["id"]
+
+
+def _edit(client: TestClient, party_id: str, message_id: int, content: str) -> Any:
+    return client.patch(f"/api/parties/{party_id}/messages/{message_id}", json={"content": content})
+
+
+def _switch_variant(client: TestClient, party_id: str, message_id: int, variant_id: int) -> Any:
+    return client.put(
+        f"/api/parties/{party_id}/messages/{message_id}/variant", json={"variant_id": variant_id}
+    )
+
+
+def _variant_rows(message_id: int) -> list[dict[str, Any]]:
+    with db.connect() as con:
+        rows = con.execute(
+            "SELECT id, content, active FROM variant WHERE message_id = ? ORDER BY id",
+            (message_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _message_content(message_id: int) -> str:
+    with db.connect() as con:
+        return con.execute("SELECT content FROM message WHERE id = ?", (message_id,)).fetchone()[
+            "content"
+        ]
+
+
+def _assert_invariant(message_id: int) -> None:
+    rows = _variant_rows(message_id)
+    content = _message_content(message_id)
+    actives = [row for row in rows if row["active"]]
+    if not rows:
+        return
+    assert len(actives) == 1, f"expected exactly one active variant, got {actives}"
+    assert actives[0]["content"] == content
+
+
+def _insert_image_message(party_id: str) -> int:
+    with db.connect() as con:
+        cursor = con.execute(
+            "INSERT INTO message (instance_id, role, kind, content, ts) "
+            "VALUES (?, 'assistant', 'image', 'la scène', ?)",
+            (party_id, time.time()),
+        )
+        assert cursor.lastrowid is not None
+        return cursor.lastrowid
+
+
+def test_get_party_returns_variants_inline(client: TestClient, monkeypatch: Any) -> None:
+    scenario_id = _create_scenario(client)
+    party = _create_party(client, scenario_id, monkeypatch)
+    party_id = party["id"]
+    message_id = _opening_message_id(client, party["id"])
+
+    detail = client.get(f"/api/parties/{party_id}")
+    assert detail.json()["messages"][0]["variants"] == []
+
+    _stub_chat_stream(monkeypatch, replies=["Autre version."])
+    assert _regenerate(client, party_id, message_id).status_code == 200
+
+    messages = client.get(f"/api/parties/{party_id}").json()["messages"]
+    variants = messages[0]["variants"]
+    assert [(v["content"], v["active"]) for v in variants] == [
+        (OPENING, False),
+        ("Autre version.", True),
+    ]
+    assert messages[0]["content"] == "Autre version."
+    # Later messages keep their empty archive.
+    assert len(messages) == 1
+
+
+def test_edit_changes_the_text_and_keeps_the_id(client: TestClient, monkeypatch: Any) -> None:
+    scenario_id = _create_scenario(client)
+    party = _create_party(client, scenario_id, monkeypatch)
+    party_id = party["id"]
+    message_id = _opening_message_id(client, party["id"])
+
+    response = _edit(client, party_id, message_id, "  La porte est condamnée.  ")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == message_id
+    assert body["content"] == "La porte est condamnée."
+    assert _message_content(message_id) == "La porte est condamnée."
+    _assert_invariant(message_id)
+
+
+def test_edit_of_a_message_with_variants_writes_the_active_row(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """Issue #11's second criterion: the edit must reach the active variant
+    row too, or switching away and back resurrects the replaced text."""
+    scenario_id = _create_scenario(client)
+    party = _create_party(client, scenario_id, monkeypatch)
+    party_id = party["id"]
+    message_id = _opening_message_id(client, party["id"])
+    _stub_chat_stream(monkeypatch, replies=["Première variante."])
+    assert _regenerate(client, party_id, message_id).status_code == 200
+    first_variant_id = _variant_rows(message_id)[0]["id"]
+    assert _switch_variant(client, party_id, message_id, first_variant_id).status_code == 200
+
+    assert _edit(client, party_id, message_id, "Texte corrigé.").status_code == 200
+    _assert_invariant(message_id)
+
+    # Away, then back: the corrected text is still there.
+    assert _switch_variant(client, party_id, message_id, _variant_rows(message_id)[1]["id"])
+    assert _switch_variant(client, party_id, message_id, first_variant_id).status_code == 200
+    assert _message_content(message_id) == "Texte corrigé."
+    assert _variant_rows(message_id)[0]["content"] == "Texte corrigé."
+
+
+def test_edit_keeps_the_message_id_so_the_summary_frontier_is_untouched(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """`instance.summary_upto` is a message id — the rolling summary's
+    frontier — and `message.id` is the order of the story. The edit is an
+    UPDATE: recreating the row would move both."""
+    scenario_id = _create_scenario(client)
+    party = _create_party(client, scenario_id, monkeypatch)
+    party_id = party["id"]
+    message_id = _opening_message_id(client, party["id"])
+    with db.connect() as con:
+        con.execute("UPDATE instance SET summary_upto = ? WHERE id = ?", (message_id, party_id))
+
+    assert _edit(client, party_id, message_id, "Texte corrigé.").status_code == 200
+
+    with db.connect() as con:
+        row = con.execute("SELECT summary_upto FROM instance WHERE id = ?", (party_id,)).fetchone()
+        messages = con.execute(
+            "SELECT id, content FROM message WHERE instance_id = ?", (party_id,)
+        ).fetchall()
+    assert [m["id"] for m in messages] == [message_id]
+    assert messages[0]["content"] == "Texte corrigé."
+    assert row["summary_upto"] == message_id
+
+
+def test_edit_does_not_bump_updated_at(client: TestClient, monkeypatch: Any) -> None:
+    scenario_id = _create_scenario(client)
+    party = _create_party(client, scenario_id, monkeypatch)
+    party_id = party["id"]
+    with db.connect() as con:
+        con.execute("UPDATE instance SET updated_at = 1000.0 WHERE id = ?", (party_id,))
+
+    opening_id = _opening_message_id(client, party_id)
+    assert _edit(client, party_id, opening_id, "Corrigé.").status_code == 200
+
+    assert client.get(f"/api/parties/{party_id}").json()["updated_at"] == 1000.0
+
+
+def test_blank_edit_is_400(client: TestClient, monkeypatch: Any) -> None:
+    scenario_id = _create_scenario(client)
+    party = _create_party(client, scenario_id, monkeypatch)
+    message_id = _opening_message_id(client, party["id"])
+
+    for blank in ("", "   \n\t "):
+        response = _edit(client, party["id"], message_id, blank)
+        assert response.status_code == 400
+        assert "empty" in response.json()["detail"]
+
+    assert _message_content(message_id) == OPENING
+
+
+def test_edit_of_an_image_message_is_400(client: TestClient, monkeypatch: Any) -> None:
+    scenario_id = _create_scenario(client)
+    party = _create_party(client, scenario_id, monkeypatch)
+    image_id = _insert_image_message(party["id"])
+
+    response = _edit(client, party["id"], image_id, "Une légende.")
+
+    assert response.status_code == 400
+    assert "text" in response.json()["detail"]
+
+
+def test_regenerate_replaces_the_text_and_archives_the_old_reply(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    scenario_id = _create_scenario(client)
+    party = _create_party(client, scenario_id, monkeypatch)
+    party_id = party["id"]
+    message_id = _opening_message_id(client, party["id"])
+    _stub_chat_stream(monkeypatch, replies=["Le ", "quai ", "s'éveille."])
+
+    response = _regenerate(client, party_id, message_id)
+
+    assert response.status_code == 200
+    events = _ndjson_events(response.text)
+    assert [e["delta"] for e in events[:-1]] == ["Le ", "quai ", "s'éveille."]
+    assert events[-1] == {"done": True, "message_id": message_id}
+    assert _message_content(message_id) == "Le quai s'éveille."
+    variants = _variant_rows(message_id)
+    assert [(v["content"], v["active"]) for v in variants] == [
+        (OPENING, False),
+        ("Le quai s'éveille.", True),
+    ]
+    _assert_invariant(message_id)
+
+
+def test_regenerated_message_is_absent_from_the_prompt(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """The reply being regenerated must not ride in the history: with it, the
+    model reads its own text and continues instead of writing an
+    alternative."""
+    scenario_id = _create_scenario(client)
+    party = _create_party(client, scenario_id, monkeypatch)
+    party_id = party["id"]
+    opening_id = _opening_message_id(client, party["id"])
+    _stub_chat_stream(monkeypatch, replies=["Réponse 1."])
+    assert _send_turn(client, party_id, "Tour 1.").status_code == 200
+    reply = next(m for m in _party_message_rows(party_id) if m["content"] == "Réponse 1.")
+    calls = _stub_chat_stream(monkeypatch, replies=["Réponse 2."])
+
+    assert _regenerate(client, party_id, reply["id"]).status_code == 200
+
+    messages = calls[0]["messages"]
+    assert {"role": "assistant", "content": "Réponse 1."} not in messages
+    # Everything before it is still there: the opening, then the player's turn.
+    assert {"role": "assistant", "content": OPENING} in messages
+    assert {"role": "user", "content": "Tour 1."} in messages
+    assert opening_id < reply["id"]
+
+
+def test_empty_stream_leaves_everything_untouched(client: TestClient, monkeypatch: Any) -> None:
+    scenario_id = _create_scenario(client)
+    party = _create_party(client, scenario_id, monkeypatch)
+    party_id = party["id"]
+    message_id = _opening_message_id(client, party["id"])
+    with db.connect() as con:
+        con.execute("UPDATE instance SET updated_at = 1000.0 WHERE id = ?", (party_id,))
+
+    for replies in ([], ["  ", "\n\t"]):
+        _stub_chat_stream(monkeypatch, replies=replies)
+        response = _regenerate(client, party_id, message_id)
+        assert response.status_code == 200
+        # Whitespace fragments ride the stream; only the database write is skipped.
+        events = _ndjson_events(response.text)
+        assert [e["delta"] for e in events[:-1]] == replies
+        assert events[-1] == {"done": True, "message_id": None}
+        assert _variant_rows(message_id) == []
+        assert _message_content(message_id) == OPENING
+        _assert_invariant(message_id)
+
+    # The party looks exactly as it did — `updated_at` included.
+    assert client.get(f"/api/parties/{party_id}").json()["updated_at"] == 1000.0
+
+
+def test_non_empty_partial_from_a_broken_stream_becomes_the_active_variant(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    scenario_id = _create_scenario(client)
+    party = _create_party(client, scenario_id, monkeypatch)
+    party_id = party["id"]
+    message_id = _opening_message_id(client, party["id"])
+    _stub_chat_stream(monkeypatch, replies=["Le navire "], error=OllamaError("stream died mid-way"))
+
+    response = _regenerate(client, party_id, message_id)
+
+    assert response.status_code == 200
+    events = _ndjson_events(response.text)
+    assert events[0] == {"delta": "Le navire "}
+    assert events[1] == {"error": "stream died mid-way"}
+    assert events[2]["done"] is True
+    assert _message_content(message_id) == "Le navire "
+    variants = _variant_rows(message_id)
+    assert [(v["content"], v["active"]) for v in variants] == [
+        (OPENING, False),
+        ("Le navire ", True),
+    ]
+    _assert_invariant(message_id)
+
+
+def test_three_regenerations_archive_every_previous_reply(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """The opening plus each of the three alternatives: four rows, of which
+    three are the archive. The first reply is still reachable and unchanged."""
+    scenario_id = _create_scenario(client)
+    party = _create_party(client, scenario_id, monkeypatch)
+    party_id = party["id"]
+    message_id = _opening_message_id(client, party["id"])
+    for reply in ("Variante 1.", "Variante 2.", "Variante 3."):
+        _stub_chat_stream(monkeypatch, replies=[reply])
+        assert _regenerate(client, party_id, message_id).status_code == 200
+
+    variants = _variant_rows(message_id)
+    assert [v["content"] for v in variants] == [
+        OPENING,
+        "Variante 1.",
+        "Variante 2.",
+        "Variante 3.",
+    ]
+    assert [v["active"] for v in variants] == [False, False, False, True]
+    assert _message_content(message_id) == "Variante 3."
+    _assert_invariant(message_id)
+
+    # The first reply is still reachable.
+    assert _switch_variant(client, party_id, message_id, variants[0]["id"]).status_code == 200
+    assert _message_content(message_id) == OPENING
+    _assert_invariant(message_id)
+
+
+def test_regenerate_bumps_updated_at(client: TestClient, monkeypatch: Any) -> None:
+    scenario_id = _create_scenario(client)
+    party = _create_party(client, scenario_id, monkeypatch)
+    party_id = party["id"]
+    message_id = _opening_message_id(client, party["id"])
+    with db.connect() as con:
+        con.execute("UPDATE instance SET updated_at = 1000.0 WHERE id = ?", (party_id,))
+    _stub_chat_stream(monkeypatch, replies=["Nouvelle version."])
+
+    assert _regenerate(client, party_id, message_id).status_code == 200
+
+    assert client.get(f"/api/parties/{party_id}").json()["updated_at"] > 1000.0
+
+
+def test_regenerate_of_a_player_turn_is_400(client: TestClient, monkeypatch: Any) -> None:
+    scenario_id = _create_scenario(client)
+    party = _create_party(client, scenario_id, monkeypatch)
+    party_id = party["id"]
+    _stub_chat_stream(monkeypatch, replies=["Réponse."])
+    assert _send_turn(client, party_id, "Tour du joueur.").status_code == 200
+    user_id = next(m["id"] for m in _party_message_rows(party_id) if m["role"] == "user")
+
+    response = _regenerate(client, party_id, user_id)
+
+    assert response.status_code == 400
+    assert "narrator" in response.json()["detail"]
+
+
+def test_regenerate_of_an_image_message_is_400(client: TestClient, monkeypatch: Any) -> None:
+    scenario_id = _create_scenario(client)
+    party = _create_party(client, scenario_id, monkeypatch)
+    image_id = _insert_image_message(party["id"])
+
+    response = _regenerate(client, party["id"], image_id)
+
+    assert response.status_code == 400
+    assert "narrator" in response.json()["detail"]
+
+
+def test_switch_variant_activates_that_variant(client: TestClient, monkeypatch: Any) -> None:
+    scenario_id = _create_scenario(client)
+    party = _create_party(client, scenario_id, monkeypatch)
+    party_id = party["id"]
+    message_id = _opening_message_id(client, party["id"])
+    _stub_chat_stream(monkeypatch, replies=["Variante."])
+    assert _regenerate(client, party_id, message_id).status_code == 200
+    first_variant_id = _variant_rows(message_id)[0]["id"]
+
+    response = _switch_variant(client, party_id, message_id, first_variant_id)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["content"] == OPENING
+    assert [(v["content"], v["active"]) for v in body["variants"]] == [
+        (OPENING, True),
+        ("Variante.", False),
+    ]
+    assert _message_content(message_id) == OPENING
+    _assert_invariant(message_id)
+    # Switching navigates the archive: it grows it by nothing.
+    assert len(_variant_rows(message_id)) == 2
+
+
+def test_switch_to_an_unknown_variant_is_404(client: TestClient, monkeypatch: Any) -> None:
+    scenario_id = _create_scenario(client)
+    party = _create_party(client, scenario_id, monkeypatch)
+    party_id = party["id"]
+    message_id = _opening_message_id(client, party["id"])
+
+    response = _switch_variant(client, party_id, message_id, 999999)
+
+    assert response.status_code == 404
+    assert _message_content(message_id) == OPENING
+
+
+def test_edit_regenerate_and_switch_on_unknown_targets_are_404(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    scenario_id = _create_scenario(client)
+    party = _create_party(client, scenario_id, monkeypatch)
+    other_party_id = party["id"]
+    other_message_id = _opening_message_id(client, party["id"])
+    other_variant = _variant_rows(other_message_id)
+    assert other_variant == []
+    stranger = _create_party(client, scenario_id, monkeypatch)
+    stranger_message_id = _opening_message_id(client, stranger["id"])
+    _stub_chat_stream(monkeypatch, replies=["Variante."])
+    assert _regenerate(client, stranger["id"], stranger_message_id).status_code == 200
+    stranger_variant_id = _variant_rows(stranger_message_id)[0]["id"]
+    missing = uuid.uuid4().hex
+    missing_message = 999999
+
+    # Unknown party.
+    assert _edit(client, missing, missing_message, "x").status_code == 404
+    assert _regenerate(client, missing, missing_message).status_code == 404
+    assert _switch_variant(client, missing, missing_message, 1).status_code == 404
+    # Unknown message in a real party.
+    assert _edit(client, other_party_id, missing_message, "x").status_code == 404
+    assert _regenerate(client, other_party_id, missing_message).status_code == 404
+    assert _switch_variant(client, other_party_id, missing_message, 1).status_code == 404
+    # A message, and a variant, belonging to another party.
+    assert _edit(client, other_party_id, stranger_message_id, "x").status_code == 404
+    assert _regenerate(client, other_party_id, stranger_message_id).status_code == 404
+    assert (
+        _switch_variant(client, other_party_id, other_message_id, stranger_variant_id).status_code
+        == 404
+    )
+
+
+def test_editing_and_regenerating_run_the_shared_stream_contract(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """A regeneration sends the assembled system prompt and the configured
+    num_ctx, exactly as a played turn does — one machinery, two callers."""
+    scenario_id = _create_scenario(client, "La Cité Noyée")
+    _configure_model("test-model", num_ctx=4096)
+    party = _create_party(client, scenario_id, monkeypatch)
+    message_id = _opening_message_id(client, party["id"])
+    calls = _stub_chat_stream(monkeypatch, replies=["Nouvelle ouverture."])
+
+    assert _regenerate(client, party["id"], message_id).status_code == 200
+
+    assert len(calls) == 1
+    assert calls[0]["model"] == "test-model"
+    assert calls[0]["num_ctx"] == 4096
+    assert "Scenario: La Cité Noyée" in calls[0]["messages"][0]["content"]

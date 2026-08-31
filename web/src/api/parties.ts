@@ -1,13 +1,20 @@
 import { request, requestVoid, streamNdjson } from "./client";
-import { expectArray, expectNumber, expectString, isRecord } from "./validate";
+import { expectArray, expectBoolean, expectInteger, expectNumber, expectString, isRecord } from "./validate";
 
 export type PartyRole = "user" | "assistant";
+
+export interface MessageVariant {
+  id: number;
+  content: string;
+  active: boolean;
+}
 
 export interface PartyMessage {
   id: number;
   role: PartyRole;
   content: string;
   ts: number;
+  variants: MessageVariant[];
 }
 
 export interface PartySummary {
@@ -31,13 +38,25 @@ function parsePartyRole(value: unknown, field: string): PartyRole {
   return role;
 }
 
+function parseMessageVariant(data: unknown): MessageVariant {
+  if (!isRecord(data)) throw new Error("Expected a message variant object");
+  return {
+    id: expectInteger(data.id, "id"),
+    content: expectString(data.content, "content"),
+    active: expectBoolean(data.active, "active"),
+  };
+}
+
 function parsePartyMessage(data: unknown): PartyMessage {
   if (!isRecord(data)) throw new Error("Expected a party message object");
   return {
-    id: expectNumber(data.id, "id"),
+    id: expectInteger(data.id, "id"),
     role: parsePartyRole(data.role, "role"),
     content: expectString(data.content, "content"),
     ts: expectNumber(data.ts, "ts"),
+    variants: expectArray(data.variants, "variants").map((item: unknown) =>
+      parseMessageVariant(item),
+    ),
   };
 }
 
@@ -133,4 +152,48 @@ export async function sendTurn(
   await streamNdjson(`/parties/${id}/messages`, { content }, signal, (data: unknown) =>
     onEvent(parseTurnEvent(data)),
   );
+}
+
+/**
+ * Asks for another reply to one narrator message, streamed exactly like a
+ * turn. Server-side the old reply is archived as a variant and stays
+ * reachable; the replacement is committed only once text has arrived, so an
+ * empty stream leaves the message as it was.
+ */
+export async function regenerateMessage(
+  id: string,
+  messageId: number,
+  onEvent: (event: TurnEvent) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  await streamNdjson(
+    `/parties/${id}/messages/${messageId}/regenerate`,
+    {},
+    signal,
+    (data: unknown) => onEvent(parseTurnEvent(data)),
+  );
+}
+
+/** Corrects a message's text in place, keeping the message's id. */
+export function editMessage(
+  partyId: string,
+  messageId: number,
+  content: string,
+): Promise<PartyMessage> {
+  return request(`/parties/${partyId}/messages/${messageId}`, parsePartyMessage, {
+    method: "PATCH",
+    body: JSON.stringify({ content }),
+  });
+}
+
+/** Makes one archived variant the message's active text. */
+export function setMessageVariant(
+  partyId: string,
+  messageId: number,
+  variantId: number,
+): Promise<PartyMessage> {
+  return request(`/parties/${partyId}/messages/${messageId}/variant`, parsePartyMessage, {
+    method: "PUT",
+    body: JSON.stringify({ variant_id: variantId }),
+  });
 }
