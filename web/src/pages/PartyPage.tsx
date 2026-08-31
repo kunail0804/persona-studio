@@ -1,10 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { ApiError } from "../api/client";
-import { getParty, sendTurn } from "../api/parties";
+import {
+  editMessage,
+  getParty,
+  regenerateMessage,
+  sendTurn,
+  setMessageVariant,
+} from "../api/parties";
 import type { Party, PartyMessage, TurnEvent } from "../api/parties";
 import { Narration } from "../components/Narration";
 import { Button } from "../components/Button";
+import { TextArea } from "../components/TextArea";
 
 // The bubble re-renders at most this often while fragments arrive. Every
 // fragment is still accumulated; only the re-render is throttled. The
@@ -21,6 +28,13 @@ function messageFor(error: unknown, fallback: string): string {
   return error instanceof ApiError ? error.detail : fallback;
 }
 
+function replaceMessage(party: Party, messageId: number, updated: PartyMessage): Party {
+  return {
+    ...party,
+    messages: party.messages.map((m) => (m.id === messageId ? updated : m)),
+  };
+}
+
 export function PartyPage() {
   const { id } = useParams<{ id: string }>();
 
@@ -28,12 +42,14 @@ export function PartyPage() {
   const [error, setError] = useState<string | null>(null);
 
   // The turn being played: the optimistic player bubble, the growing reply,
-  // and why the stream broke, if it broke.
+  // and why the stream broke, if it broke. `regeneratingId` marks the
+  // message a regeneration is replacing instead of appending a new bubble.
   const [input, setInput] = useState("");
   const [pending, setPending] = useState<string | null>(null);
   const [streamText, setStreamText] = useState<string | null>(null);
   const [streamError, setStreamError] = useState<string | null>(null);
   const [streaming, setStreaming] = useState(false);
+  const [regeneratingId, setRegeneratingId] = useState<number | null>(null);
 
   const load = useCallback(async (partyId: string, signal?: AbortSignal): Promise<boolean> => {
     try {
@@ -66,10 +82,12 @@ export function PartyPage() {
     endRef.current?.scrollIntoView();
   }, [partyId]);
 
-  // Keep the growing reply in view while it streams.
+  // Keep the growing reply in view while a turn streams. A regeneration
+  // replaces its bubble in place — wherever that sits in the transcript — so
+  // the view must not jump to the end while it runs.
   useEffect(() => {
-    if (streamText !== null) endRef.current?.scrollIntoView();
-  }, [streamText]);
+    if (streamText !== null && regeneratingId === null) endRef.current?.scrollIntoView();
+  }, [streamText, regeneratingId]);
 
   // The reply accumulates in a ref — the state only mirrors it for rendering,
   // throttled to one pass per RENDER_INTERVAL_MS.
@@ -111,6 +129,36 @@ export function PartyPage() {
     [onDelta],
   );
 
+  // Both run before the early returns below: hooks must not be conditional.
+  // They rethrow so a caller (the message editor) can keep its draft.
+  const saveEdit = useCallback(
+    async (messageId: number, content: string) => {
+      if (!id) return;
+      try {
+        const updated = await editMessage(id, messageId, content);
+        setParty((current) => (current ? replaceMessage(current, messageId, updated) : current));
+      } catch (err) {
+        setError(messageFor(err, "Impossible d'enregistrer la modification."));
+        throw err;
+      }
+    },
+    [id],
+  );
+
+  const switchVariant = useCallback(
+    async (messageId: number, variantId: number) => {
+      if (!id) return;
+      try {
+        const updated = await setMessageVariant(id, messageId, variantId);
+        setParty((current) => (current ? replaceMessage(current, messageId, updated) : current));
+      } catch (err) {
+        setError(messageFor(err, "Impossible de changer de variante."));
+        throw err;
+      }
+    },
+    [id],
+  );
+
   if (!id) {
     return <p className="text-red-400">Partie introuvable.</p>;
   }
@@ -136,15 +184,12 @@ export function PartyPage() {
       bufferRef.current = "";
       setStreamText(null);
       setPending(null);
+      setRegeneratingId(null);
     }
     setStreaming(false);
   };
 
-  const send = async () => {
-    const content = input.trim();
-    if (!content || controllerRef.current !== null) return;
-    setInput("");
-    setPending(content);
+  const startStream = (): AbortController => {
     setStreamText(null);
     setStreamError(null);
     setStreaming(true);
@@ -152,6 +197,15 @@ export function PartyPage() {
     lastRenderRef.current = 0;
     const controller = new AbortController();
     controllerRef.current = controller;
+    return controller;
+  };
+
+  const send = async () => {
+    const content = input.trim();
+    if (!content || controllerRef.current !== null) return;
+    setInput("");
+    setPending(content);
+    const controller = startStream();
     let stopped = false;
     try {
       await sendTurn(id, content, onEvent, controller.signal);
@@ -167,6 +221,24 @@ export function PartyPage() {
         setStreamError(err.detail);
       } else {
         setInput(content);
+        setStreamError(messageFor(err, "La connexion au narrateur a été interrompue."));
+      }
+    } finally {
+      await finishTurn(stopped);
+    }
+  };
+
+  const regenerate = async (messageId: number) => {
+    if (controllerRef.current !== null) return;
+    setRegeneratingId(messageId);
+    const controller = startStream();
+    let stopped = false;
+    try {
+      await regenerateMessage(id, messageId, onEvent, controller.signal);
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        stopped = true;
+      } else {
         setStreamError(messageFor(err, "La connexion au narrateur a été interrompue."));
       }
     } finally {
@@ -192,11 +264,28 @@ export function PartyPage() {
         <p className="text-neutral-500">Aucun message pour l'instant.</p>
       ) : null}
       <ul className="flex flex-col gap-4">
-        {party?.messages.map((message) => (
-          <MessageBubble key={message.id} message={message} />
+        {party.messages.map((message) => (
+          <MessageBubble
+            key={message.id}
+            message={message}
+            disabled={streaming}
+            regenerating={regeneratingId === message.id}
+            // The old reply stays on screen until the first token of the new
+            // one arrives: `overrideText` is undefined until then.
+            overrideText={
+              regeneratingId === message.id && streamText !== null ? streamText : undefined
+            }
+            onSaveEdit={saveEdit}
+            onRegenerate={(messageTarget) => void regenerate(messageTarget)}
+            onSwitchVariant={(messageTarget, variantId) =>
+              void switchVariant(messageTarget, variantId)
+            }
+          />
         ))}
-        {pending !== null ? <MessageBubble message={pendingMessage(pending)} /> : null}
-        {streamText !== null ? <StreamingBubble text={streamText} /> : null}
+        {pending !== null ? <MessageBubble message={pendingMessage(pending)} disabled /> : null}
+        {streamText !== null && regeneratingId === null ? (
+          <StreamingBubble text={streamText} />
+        ) : null}
       </ul>
       <div ref={endRef} />
       {streamError ? <p className="text-sm text-red-400">{streamError}</p> : null}
@@ -229,12 +318,63 @@ export function PartyPage() {
 }
 
 function pendingMessage(content: string): PartyMessage {
-  // A stand-in until the reload brings the real row with its id.
-  return { id: -1, role: "user", content, ts: 0 };
+  // A stand-in until the reload brings the real row with its id. It exists
+  // only while a turn is streaming, so its actions are disabled with the
+  // bubble's `disabled` prop — its negative id is never sent anywhere.
+  return { id: -1, role: "user", content, ts: 0, variants: [] };
 }
 
-function MessageBubble({ message }: { message: PartyMessage }) {
+interface MessageBubbleProps {
+  message: PartyMessage;
+  disabled: boolean;
+  regenerating?: boolean;
+  overrideText?: string;
+  onSaveEdit?: (messageId: number, content: string) => Promise<void>;
+  onRegenerate?: (messageId: number) => void;
+  onSwitchVariant?: (messageId: number, variantId: number) => void;
+}
+
+function MessageBubble({
+  message,
+  disabled,
+  regenerating = false,
+  overrideText,
+  onSaveEdit,
+  onRegenerate,
+  onSwitchVariant,
+}: MessageBubbleProps) {
   const isPlayer = message.role === "user";
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const startEdit = () => {
+    setDraft(message.content);
+    setEditing(true);
+  };
+
+  const save = async () => {
+    const content = draft.trim();
+    if (!content || saving || !onSaveEdit) return;
+    setSaving(true);
+    try {
+      await onSaveEdit(message.id, content);
+      setEditing(false);
+    } catch {
+      // The page displays the reason; the editor stays open on the draft.
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const activeIndex = message.variants.findIndex((v) => v.active);
+  const previousVariant = activeIndex > 0 ? message.variants[activeIndex - 1] : null;
+  const nextVariant =
+    activeIndex >= 0 && activeIndex < message.variants.length - 1
+      ? message.variants[activeIndex + 1]
+      : null;
+  const text = overrideText ?? message.content;
+
   return (
     <li
       className={`rounded-lg border p-4 ${
@@ -244,12 +384,86 @@ function MessageBubble({ message }: { message: PartyMessage }) {
       <p className="text-xs font-medium uppercase tracking-wide text-neutral-500">
         {isPlayer ? "Vous" : "Narration"}
       </p>
-      {isPlayer ? (
-        // The player's own text, not the narrator's: it stays plain, so what
-        // they typed is what they see.
-        <p className="mt-2 whitespace-pre-wrap text-neutral-100">{message.content}</p>
+      {editing ? (
+        <div className="mt-2 flex flex-col gap-2">
+          <TextArea
+            label="Message"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            disabled={saving}
+            autoFocus
+          />
+          <div className="flex gap-2">
+            <Button onClick={() => void save()} disabled={saving || !draft.trim()}>
+              Enregistrer
+            </Button>
+            <Button variant="secondary" onClick={() => setEditing(false)} disabled={saving}>
+              Annuler
+            </Button>
+          </div>
+        </div>
       ) : (
-        <Narration text={message.content} />
+        <>
+          {isPlayer ? (
+            // The player's own text, not the narrator's: it stays plain, so what
+            // they typed is what they see.
+            <p className="mt-2 whitespace-pre-wrap text-neutral-100">{text}</p>
+          ) : (
+            <Narration text={text} />
+          )}
+          {regenerating ? <p className="mt-2 text-xs text-neutral-500">Régénération…</p> : null}
+          {message.variants.length > 1 ? (
+            <div className="mt-2 flex items-center gap-2 text-xs text-neutral-500">
+              <Button
+                variant="secondary"
+                className="text-xs"
+                disabled={disabled || previousVariant === null}
+                onClick={() => {
+                  if (previousVariant && onSwitchVariant) {
+                    onSwitchVariant(message.id, previousVariant.id);
+                  }
+                }}
+              >
+                ←
+              </Button>
+              <span>
+                {activeIndex + 1} / {message.variants.length}
+              </span>
+              <Button
+                variant="secondary"
+                className="text-xs"
+                disabled={disabled || nextVariant === null}
+                onClick={() => {
+                  if (nextVariant && onSwitchVariant) {
+                    onSwitchVariant(message.id, nextVariant.id);
+                  }
+                }}
+              >
+                →
+              </Button>
+            </div>
+          ) : null}
+          <div className="mt-2 flex gap-2">
+            <Button
+              variant="secondary"
+              className="text-xs"
+              disabled={disabled || !onSaveEdit}
+              onClick={startEdit}
+            >
+              Modifier
+            </Button>
+            {!isPlayer && onRegenerate ? (
+              <Button
+                variant="secondary"
+                className="text-xs"
+                disabled={disabled}
+                onClick={() => onRegenerate(message.id)}
+              >
+                Régénérer
+              </Button>
+            ) : null}
+          </div>
+        </>
       )}
     </li>
   );

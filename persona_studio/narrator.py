@@ -340,8 +340,19 @@ def load_active_persona(con: sqlite3.Connection) -> PromptPersona | None:
     )
 
 
-def load_history(con: sqlite3.Connection, instance_id: str, window: int) -> list[HistoryMessage]:
+def load_history(
+    con: sqlite3.Connection,
+    instance_id: str,
+    window: int,
+    before_id: int | None = None,
+) -> list[HistoryMessage]:
     """The last `window` text messages of a party, oldest first.
+
+    With `before_id`, only messages strictly before that id are read. The
+    regenerate path uses it to ask for the history as it stood before the
+    reply being replaced: with the old reply still in the prompt, the model
+    reads its own text as history and writes a continuation instead of an
+    alternative.
 
     Raises ValueError when the window is below 1: SQLite reads a non-positive
     LIMIT as no limit at all, so clamping would silently return the entire
@@ -353,11 +364,14 @@ def load_history(con: sqlite3.Connection, instance_id: str, window: int) -> list
     """
     if window < 1:
         raise ValueError(f"History window must be at least 1, got {window}")
+    where = "instance_id = ? AND kind = 'text'"
+    parameters: list[str | int] = [instance_id]
+    if before_id is not None:
+        where += " AND id < ?"
+        parameters.append(before_id)
     rows = con.execute(
-        "SELECT id, role, content, ooc FROM message "
-        "WHERE instance_id = ? AND kind = 'text' "
-        "ORDER BY id DESC LIMIT ?",
-        (instance_id, window),
+        f"SELECT id, role, content, ooc FROM message WHERE {where} ORDER BY id DESC LIMIT ?",
+        (*parameters, window),
     ).fetchall()
     return [
         HistoryMessage(

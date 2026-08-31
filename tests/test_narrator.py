@@ -354,6 +354,28 @@ def test_image_messages_never_reach_the_narrator(connection: sqlite3.Connection)
     assert all("the generated scene" not in message["content"] for message in received)
 
 
+def test_load_history_before_id_stops_before_that_message(
+    connection: sqlite3.Connection,
+) -> None:
+    """The regenerate path asks for the history as it stood before the reply
+    being replaced, so that reply is excluded from the prompt."""
+    instance_id = _new_instance(connection)
+    ids = _insert_messages(
+        connection,
+        instance_id,
+        [("assistant" if i % 2 else "user", "text", f"m{i}", 0) for i in range(5)],
+    )
+
+    messages = load_history(connection, instance_id, 10, before_id=ids[3])
+    assert [message.id for message in messages] == ids[:3]
+
+    # Default behaviour is unchanged: without `before_id`, everything is read.
+    assert [message.id for message in load_history(connection, instance_id, 10)] == ids
+
+    # A before_id below every id yields nothing, not an error.
+    assert load_history(connection, instance_id, 10, before_id=ids[0]) == []
+
+
 def test_ooc_flag_survives_the_loader(connection: sqlite3.Connection) -> None:
     instance_id = _new_instance(connection)
     _insert_messages(connection, instance_id, [("user", "text", "Pause a moment.", 1)])
