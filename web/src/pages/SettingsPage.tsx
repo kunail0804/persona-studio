@@ -1,13 +1,16 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError } from "../api/client";
 import type { Persona, PersonaInput } from "../api/personas";
 import { createPersona, deletePersona, listPersonas, setActivePersona, updatePersona } from "../api/personas";
 import type { LlmSettings } from "../api/settings";
 import { getLlmSettings, updateLlmSettings } from "../api/settings";
+import type { Workflow } from "../api/workflows";
+import { deleteWorkflow, importWorkflow, listWorkflows, setActiveWorkflow, updateWorkflow } from "../api/workflows";
 import { Button } from "../components/Button";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { PersonaForm } from "../components/PersonaForm";
 import { TextField } from "../components/TextField";
+import { isRecord } from "../api/validate";
 
 function messageFor(error: unknown, fallback: string): string {
   return error instanceof ApiError ? error.detail : fallback;
@@ -18,13 +21,21 @@ function parseBoundedInt(value: string, min: number, max: number): number | null
   return Number.isInteger(parsed) && parsed >= min && parsed <= max ? parsed : null;
 }
 
+function optionValue(node: string, field: string): string {
+  return `${node}::${field}`;
+}
+
 export function SettingsPage() {
   const [personas, setPersonas] = useState<Persona[]>([]);
+  const [workflows, setWorkflows] = useState<Workflow[]>([]);
   const [llm, setLlm] = useState<LlmSettings | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [addingPersona, setAddingPersona] = useState(false);
   const [editingPersonaId, setEditingPersonaId] = useState<string | null>(null);
   const [confirmDeletePersonaId, setConfirmDeletePersonaId] = useState<string | null>(null);
+  const [confirmDeleteWorkflowId, setConfirmDeleteWorkflowId] = useState<string | null>(null);
+  const [importingWorkflow, setImportingWorkflow] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [model, setModel] = useState<string | null>(null);
   const [numCtx, setNumCtx] = useState("");
@@ -33,8 +44,13 @@ export function SettingsPage() {
 
   const load = useCallback(async (signal?: AbortSignal) => {
     try {
-      const [personaData, llmData] = await Promise.all([listPersonas(signal), getLlmSettings(signal)]);
+      const [personaData, llmData, workflowData] = await Promise.all([
+        listPersonas(signal),
+        getLlmSettings(signal),
+        listWorkflows(signal),
+      ]);
       setPersonas(personaData);
+      setWorkflows(workflowData);
       setLlm(llmData);
       setModel(llmData.model);
       setNumCtx(String(llmData.numCtx));
@@ -94,6 +110,72 @@ export function SettingsPage() {
       await reload();
     } catch (err) {
       setError(messageFor(err, "Impossible de définir la persona active."));
+    }
+  }
+
+  async function handleImportWorkflow(file: File) {
+    const name = file.name.replace(/\.json$/i, "") || "Workflow";
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await file.text());
+    } catch {
+      setError(`« ${file.name} » n'est pas un fichier JSON valide.`);
+      return;
+    }
+    if (!isRecord(parsed) || Array.isArray(parsed)) {
+      setError(
+        `« ${file.name} » n'est pas un export de workflow : il faut un objet JSON, l'export « Export (API) » de ComfyUI.`,
+      );
+      return;
+    }
+    try {
+      setImportingWorkflow(true);
+      await importWorkflow({ name, graph: parsed });
+      await reload();
+      setError(null);
+    } catch (err) {
+      setError(messageFor(err, `Impossible d'importer « ${file.name} ».`));
+    } finally {
+      setImportingWorkflow(false);
+      // Reset the input so re-selecting the same file fires a change event.
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
+
+  async function handleUpdateWorkflow(workflowId: string, patch: {
+    name: string;
+    promptNode: string;
+    promptField: string;
+    seedNode: string;
+    seedField: string;
+  }) {
+    try {
+      await updateWorkflow(workflowId, patch);
+      await reload();
+      setError(null);
+    } catch (err) {
+      setError(messageFor(err, "Impossible d'enregistrer la configuration du workflow."));
+    }
+  }
+
+  async function handleDeleteWorkflow(workflowId: string) {
+    try {
+      await deleteWorkflow(workflowId);
+      await reload();
+    } catch (err) {
+      setError(messageFor(err, "Impossible de supprimer le workflow."));
+    } finally {
+      setConfirmDeleteWorkflowId(null);
+    }
+  }
+
+  async function handleActivateWorkflow(workflowId: string) {
+    try {
+      await setActiveWorkflow(workflowId);
+      await reload();
+      setError(null);
+    } catch (err) {
+      setError(messageFor(err, "Impossible de définir le workflow actif."));
     }
   }
 
@@ -178,6 +260,48 @@ export function SettingsPage() {
         )}
       </section>
 
+      <section className="flex flex-col gap-4">
+        <div className="flex items-center justify-between">
+          <h2 className="text-xl font-semibold">Workflow ComfyUI</h2>
+          <label className="inline-flex cursor-pointer items-center rounded bg-sky-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-sky-500">
+            {importingWorkflow ? "Import…" : "Importer un workflow"}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".json"
+              className="hidden"
+              disabled={importingWorkflow}
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) void handleImportWorkflow(file);
+              }}
+            />
+          </label>
+        </div>
+        <p className="text-sm text-neutral-500">
+          Importez l'export <span className="font-medium">Export (API)</span> de ComfyUI, puis
+          choisissez dans quel nœud et quel champ le prompt est injecté.
+        </p>
+
+        {workflows.length === 0 ? (
+          <p className="text-neutral-500">
+            Aucun workflow : importez-en un pour que la génération d'images puisse fonctionner.
+          </p>
+        ) : (
+          <ul className="flex flex-col gap-3">
+            {workflows.map((workflow) => (
+              <WorkflowListItem
+                key={workflow.id}
+                workflow={workflow}
+                onSelect={() => void handleActivateWorkflow(workflow.id)}
+                onPatch={(patch) => void handleUpdateWorkflow(workflow.id, patch)}
+                onDelete={() => setConfirmDeleteWorkflowId(workflow.id)}
+              />
+            ))}
+          </ul>
+        )}
+      </section>
+
       <section className="flex flex-col gap-3">
         <h2 className="text-xl font-semibold">Modèle de narration</h2>
 
@@ -242,7 +366,116 @@ export function SettingsPage() {
         }}
         onCancel={() => setConfirmDeletePersonaId(null)}
       />
+
+      <ConfirmDialog
+        open={confirmDeleteWorkflowId !== null}
+        title="Supprimer ce workflow ?"
+        description="Cette action est définitive. S'il était actif, un autre workflow valide devient actif."
+        onConfirm={() => {
+          if (confirmDeleteWorkflowId !== null) void handleDeleteWorkflow(confirmDeleteWorkflowId);
+        }}
+        onCancel={() => setConfirmDeleteWorkflowId(null)}
+      />
     </div>
+  );
+}
+
+interface WorkflowListItemProps {
+  workflow: Workflow;
+  onSelect: () => void;
+  onPatch: (patch: { name: string; promptNode: string; promptField: string; seedNode: string; seedField: string }) => void;
+  onDelete: () => void;
+}
+
+const selectClasses =
+  "rounded border border-neutral-700 bg-neutral-900 px-3 py-2 text-neutral-100 focus:border-sky-500 focus:outline-none";
+
+function WorkflowListItem({ workflow, onSelect, onPatch, onDelete }: WorkflowListItemProps) {
+  const promptValue =
+    workflow.promptNode && workflow.promptField
+      ? optionValue(workflow.promptNode, workflow.promptField)
+      : "";
+  const seedValue =
+    workflow.seedNode && workflow.seedField ? optionValue(workflow.seedNode, workflow.seedField) : "";
+
+  const patch = (promptNode: string, promptField: string, seedNode: string, seedField: string) =>
+    onPatch({ name: workflow.name, promptNode, promptField, seedNode, seedField });
+
+  return (
+    <li className="rounded-lg border border-neutral-800 bg-neutral-900 p-4">
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex items-center gap-2">
+          <h3 className="font-medium">{workflow.name || "Sans nom"}</h3>
+          {workflow.isActive ? (
+            <span className="rounded bg-sky-900 px-2 py-0.5 text-xs text-sky-300">Actif</span>
+          ) : null}
+        </div>
+        <div className="flex shrink-0 items-center gap-1">
+          {!workflow.isActive ? (
+            <Button variant="secondary" onClick={onSelect}>
+              Activer
+            </Button>
+          ) : null}
+          <Button variant="danger" onClick={onDelete}>
+            Supprimer
+          </Button>
+        </div>
+      </div>
+
+      {workflow.problem ? <p className="mt-2 text-sm text-amber-400">{workflow.problem}</p> : null}
+
+      <div className="mt-3 grid gap-3 sm:grid-cols-2">
+        <label className="flex flex-col gap-1 text-sm text-neutral-300">
+          <span className="font-medium">Champ du prompt</span>
+          <select
+            className={selectClasses}
+            value={promptValue}
+            onChange={(event) => {
+              if (event.target.value === "") {
+                patch("", "", workflow.seedNode, workflow.seedField);
+                return;
+              }
+              const option = workflow.promptOptions.find(
+                (o) => optionValue(o.node, o.field) === event.target.value,
+              );
+              if (option) patch(option.node, option.field, workflow.seedNode, workflow.seedField);
+            }}
+          >
+            <option value="">Non configuré</option>
+            {workflow.promptOptions.map((o) => (
+              <option key={optionValue(o.node, o.field)} value={optionValue(o.node, o.field)}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label className="flex flex-col gap-1 text-sm text-neutral-300">
+          <span className="font-medium">Champ de la graine</span>
+          <select
+            className={selectClasses}
+            value={seedValue}
+            onChange={(event) => {
+              if (event.target.value === "") {
+                patch(workflow.promptNode, workflow.promptField, "", "");
+                return;
+              }
+              const option = workflow.seedOptions.find(
+                (o) => optionValue(o.node, o.field) === event.target.value,
+              );
+              if (option) patch(workflow.promptNode, workflow.promptField, option.node, option.field);
+            }}
+          >
+            <option value="">Aucune (graine aléatoire)</option>
+            {workflow.seedOptions.map((o) => (
+              <option key={optionValue(o.node, o.field)} value={optionValue(o.node, o.field)}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+    </li>
   );
 }
 

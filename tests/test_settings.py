@@ -335,6 +335,8 @@ def test_settings_round_trip_through_json_storage(client: TestClient) -> None:
     with db.connect() as con:
         settings.set_num_ctx(con, 2048)
         settings.set_active_persona_id(con, "abc123")
+        settings.set_active_workflow_id(con, "wf456")
         raw = {row["key"]: row["value"] for row in con.execute("SELECT key, value FROM setting")}
     assert json.loads(raw[settings.NUM_CTX_KEY]) == 2048
     assert json.loads(raw[settings.ACTIVE_PERSONA_KEY]) == "abc123"
+    assert json.loads(raw[settings.WORKFLOW_ACTIVE_KEY]) == "wf456"
