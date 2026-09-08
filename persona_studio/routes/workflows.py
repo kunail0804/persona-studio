@@ -180,14 +180,18 @@ def update_workflow(workflow_id: str, body: WorkflowPatch) -> WorkflowOut:
 def set_active_workflow(body: ActiveWorkflowInput) -> WorkflowOut:
     # The row check reads, and the setting write depends on it: on the default
     # transaction the row could be deleted in between, so the write lock is
-    # taken up front. `problem()` is the same rule the generator enforces —
-    # activating a workflow that cannot generate would leave the setting
-    # pointing at a broken graph until a later read healed it.
+    # taken up front. Activation refuses only what can never be used as it
+    # stands — a stored graph that does not parse as an API-format graph. A
+    # valid but unmapped workflow is activatable: the first import is unmapped
+    # and auto-activated, so refusing it here would make a reachable state
+    # unreachable by choice. Whether generation is possible yet stays the
+    # read-only `problem` field and the generator's own refusal.
     with db.connect(immediate=True) as con:
         row = _get_workflow_row(con, body.id)
-        message = workflows.problem(row)
-        if message is not None:
-            raise HTTPException(status_code=422, detail=message)
+        try:
+            workflows.parse_stored_graph(row["graph"])
+        except workflows.InvalidWorkflow as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         settings.set_active_workflow_id(con, body.id)
     return _workflow_item(row, body.id)
 

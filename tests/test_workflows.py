@@ -348,6 +348,29 @@ def test_healing_and_the_active_choice_take_the_write_lock_first(
     assert modes == [True, True]
 
 
+def test_activating_a_valid_but_unmapped_workflow_succeeds(client: TestClient) -> None:
+    # Activation only refuses what can never be used: a stored graph that does
+    # not parse. "Not mapped yet" is not that — the first import is unmapped
+    # and auto-activated, so refusing it here would make a reachable state
+    # unreachable by choice. Generation still refuses on its own (issue #15,
+    # criterion 3) via `problem()` on the read model.
+    first = _import(client, "First", api_graph())
+    second = _import(client, "Second", api_graph())
+    assert second["problem"] is not None
+
+    response = client.put("/api/workflows/active", json={"id": second["id"]})
+
+    assert response.status_code == 200
+    assert response.json()["is_active"] is True
+    # Asserted on the database before any GET: the read path heals, so a
+    # follow-up GET would prove nothing about set_active_workflow itself.
+    with db.connect() as con:
+        assert settings.get_active_workflow_id(con) == second["id"]
+    listed = client.get("/api/workflows").json()
+    assert next(w for w in listed if w["id"] == first["id"])["is_active"] is False
+    assert next(w for w in listed if w["id"] == second["id"])["is_active"] is True
+
+
 def test_the_active_choice_cannot_be_a_broken_workflow(client: TestClient) -> None:
     first = _import(client, "First", api_graph())
     second = _import(client, "Second", api_graph())
