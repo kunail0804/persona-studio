@@ -302,25 +302,106 @@ def test_patch_rejects_a_mapping_the_graph_does_not_offer(client: TestClient) ->
     assert patch("6", "text", seed_node="6", seed_field="text").status_code == 422
 
 
+def test_a_bool_field_is_rejected_as_a_seed_mapping(client: TestClient) -> None:
+    # Pinned on purpose: the bool exclusion in `_is_int_literal` is the rule
+    # that stops a raw PATCH mapping a boolean widget as a seed.
+    workflow = _import(client, "Krea", api_graph())
+    response = client.patch(
+        f"/api/workflows/{workflow['id']}",
+        json={
+            "name": "Krea",
+            "prompt_node": "6",
+            "prompt_field": "text",
+            "seed_node": "7",
+            "seed_field": "flag",
+        },
+    )
+    assert response.status_code == 422
+    assert "no longer holds an integer" in response.json()["detail"]
+
+
 # --- 5. Healing ---------------------------------------------------------------
+
+
+def test_healing_and_the_active_choice_take_the_write_lock_first(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # White-box pin of the transaction mode: the lost update itself was
+    # reproduced end to end with two concurrent requests, but two statements
+    # cannot be interleaved deterministically in a threaded test. What is
+    # pinned here is the rule that closes the window — any route whose first
+    # statements are a read-check-write must start BEGIN IMMEDIATE.
+    modes: list[bool] = []
+    real_connect = db.connect
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        modes.append(bool(kwargs.get("immediate", False)))
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(db, "connect", spy)
+
+    workflow = _import(client, "Krea", api_graph())
+    _set_mapping(client, workflow["id"], "Krea", "6", "text")
+    modes.clear()
+    assert client.get("/api/workflows").status_code == 200
+    assert client.put("/api/workflows/active", json={"id": workflow["id"]}).status_code == 200
+    assert modes == [True, True]
+
+
+def test_the_active_choice_cannot_be_a_broken_workflow(client: TestClient) -> None:
+    first = _import(client, "First", api_graph())
+    second = _import(client, "Second", api_graph())
+    with db.connect() as con:
+        con.execute("UPDATE workflow SET graph = 'not-json{' WHERE id = ?", (second["id"],))
+
+    response = client.put("/api/workflows/active", json={"id": second["id"]})
+
+    assert response.status_code == 422
+    assert "not valid JSON" in response.json()["detail"]
+    with db.connect() as con:
+        assert settings.get_active_workflow_id(con) == first["id"]
+
+
+def test_pick_valid_takes_the_newest_valid_not_just_the_newest(client: TestClient) -> None:
+    # Two rules pinned at once: the newest row wins only when its graph is
+    # valid, and recency is descending. Four workflows, the newest corrupted,
+    # then the active (oldest) deleted: healing must land on the third — red
+    # if the order flips to ascending, red if the validity filter is dropped.
+    first = _import(client, "First", api_graph())
+    _import(client, "Second", api_graph())
+    third = _import(client, "Third", api_graph())
+    fourth = _import(client, "Fourth", api_graph())
+    with db.connect() as con:
+        con.execute("UPDATE workflow SET graph = 'not-json{' WHERE id = ?", (fourth["id"],))
+
+    assert client.delete(f"/api/workflows/{first['id']}").status_code == 204
+
+    # Right after the DELETE, before any GET: read-healing would mask a
+    # delete-time failure.
+    with db.connect() as con:
+        assert settings.get_active_workflow_id(con) == third["id"]
 
 
 def test_deleting_the_active_workflow_activates_another(client: TestClient) -> None:
     first = _import(client, "First", api_graph())
     second = _import(client, "Second", api_graph())
+    _set_mapping(client, second["id"], "Second", "6", "text")
     assert client.put("/api/workflows/active", json={"id": second["id"]}).status_code == 200
 
     assert client.delete(f"/api/workflows/{second['id']}").status_code == 204
 
-    listed = client.get("/api/workflows").json()
-    assert next(w for w in listed if w["id"] == first["id"])["is_active"] is True
+    # Asserted on the database before any GET: the read path heals too, so a
+    # follow-up GET would prove nothing about delete_workflow itself.
     with db.connect() as con:
         assert settings.get_active_workflow_id(con) == first["id"]
+    listed = client.get("/api/workflows").json()
+    assert next(w for w in listed if w["id"] == first["id"])["is_active"] is True
 
 
 def test_corrupting_the_active_graph_heals_to_a_valid_one(client: TestClient) -> None:
     first = _import(client, "First", api_graph())
     second = _import(client, "Second", api_graph())
+    _set_mapping(client, first["id"], "First", "6", "text")
     client.put("/api/workflows/active", json={"id": first["id"]})
 
     with db.connect() as con:
@@ -373,6 +454,18 @@ def test_first_import_becomes_active_and_later_ones_do_not_steal_it(
     assert next(w for w in listed if w["id"] == first["id"])["is_active"] is True
 
 
+def test_first_import_with_a_dangling_setting_reports_itself_active(
+    client: TestClient,
+) -> None:
+    # The setting points at a workflow that no longer exists: the import is
+    # the only workflow there is, and it must not be reported inactive until
+    # some later read happens to heal.
+    with db.connect() as con:
+        settings.set_active_workflow_id(con, "deleted-ghost")
+    first = _import(client, "Fresh", api_graph())
+    assert first["is_active"] is True
+
+
 # --- 7. prepare_graph injects the prompt and nothing else ---------------------
 
 
@@ -392,11 +485,25 @@ def test_prepare_graph_injects_the_prompt_and_touches_nothing_else() -> None:
     assert json.loads(workflow["graph"])["6"]["inputs"]["text"] == "a castle"
 
 
-def test_prepare_graph_deep_copies_linked_values_untouched() -> None:
+def test_prepare_graph_result_is_private_to_the_caller() -> None:
+    # The returned graph is a copy: mutating it must not leak into a later
+    # call, which would feed the generator a corrupted graph.
     workflow = _mapped_workflow(api_graph(), prompt_node="6", prompt_field="text")
-    prepared = workflows.prepare_graph(workflow, "new prompt", rng=SequentialRng().randint)
-    assert prepared["6"]["inputs"]["clip"] == ["4", 1]
-    assert prepared["7"]["inputs"]["model"] == ["4", 0]
+    rng = SequentialRng()
+
+    first = workflows.prepare_graph(workflow, "first", rng=rng.randint)
+    first["6"]["inputs"]["text"] = "mutated in place"
+    first["7"]["inputs"]["noise_seed"] = ["4", 0]
+
+    second = workflows.prepare_graph(workflow, "second", rng=rng.randint)
+    assert second["6"]["inputs"]["text"] == "second"
+    assert isinstance(second["7"]["inputs"]["noise_seed"], int)
+
+
+def test_max_seed_stays_inside_the_stock_node_range() -> None:
+    # The comment on MAX_SEED promises 2**32-1 sits inside the declared range
+    # of every stock node; 2**64-1, the natural-looking value, would not.
+    assert workflows.MAX_SEED == 2**32 - 1
 
 
 # --- 8. Unmapped refuses with the same message prepare would raise ------------
@@ -423,6 +530,18 @@ def test_mapped_field_now_linked_refuses() -> None:
     graph["6"]["inputs"]["text"] = ["4", 0]
     workflow = _mapped_workflow(graph, prompt_node="6", prompt_field="text")
     assert workflows.problem(workflow) is not None
+
+
+def test_a_wrong_typed_literal_is_not_reported_as_linked() -> None:
+    # A drifted value is a different fix from a link: the message must say
+    # which type was expected, not blame a list that is not there.
+    graph = api_graph()
+    graph["6"]["inputs"]["text"] = 42
+    workflow = _mapped_workflow(graph, prompt_node="6", prompt_field="text")
+    message = workflows.problem(workflow)
+    assert message is not None
+    assert "linked" not in message
+    assert "no longer holds a string" in message
 
 
 def test_half_mapped_workflow_refuses() -> None:
@@ -474,6 +593,22 @@ def test_seed_field_names_beyond_ksampler_are_randomised() -> None:
     assert prepared["3"]["inputs"]["noise_seed"] == 1
     assert prepared["8"]["inputs"]["seed"] == 2
     assert prepared["9"]["inputs"]["steps"] == 20
+
+
+def test_a_bool_typed_seed_field_is_never_randomised() -> None:
+    # A bool named "seed" is deliberately left exactly as stored: writing a
+    # random int into a boolean widget would send ComfyUI a wrong-typed value.
+    graph = {
+        "3": {"class_type": "Custom", "inputs": {"seed": True, "text": "hi"}},
+        "9": {"class_type": "Other", "inputs": {"text": "p"}},
+    }
+    workflow = _mapped_workflow(graph, prompt_node="9", prompt_field="text")
+    rng = SequentialRng()
+
+    prepared = workflows.prepare_graph(workflow, "p", rng=rng.randint)
+
+    assert prepared["3"]["inputs"]["seed"] is True
+    assert rng.draws == []
 
 
 # --- 10. A seed mapping writes only the mapped field --------------------------

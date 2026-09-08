@@ -101,7 +101,10 @@ def _workflow_item(row: sqlite3.Row, active_id: str | None) -> WorkflowOut:
 
 @router.get("/workflows", response_model=list[WorkflowOut])
 def list_workflows() -> list[WorkflowOut]:
-    with db.connect() as con:
+    # resolve_active may heal, a read-check-write: with the default deferred
+    # transaction the write lock would only be taken at the heal itself, and a
+    # concurrent explicit choice committed in between would be overwritten.
+    with db.connect(immediate=True) as con:
         active = workflows.resolve_active(con)
         active_id = active["id"] if active is not None else None
         rows = con.execute("SELECT * FROM workflow ORDER BY created_at").fetchall()
@@ -124,10 +127,14 @@ def create_workflow(body: WorkflowInput) -> WorkflowOut:
         )
         # The first import becomes active by itself: one workflow and nothing
         # active is a dead end the user would have to guess their way out of.
+        # Default transaction is safe here: the INSERT above already holds the
+        # write lock, so the setting read below cannot go stale — keep the
+        # INSERT first if this block is ever reordered.
         if settings.get_active_workflow_id(con) is None:
             settings.set_active_workflow_id(con, workflow_id)
         row = _get_workflow_row(con, workflow_id)
-        active_id = settings.get_active_workflow_id(con)
+        active = workflows.resolve_active(con)
+    active_id = active["id"] if active is not None else None
     return _workflow_item(row, active_id)
 
 
@@ -163,14 +170,24 @@ def update_workflow(workflow_id: str, body: WorkflowPatch) -> WorkflowOut:
             ),
         )
         row = _get_workflow_row(con, workflow_id)
+        # Default transaction is safe here: the UPDATE above already holds the
+        # write lock, so the setting read below cannot go stale.
         active_id = settings.get_active_workflow_id(con)
     return _workflow_item(row, active_id)
 
 
 @router.put("/workflows/active", response_model=WorkflowOut)
 def set_active_workflow(body: ActiveWorkflowInput) -> WorkflowOut:
-    with db.connect() as con:
+    # The row check reads, and the setting write depends on it: on the default
+    # transaction the row could be deleted in between, so the write lock is
+    # taken up front. `problem()` is the same rule the generator enforces —
+    # activating a workflow that cannot generate would leave the setting
+    # pointing at a broken graph until a later read healed it.
+    with db.connect(immediate=True) as con:
         row = _get_workflow_row(con, body.id)
+        message = workflows.problem(row)
+        if message is not None:
+            raise HTTPException(status_code=422, detail=message)
         settings.set_active_workflow_id(con, body.id)
     return _workflow_item(row, body.id)
 

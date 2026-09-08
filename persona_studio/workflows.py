@@ -203,9 +203,15 @@ _NOT_MAPPED = (
 
 
 def _mapping_message(
-    graph: dict[str, Any], node: str, field: str, literal_check: Any
+    graph: dict[str, Any], node: str, field: str, literal_check: Any, expected: str
 ) -> str | None:
-    """Why a configured mapping cannot be used, or None when it holds."""
+    """Why a configured mapping cannot be used, or None when it holds.
+
+    `expected` names the literal type the mapping requires ("a string", "an
+    integer"): a value can fail the check in two different ways and the user
+    fixes them differently — a list means the field became a link, anything
+    else means the stored value drifted to another type.
+    """
     node_data = graph.get(node)
     if node_data is None:
         return (
@@ -219,11 +225,16 @@ def _mapping_message(
             "re-select it in the settings."
         )
     value = inputs[field]
-    if isinstance(value, list) or not literal_check(value):
+    if isinstance(value, list):
         return (
             f"The configured field {field!r} of node {node!r} is now linked to "
             "another node's output and can no longer be filled. Re-select it in "
             "the settings."
+        )
+    if not literal_check(value):
+        return (
+            f"The configured field {field!r} of node {node!r} no longer holds "
+            f"{expected}: its value has another type. Re-select it in the settings."
         )
     return None
 
@@ -243,17 +254,24 @@ def problem(workflow: sqlite3.Row | dict[str, Any]) -> str | None:
     node, field = workflow["prompt_node"], workflow["prompt_field"]
     if not node or not field:
         return _NOT_MAPPED
-    message = _mapping_message(graph, node, field, lambda v: isinstance(v, str))
+    message = _mapping_message(graph, node, field, lambda v: isinstance(v, str), "a string")
     if message is not None:
         return message
 
     seed_node, seed_field = workflow["seed_node"], workflow["seed_field"]
     if not seed_node or not seed_field:
         return None
-    return _mapping_message(graph, seed_node, seed_field, _is_int_literal)
+    return _mapping_message(graph, seed_node, seed_field, _is_int_literal, "an integer")
 
 
 def _is_int_literal(value: Any) -> bool:
+    # The bool exclusion is deliberate, not an oversight: a real seed is an
+    # integer, and a bool field named "seed" must stay untouched. Writing a
+    # random int into a boolean widget would send ComfyUI a wrong-typed value;
+    # leaving the graph byte-identical instead is honest, even though it means
+    # ComfyUI's cache then serves the same image. A custom node that exposes a
+    # boolean "seed" simply cannot be used as a seed mapping — the user maps
+    # the node's real integer field.
     return isinstance(value, int) and not isinstance(value, bool)
 
 
@@ -266,10 +284,15 @@ def prepare_graph(
     # of randomness, and a callable the tests can replace.
     rng: Callable[[int, int], int] = random.randint,
 ) -> dict[str, Any]:
-    """A deep copy of the stored graph with the prompt injected, ready to submit.
+    """A private deep copy of the stored graph, with the prompt injected.
 
-    The stored graph is never mutated. Raises `WorkflowNotReady` with the
-    message `problem()` returns when the workflow cannot be used.
+    The copy is what makes the returned graph owned by the caller: it may
+    mutate it or keep it around without a later `prepare_graph` call ever
+    seeing the changes. (`parse_stored_graph` already allocates a fresh tree
+    per call, so today the copy is defence in depth against that ever being
+    memoised — the stored JSON text itself cannot be reached by mutation.)
+    Raises `WorkflowNotReady` with the message `problem()` returns when the
+    workflow cannot be used.
 
     The seed asymmetry is a decision, not an oversight: with no seed mapping,
     every seed field is randomised — otherwise ComfyUI's graph cache returns
@@ -317,5 +340,5 @@ def check_mapping(
     if not node or not field:
         return f"The {kind} mapping must name both a node and a field."
     if kind == "prompt":
-        return _mapping_message(graph, node, field, lambda v: isinstance(v, str))
-    return _mapping_message(graph, node, field, _is_int_literal)
+        return _mapping_message(graph, node, field, lambda v: isinstance(v, str), "a string")
+    return _mapping_message(graph, node, field, _is_int_literal, "an integer")

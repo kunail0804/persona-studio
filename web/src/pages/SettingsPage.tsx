@@ -114,30 +114,35 @@ export function SettingsPage() {
   }
 
   async function handleImportWorkflow(file: File) {
-    const name = file.name.replace(/\.json$/i, "") || "Workflow";
-    let parsed: unknown;
+    // Reset the input on every exit path, including the client-side rejects
+    // below: browsers do not re-fire `change` when the same file is picked
+    // again, so a rejected file would otherwise be stuck.
     try {
-      parsed = JSON.parse(await file.text());
-    } catch {
-      setError(`« ${file.name} » n'est pas un fichier JSON valide.`);
-      return;
-    }
-    if (!isRecord(parsed) || Array.isArray(parsed)) {
-      setError(
-        `« ${file.name} » n'est pas un export de workflow : il faut un objet JSON, l'export « Export (API) » de ComfyUI.`,
-      );
-      return;
-    }
-    try {
+      const name = file.name.replace(/\.json$/i, "") || "Workflow";
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(await file.text());
+      } catch {
+        setError(`« ${file.name} » n'est pas un fichier JSON valide.`);
+        return;
+      }
+      if (!isRecord(parsed) || Array.isArray(parsed)) {
+        setError(
+          `« ${file.name} » n'est pas un export de workflow : il faut un objet JSON, l'export « Export (API) » de ComfyUI.`,
+        );
+        return;
+      }
       setImportingWorkflow(true);
-      await importWorkflow({ name, graph: parsed });
-      await reload();
-      setError(null);
-    } catch (err) {
-      setError(messageFor(err, `Impossible d'importer « ${file.name} ».`));
+      try {
+        await importWorkflow({ name, graph: parsed });
+        await reload();
+        setError(null);
+      } catch (err) {
+        setError(messageFor(err, `Impossible d'importer « ${file.name} ».`));
+      } finally {
+        setImportingWorkflow(false);
+      }
     } finally {
-      setImportingWorkflow(false);
-      // Reset the input so re-selecting the same file fires a change event.
       if (fileInputRef.current) fileInputRef.current.value = "";
     }
   }
