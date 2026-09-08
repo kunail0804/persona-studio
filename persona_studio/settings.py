@@ -29,6 +29,7 @@ LLM_MODEL_KEY = "llm.model"
 NUM_CTX_KEY = "llm.num_ctx"
 HISTORY_WINDOW_KEY = "narrator.history_window"
 ACTIVE_PERSONA_KEY = "persona.active_id"
+WORKFLOW_ACTIVE_KEY = "workflow.active_id"
 
 
 def _read(con: sqlite3.Connection, key: str) -> Any:
@@ -105,3 +106,15 @@ def set_active_persona_id(con: sqlite3.Connection, persona_id: str | None) -> No
         _clear(con, ACTIVE_PERSONA_KEY)
     else:
         _write(con, ACTIVE_PERSONA_KEY, persona_id)
+
+
+def get_active_workflow_id(con: sqlite3.Connection) -> str | None:
+    value = _read(con, WORKFLOW_ACTIVE_KEY)
+    return value if isinstance(value, str) and value else None
+
+
+def set_active_workflow_id(con: sqlite3.Connection, workflow_id: str | None) -> None:
+    if workflow_id is None:
+        _clear(con, WORKFLOW_ACTIVE_KEY)
+    else:
+        _write(con, WORKFLOW_ACTIVE_KEY, workflow_id)
