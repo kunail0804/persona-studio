@@ -6,6 +6,13 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+export function expectRecord(value: unknown, field: string): Record<string, unknown> {
+  if (!isRecord(value) || Array.isArray(value)) {
+    throw new Error(`Expected an object for "${field}"`);
+  }
+  return value;
+}
+
 export function expectString(value: unknown, field: string): string {
   if (typeof value !== "string") {
     throw new Error(`Expected a string for "${field}"`);

@@ -376,6 +376,47 @@ def test_load_history_before_id_stops_before_that_message(
     assert load_history(connection, instance_id, 10, before_id=ids[0]) == []
 
 
+def test_load_history_after_id_starts_after_that_message(
+    connection: sqlite3.Connection,
+) -> None:
+    """The turn passes the rolling summary's frontier, so the messages the
+    summary stands in for are never re-sent verbatim."""
+    instance_id = _new_instance(connection)
+    ids = _insert_messages(
+        connection,
+        instance_id,
+        [("assistant" if i % 2 else "user", "text", f"m{i}", 0) for i in range(5)],
+    )
+
+    messages = load_history(connection, instance_id, 10, after_id=ids[1])
+    assert [message.id for message in messages] == ids[2:]
+
+    # Default behaviour is unchanged: without `after_id`, everything is read.
+    assert [message.id for message in load_history(connection, instance_id, 10)] == ids
+
+    # An after_id past every id yields nothing, not an error.
+    assert load_history(connection, instance_id, 10, after_id=ids[-1]) == []
+
+
+def test_after_id_and_before_id_compose(connection: sqlite3.Connection) -> None:
+    """A history bounded on both sides returns exactly the messages between
+    them: the regenerate path asks for the window as it stood before a reply
+    *and* after the summary frontier."""
+    instance_id = _new_instance(connection)
+    ids = _insert_messages(
+        connection,
+        instance_id,
+        [("assistant" if i % 2 else "user", "text", f"m{i}", 0) for i in range(6)],
+    )
+
+    messages = load_history(connection, instance_id, 10, before_id=ids[5], after_id=ids[1])
+    assert [message.id for message in messages] == ids[2:5]
+
+    # The window still applies on top of both bounds.
+    messages = load_history(connection, instance_id, 2, before_id=ids[5], after_id=ids[0])
+    assert [message.id for message in messages] == ids[3:5]
+
+
 def test_ooc_flag_survives_the_loader(connection: sqlite3.Connection) -> None:
     instance_id = _new_instance(connection)
     _insert_messages(connection, instance_id, [("user", "text", "Pause a moment.", 1)])
