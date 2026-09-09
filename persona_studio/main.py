@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import db
-from .routes import characters, parties, personas, scenarios, settings, workflows
+from .routes import characters, images, parties, personas, scenarios, settings, workflows
 
 WEB_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
 
@@ -27,6 +27,7 @@ app.include_router(scenarios.router, prefix="/api")
 app.include_router(characters.router, prefix="/api")
 app.include_router(personas.router, prefix="/api")
 app.include_router(parties.router, prefix="/api")
+app.include_router(images.router, prefix="/api")
 app.include_router(settings.router, prefix="/api")
 app.include_router(workflows.router, prefix="/api")
 
