@@ -71,6 +71,7 @@ def compose_image_prompt(party_id: str, body: ImagePromptInput) -> ImagePromptOu
         raise HTTPException(
             status_code=502,
             detail="The model's answer carried nothing usable once the proper names "
-            "were removed. Rephrase the request and try again.",
+            "were removed. Try again, or write the prompt yourself — the field is "
+            "editable.",
         )
     return ImagePromptOutput(prompt=prompt)

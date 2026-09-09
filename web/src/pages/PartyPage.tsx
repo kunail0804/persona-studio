@@ -344,7 +344,10 @@ export function PartyPage() {
           </Button>
         )}
       </form>
-      <ImagePanel partyId={party.id} />
+      {/* key: the panel keeps its composed prompt in local state, so a party
+          change must remount it rather than show one party's prompt on
+          another party's page. */}
+      <ImagePanel key={party.id} partyId={party.id} />
     </div>
   );
 }

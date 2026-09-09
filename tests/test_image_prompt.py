@@ -43,7 +43,12 @@ def connection(client: TestClient) -> Iterator[sqlite3.Connection]:
 
 
 ELENA = Appearance(name="Elena", appearance="Red hair, green eyes, a scar across one brow.")
-MARCO = Appearance(name="Marco", appearance="Tall, greying beard, navy coat.")
+# Multi-line on purpose: a real appearance is a textarea and will contain
+# newlines, so the narrator's field formatting contract is pinned from both
+# consumers' side, not only narrator.py's own tests.
+MARCO = Appearance(
+    name="Marco", appearance="Tall, greying beard,\nnavy coat, always at the harbour."
+)
 ANA = Appearance(name="Ana", appearance="Small, dark-haired, quick-eyed.")
 ASH = Appearance(name="Ash", appearance="Grey coat, always damp.")
 # A character the scenario never gave an appearance to: a name with nothing
@@ -88,13 +93,29 @@ def test_case_insensitive_matching_catches_any_casing() -> None:
         assert "Red hair, green eyes" in scrubbed
 
 
-def test_a_name_without_appearance_is_removed_with_its_keyword() -> None:
+def test_a_name_without_appearance_is_removed_without_its_neighbours() -> None:
+    """The removal is name-local: only the name goes, not the whole
+    comma-segment it sat in — the segment is whatever the model happened to
+    put between commas, and dropping it whole destroys unrelated details."""
     inputs = replace_instruction(INPUTS, characters=(BARE_MARCO,))
     scrubbed = scrub_names("castle at dusk, portrait of Marco, blue lantern", inputs)
     assert "Marco" not in scrubbed
-    assert "portrait" not in scrubbed
+    assert "portrait of" in scrubbed
     assert "castle at dusk" in scrubbed
     assert "blue lantern" in scrubbed
+
+
+def test_a_detail_sharing_a_clause_with_a_removed_name_survives() -> None:
+    """'The Drowned City' has no appearance; 'red lantern' shares its clause
+    and must not die with it."""
+    inputs = replace_instruction(INPUTS, scenario_title="The Drowned City")
+    scrubbed = scrub_names(
+        "dusk, in the streets of The Drowned City with a red lantern, quay", inputs
+    )
+    assert "Drowned City" not in scrubbed
+    assert "red lantern" in scrubbed
+    assert "dusk" in scrubbed
+    assert "quay" in scrubbed
 
 
 def test_the_persona_name_and_the_scenario_title_are_scrubbed_too() -> None:
@@ -103,8 +124,55 @@ def test_the_persona_name_and_the_scenario_title_are_scrubbed_too() -> None:
     assert "Grey coat, always damp." in scrubbed
     assert "night" in scrubbed
     assert "Noyée" not in scrubbed
-    # The title has no appearance: it takes its whole keyword with it.
-    assert "walls" not in scrubbed
+    # The title has no appearance, but the removal is name-local: only the
+    # name goes, the rest of the keyword stays.
+    assert "walls of" in scrubbed
+
+
+def test_an_appearance_mentioning_another_character_leaks_in_neither_order() -> None:
+    """Shape (a): Marco's appearance mentions Elena. The substitution must
+    not carry her back into the answer — and whether she leaked used to
+    depend on list order, which made the guarantee an accident. Both orders
+    are pinned so it can never come back."""
+    marco = Appearance(name="Marco", appearance="Same sharp jaw as his sister Elena, navy coat.")
+    for characters in ((marco, ELENA), (ELENA, marco)):
+        inputs = replace_instruction(INPUTS, characters=characters)
+        scrubbed = scrub_names("portrait of Marco, dusk", inputs)
+        assert "Elena" not in scrubbed
+        assert "Same sharp jaw as his sister, navy coat." in scrubbed
+        assert "dusk" in scrubbed
+
+
+def test_an_appearance_mentioning_a_name_without_appearance_leaks_in_neither_order() -> None:
+    """Shape (b): Zoe has no appearance, and Marco's appearance mentions her.
+    This used to leak in either order, because a bare name was only ever
+    looked for in the model's original text, never in text a substitution
+    had just introduced."""
+    zoe = Appearance(name="Zoe", appearance="")
+    marco = Appearance(name="Marco", appearance="Tall, always at Zoe's side, navy coat.")
+    for characters in ((zoe, marco), (marco, zoe)):
+        inputs = replace_instruction(INPUTS, characters=characters)
+        scrubbed = scrub_names("portrait of Marco, dusk", inputs)
+        assert "Zoe" not in scrubbed
+        assert "Tall, always at side, navy coat." in scrubbed
+    # Zoe met directly in the model's answer still leaves cleanly.
+    inputs = replace_instruction(INPUTS, characters=(zoe, marco))
+    scrubbed = scrub_names("Zoe at the till, dusk", inputs)
+    assert "Zoe" not in scrubbed
+    assert "at the till" in scrubbed
+
+
+def test_an_appearance_that_contains_its_own_name_returns_no_name() -> None:
+    """Shape (c): a user writing Elena's appearance as 'Elena, tall woman
+    with black hair' is doing nothing wrong, and the name must not come
+    straight back. Re-running the scrub until a pass changes nothing would
+    loop forever here; the appearance is cleaned once, its own name
+    included, before it is ever used as a replacement."""
+    elena = Appearance(name="Elena", appearance="Elena, tall woman with black hair")
+    inputs = replace_instruction(INPUTS, characters=(elena,))
+    scrubbed = scrub_names("Elena standing in a hall", inputs)
+    assert "Elena" not in scrubbed
+    assert "tall woman with black hair standing in a hall" in scrubbed
 
 
 def test_the_scenario_title_has_no_appearance_so_it_takes_its_keyword() -> None:
@@ -116,6 +184,47 @@ def test_the_scenario_title_has_no_appearance_so_it_takes_its_keyword() -> None:
 def test_scrubbing_leaves_a_reply_without_any_name_untouched() -> None:
     reply = "harbour gate, blue lantern, dusk, wet stones"
     assert scrub_names(reply, INPUTS) == reply
+
+
+def test_a_name_that_is_also_an_ordinary_word_with_an_appearance_is_pinned() -> None:
+    """Decision for V1, pinned so it is known rather than accidental: a
+    character named Ash collides with scenery, and 'ash grey sky' becomes
+    Ash's description. No heuristic, stop-word list or capitalisation rule
+    separates Ash-the-character from ash-the-residue — every cheap
+    approximation trades a criterion-1 leak for a criterion-2 slip. The
+    player sees and edits the prompt before anything is generated; the real
+    answer is issue #16's Scene Compiler."""
+    scrubbed = scrub_names("ash grey sky, harbour gate", INPUTS)
+    assert scrubbed == "Grey coat, always damp. grey sky, harbour gate"
+
+
+def test_a_name_that_is_also_an_ordinary_word_without_an_appearance_is_pinned() -> None:
+    """The bare-name half of the same decision: only the word goes, the rest
+    of the keyword survives."""
+    rose = Appearance(name="Rose", appearance="")
+    inputs = replace_instruction(INPUTS, characters=(ELENA, rose))
+    scrubbed = scrub_names("rose petals on the ground, fountain", inputs)
+    assert "Rose" not in scrubbed
+    assert "rose" not in scrubbed
+    assert "petals on the ground" in scrubbed
+    assert "fountain" in scrubbed
+
+
+def test_a_blank_name_is_skipped_rather_than_matching_everywhere() -> None:
+    """`character.name` and `persona.name` are `TEXT NOT NULL DEFAULT ''`, so
+    a blank name is real data. Without the guard the empty pattern matches
+    between every character and mangles the whole answer; a blank scenario
+    title is skipped by the same shape of guard."""
+    inputs = replace_instruction(
+        INPUTS,
+        characters=(
+            Appearance(name="", appearance="Empty-named one."),
+            Appearance(name="   ", appearance="Whitespace-named one."),
+        ),
+        persona=Appearance(name="", appearance="Blank-named persona."),
+        scenario_title="",
+    )
+    assert scrub_names("a blue lantern, dusk", inputs) == "a blue lantern, dusk"
 
 
 def replace_instruction(inputs: ImagePromptInputs, **changes: Any) -> ImagePromptInputs:
@@ -142,12 +251,27 @@ def test_the_scene_rides_whole() -> None:
         assert json.dumps(value, ensure_ascii=False) in scene
 
 
+def test_a_multiline_appearance_is_indented_under_its_label_in_the_scene() -> None:
+    """The multi-line formatting contract used to be pinned only by
+    narrator.py's own tests, because every appearance in these fixtures was
+    one line. MARCO's is not, so this consumer pins the rendering too."""
+    scene = build_messages(INPUTS)[-1]["content"]
+    assert "Appearance:\n  Tall, greying beard,\n  navy coat, always at the harbour." in scene
+
+
+def test_a_multiline_appearance_rides_whole_into_the_scrub() -> None:
+    scrubbed = scrub_names("portrait of Marco, dusk", INPUTS)
+    assert "Tall, greying beard,\nnavy coat, always at the harbour." in scrubbed
+
+
 def test_only_appearance_fields_are_sent() -> None:
     scene = build_messages(INPUTS)[-1]["content"]
     assert f"Name: {ELENA.name}" in scene
     assert ELENA.appearance in scene
-    assert MARCO.appearance in scene
     assert ASH.appearance in scene
+    # Marco's appearance is multi-line: in the scene it arrives through the
+    # narrator's field formatting, indented under its label.
+    assert "Tall, greying beard,\n  navy coat, always at the harbour." in scene
     for forbidden in ("Personality", "Story", "Relationships", "Secrets"):
         assert forbidden not in scene
 
@@ -239,6 +363,11 @@ def _seed_party(
                 (persona_id, ASH.name, ASH.appearance, 0.0),
             )
             settings.set_active_persona_id(con, persona_id)
+        else:
+            # The persona setting lives in the one SQLite file the whole
+            # pytest session shares: an earlier test's active persona must
+            # not reach a test that composes without one.
+            settings.set_active_persona_id(con, None)
         settings.set_llm_model(con, model)
     return party_id
 
@@ -372,14 +501,45 @@ def test_no_model_configured_is_400(client: TestClient, monkeypatch: Any) -> Non
 def test_composition_without_an_active_persona_still_works(
     client: TestClient, monkeypatch: Any
 ) -> None:
+    """Issue #4's last criterion lands here too: an absent persona leaves the
+    composition working, with the protagonist section simply absent. The
+    persona setting is shared by the whole pytest session (one `PS_DATA` for
+    the process), so the seed clears it explicitly — an earlier test's
+    active persona must not reach a test that composes without one."""
     party_id = _seed_party(with_persona=False)
-    _stub_chat(monkeypatch, reply="portrait of Elena, dusk")
+    calls = _stub_chat(monkeypatch, reply="portrait of Elena, dusk")
 
     response = _compose(client, party_id)
 
     assert response.status_code == 200
-    assert "Elena" not in response.json()["prompt"]
-    assert ELENA.appearance in response.json()["prompt"]
+    prompt = response.json()["prompt"]
+    assert "Elena" not in prompt
+    assert ELENA.appearance in prompt
+    scene = calls[0]["messages"][-1]["content"]
+    assert "Protagonist" not in scene
+    assert ASH.appearance not in scene
+    assert ELENA.appearance in scene
+
+
+def test_a_persona_id_set_but_row_gone_composes_without_protagonist(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """An active persona id pointing at a deleted row is as good as no
+    persona: the composition works and the protagonist section is absent."""
+    party_id = _seed_party(with_persona=False)
+    with db.connect() as con:
+        settings.set_active_persona_id(con, uuid.uuid4().hex)
+    calls = _stub_chat(monkeypatch, reply="portrait of Elena, dusk")
+
+    response = _compose(client, party_id)
+
+    assert response.status_code == 200
+    scene = calls[0]["messages"][-1]["content"]
+    assert "Protagonist" not in scene
+    assert ASH.appearance not in scene
+    assert ELENA.appearance in scene
+    prompt = response.json()["prompt"]
+    assert "Elena" not in prompt
 
 
 def test_composition_writes_nothing(client: TestClient, monkeypatch: Any) -> None:

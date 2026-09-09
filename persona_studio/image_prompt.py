@@ -14,6 +14,12 @@ line of defence against proper names reaching an image generator; `scrub_names`
 is the deterministic second line. It works on the model's **answer**, not on
 the prompt: the model may see names (it must, to tell which appearance belongs
 to whom), the returned keywords may not.
+
+Place names are left alone on purpose. A location such as "la Tour Eiffel"
+rides into the prompt untouched: an image model does not know who Elena is,
+but it knows the Eiffel Tower, and a place has no appearance field to become —
+the criterion ties the scrub to characters becoming their description, not to
+every proper name.
 """
 
 from __future__ import annotations
@@ -131,6 +137,16 @@ def build_messages(inputs: ImagePromptInputs) -> list[dict[str, str]]:
 # prompt. A model asked politely complies most of the time, which is not the
 # same thing, so every known name is removed from the answer regardless of
 # what the model was told.
+#
+# The pass is safe by construction, not by repetition: every appearance string
+# is cleaned of every known name — its own included — once, before it is ever
+# used as a replacement. No replacement value therefore contains a name, and a
+# single substitution pass cannot introduce one. Re-running the scrub until a
+# pass changes nothing would not even terminate: an appearance containing its
+# own character's name would be found and substituted back forever.
+
+
+_PUNCTUATION = ",.;:!?"
 
 
 @dataclass(frozen=True)
@@ -144,56 +160,97 @@ class _NamePass:
 def _word_pattern(name: str) -> re.Pattern[str]:
     # Whole words only: `\b` is what keeps a character named Ana from turning
     # "banana" into a description. Case-insensitive because a model answers in
-    # any casing it likes.
-    return re.compile(rf"\b{re.escape(name)}\b", re.IGNORECASE)
+    # any casing it likes. The optional possessive keeps "Zoe's" from leaving
+    # a "'s" behind.
+    return re.compile(rf"\b{re.escape(name)}\b(?:'s)?", re.IGNORECASE)
+
+
+def _tidy(text: str) -> str:
+    """The leftovers of a removal, pulled tight: doubled spaces collapsed,
+    a space before punctuation closed up, punctuation that only dangled off
+    the removed name dropped. Newlines survive — an appearance is a textarea
+    and may legitimately be multi-line."""
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(rf"[ \t]+([{_PUNCTUATION}])", r"\1", text)
+    text = re.sub(rf"([{_PUNCTUATION}])(?:[ \t]*[{_PUNCTUATION}])+", r"\1", text)
+    text = re.sub(rf"^[ \t]*[{_PUNCTUATION}][ \t]*", "", text)
+    return text.strip()
+
+
+def _clean_description(appearance: str, patterns: tuple[re.Pattern[str], ...]) -> str:
+    """The appearance with every known name removed from it, its own included.
+
+    Removal, not substitution: "Same sharp jaw as his sister Elena" keeps the
+    jaw and the sister and loses the name. Tidying runs only when something
+    was actually removed, so an appearance that never carried a name rides
+    into the prompt byte for byte.
+    """
+    cleaned = appearance
+    for pattern in patterns:
+        cleaned = pattern.sub(" ", cleaned)
+    if cleaned != appearance:
+        cleaned = _tidy(cleaned)
+    return cleaned
 
 
 def _name_pass(inputs: ImagePromptInputs) -> _NamePass:
     """Names with an appearance become that appearance; the rest disappear.
 
-    A name with a non-blank appearance is replaceable — that substitution is
-    exactly the criterion's "characters become generic physical descriptions".
-    A name with none has nothing to become: persona or character with a blank
-    appearance field, and the scenario title, which has no appearance at all.
-    Such a name is removed together with the keyword that carries it, rather
-    than left as a dangling fragment.
+    Every appearance is cleaned of every known name before it becomes a
+    replacement value, so one substitution pass cannot introduce a name. A
+    name whose appearance is blank — or becomes blank once its own name is
+    out of it — has nothing to become: it is removed where it stands, name-
+    locally, together with the punctuation left dangling around it. The
+    scenario title has no appearance at all and is bare the same way. A blank
+    name is skipped: the empty pattern would match between every character.
     """
-    replacements: list[tuple[re.Pattern[str], str]] = []
-    bare: list[re.Pattern[str]] = []
-    beings = list(inputs.characters)
-    if inputs.persona is not None:
-        beings.append(inputs.persona)
-    for being in beings:
-        name = being.name.strip()
-        if not name:
-            continue
-        appearance = being.appearance.strip()
-        if appearance:
-            replacements.append((_word_pattern(name), appearance))
-        else:
-            bare.append(_word_pattern(name))
+    beings = [being for being in (*inputs.characters, inputs.persona) if being is not None]
+    named = [(being.name.strip(), being.appearance.strip()) for being in beings]
     title = inputs.scenario_title.strip()
     if title:
-        bare.append(_word_pattern(title))
+        named.append((title, ""))
+    named = [(name, appearance) for name, appearance in named if name]
+    patterns = tuple(_word_pattern(name) for name, _ in named)
+    replacements: list[tuple[re.Pattern[str], str]] = []
+    bare: list[re.Pattern[str]] = []
+    for (_name, appearance), pattern in zip(named, patterns, strict=True):
+        cleaned = _clean_description(appearance, patterns) if appearance else ""
+        if cleaned:
+            replacements.append((pattern, cleaned))
+        else:
+            bare.append(pattern)
     return _NamePass(replacements=tuple(replacements), bare=tuple(bare))
 
 
+def _has_words(text: str) -> bool:
+    """Whether anything beyond punctuation and whitespace is left."""
+    return re.search(r"\w", text) is not None
+
+
 def _scrub_keyword(keyword: str, name_pass: _NamePass) -> str:
-    """One comma-separated keyword, cleaned — or empty when it must go."""
-    for pattern in name_pass.bare:
-        if pattern.search(keyword):
-            return ""
+    """One comma-separated keyword, cleaned — or empty when nothing but
+    punctuation is left of it. The removal of a bare name takes the name and
+    the spacing or punctuation dangling around it, never the neighbouring
+    details that happen to share the comma-segment."""
+    cleaned = keyword
     for pattern, appearance in name_pass.replacements:
-        keyword = pattern.sub(appearance, keyword)
-    return keyword.strip()
+        cleaned = pattern.sub(appearance, cleaned)
+    for pattern in name_pass.bare:
+        cleaned = pattern.sub(" ", cleaned)
+    if cleaned != keyword:
+        cleaned = _tidy(cleaned)
+    if not _has_words(cleaned):
+        return ""
+    return cleaned.strip()
 
 
 def scrub_names(text: str, inputs: ImagePromptInputs) -> str:
     """The model's answer with every known proper name driven out.
 
     The answer is treated as the comma-separated keyword list the instruction
-    asked for, so a name that cannot become a description takes its whole
-    keyword with it. A description substituted in may itself contain commas —
+    asked for. A name that cannot become a description is removed on its own;
+    a comma-segment is dropped only when nothing but punctuation or whitespace
+    is left of it. A description substituted in may itself contain commas —
     that is fine for an image prompt, which is a bag of tags, not prose.
     """
     name_pass = _name_pass(inputs)
