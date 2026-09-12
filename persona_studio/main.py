@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import db
+from . import db, generation
 from .routes import characters, images, parties, personas, scenarios, settings, workflows
 
 WEB_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
@@ -18,6 +18,10 @@ async def lifespan(app: FastAPI):
     # Le schéma se met à niveau au démarrage : rien à lancer à la main, et une
     # base absente est créée au premier lancement.
     db.migrate()
+    # Les messages d'image encore `pending` ne peuvent plus aboutir : leur
+    # observateur est mort avec le processus. Le premier démarrage les passe
+    # en erreur, pour qu'aucun ne prétende travailler pour toujours.
+    generation.recover_pending()
     yield
 
 

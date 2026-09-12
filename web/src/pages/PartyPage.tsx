@@ -9,10 +9,12 @@ import {
   setMessageVariant,
 } from "../api/parties";
 import type { Party, PartyMessage, TurnEvent } from "../api/parties";
+import { cancelImageGeneration } from "../api/images";
 import { Narration } from "../components/Narration";
 import { Button } from "../components/Button";
 import { TextArea } from "../components/TextArea";
 import { ImagePanel } from "../components/ImagePanel";
+import { ImageMessage } from "../components/ImageMessage";
 
 // The bubble re-renders at most this often while fragments arrive. Every
 // fragment is still accumulated; only the re-render is throttled. The
@@ -24,6 +26,10 @@ const RENDER_INTERVAL_MS = 150;
 // hang-up, which lands slightly after the abort resolves here; the reload
 // waits that long before reading the database.
 const RELOAD_AFTER_STOP_MS = 500;
+
+// While an image is rendering, the party endpoint is the progress channel:
+// the page re-reads it on this cadence and stops when nothing is pending.
+const IMAGE_POLL_INTERVAL_MS = 3000;
 
 function messageFor(error: unknown, fallback: string): string {
   return error instanceof ApiError ? error.detail : fallback;
@@ -160,6 +166,30 @@ export function PartyPage() {
     [id],
   );
 
+  const cancelImage = useCallback(
+    async (messageId: number) => {
+      if (!id) return;
+      try {
+        const updated = await cancelImageGeneration(id, messageId);
+        setParty((current) => (current ? replaceMessage(current, messageId, updated) : current));
+      } catch (err) {
+        setError(messageFor(err, "Impossible d'annuler la génération."));
+      }
+    },
+    [id],
+  );
+
+  // Both run before the early returns below: hooks must not be conditional.
+  const hasPendingImage =
+    party?.messages.some((m) => m.kind === "image" && m.status === "pending") ?? false;
+  useEffect(() => {
+    if (!id || !hasPendingImage) return;
+    const timer = window.setInterval(() => {
+      void load(id);
+    }, IMAGE_POLL_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [id, hasPendingImage, load]);
+
   if (!id) {
     return <p className="text-red-400">Partie introuvable.</p>;
   }
@@ -295,24 +325,33 @@ export function PartyPage() {
         <p className="text-neutral-500">Aucun message pour l'instant.</p>
       ) : null}
       <ul className="flex flex-col gap-4">
-        {party.messages.map((message) => (
-          <MessageBubble
-            key={message.id}
-            message={message}
-            disabled={streaming}
-            regenerating={regeneratingId === message.id}
-            // The old reply stays on screen until the first token of the new
-            // one arrives: `overrideText` is undefined until then.
-            overrideText={
-              regeneratingId === message.id && streamText !== null ? streamText : undefined
-            }
-            onSaveEdit={saveEdit}
-            onRegenerate={(messageTarget) => void regenerate(messageTarget)}
-            onSwitchVariant={(messageTarget, variantId) =>
-              void switchVariant(messageTarget, variantId)
-            }
-          />
-        ))}
+        {party.messages.map((message) =>
+          message.kind === "image" ? (
+            <ImageMessage
+              key={message.id}
+              message={message}
+              disabled={streaming}
+              onCancel={(messageTarget) => void cancelImage(messageTarget)}
+            />
+          ) : (
+            <MessageBubble
+              key={message.id}
+              message={message}
+              disabled={streaming}
+              regenerating={regeneratingId === message.id}
+              // The old reply stays on screen until the first token of the new
+              // one arrives: `overrideText` is undefined until then.
+              overrideText={
+                regeneratingId === message.id && streamText !== null ? streamText : undefined
+              }
+              onSaveEdit={saveEdit}
+              onRegenerate={(messageTarget) => void regenerate(messageTarget)}
+              onSwitchVariant={(messageTarget, variantId) =>
+                void switchVariant(messageTarget, variantId)
+              }
+            />
+          ),
+        )}
         {pending !== null ? <MessageBubble message={pendingMessage(pending)} disabled /> : null}
         {streamText !== null && regeneratingId === null ? (
           <StreamingBubble text={streamText} />
@@ -347,7 +386,11 @@ export function PartyPage() {
       {/* key: the panel keeps its composed prompt in local state, so a party
           change must remount it rather than show one party's prompt on
           another party's page. */}
-      <ImagePanel key={party.id} partyId={party.id} />
+      <ImagePanel
+        key={party.id}
+        partyId={party.id}
+        onGenerationStarted={() => void load(party.id)}
+      />
     </div>
   );
 }
@@ -356,7 +399,18 @@ function pendingMessage(content: string): PartyMessage {
   // A stand-in until the reload brings the real row with its id. It exists
   // only while a turn is streaming, so its actions are disabled with the
   // bubble's `disabled` prop — its negative id is never sent anywhere.
-  return { id: -1, role: "user", content, ts: 0, variants: [] };
+  return {
+    id: -1,
+    role: "user",
+    content,
+    ts: 0,
+    variants: [],
+    kind: "text",
+    imageId: null,
+    status: null,
+    startedAt: null,
+    error: null,
+  };
 }
 
 interface MessageBubbleProps {

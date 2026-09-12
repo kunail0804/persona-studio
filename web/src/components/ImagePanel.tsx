@@ -1,24 +1,29 @@
 import { useState } from "react";
 import { ApiError } from "../api/client";
-import { composeImagePrompt } from "../api/images";
+import { composeImagePrompt, startImageGeneration } from "../api/images";
 import { Button } from "./Button";
 import { TextArea } from "./TextArea";
 import { TextField } from "./TextField";
 
 interface ImagePanelProps {
   partyId: string;
+  /** Called once a generation has started, so the page reloads and the
+   * pending message appears in the story. */
+  onGenerationStarted?: () => void;
 }
 
 /**
  * The image panel: the player says what they want to see, the server turns
  * that plus the current scene into English keywords, and the result lands in
- * an editable field. Composing is the whole of it — the prompt stays here,
- * in the interface, until it is sent unchanged.
+ * an editable field. Sending it starts the generation — the text goes to
+ * ComfyUI exactly as it is on screen, and the render continues in the
+ * background while the player keeps playing.
  */
-export function ImagePanel({ partyId }: ImagePanelProps) {
+export function ImagePanel({ partyId, onGenerationStarted }: ImagePanelProps) {
   const [instruction, setInstruction] = useState("");
   const [prompt, setPrompt] = useState("");
   const [composing, setComposing] = useState(false);
+  const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const compose = async () => {
@@ -33,6 +38,22 @@ export function ImagePanel({ partyId }: ImagePanelProps) {
       setError(err instanceof ApiError ? err.detail : "La composition du prompt a échoué.");
     } finally {
       setComposing(false);
+    }
+  };
+
+  const generate = async () => {
+    const text = prompt.trim();
+    if (!text || starting) return;
+    setStarting(true);
+    setError(null);
+    try {
+      await startImageGeneration(partyId, text, instruction.trim());
+      // The pending message now lives in the story: reload to show it.
+      onGenerationStarted?.();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.detail : "Le lancement de la génération a échoué.");
+    } finally {
+      setStarting(false);
     }
   };
 
@@ -61,6 +82,11 @@ export function ImagePanel({ partyId }: ImagePanelProps) {
           onChange={(e) => setPrompt(e.target.value)}
           placeholder="Le prompt composé apparaîtra ici."
         />
+        {prompt.trim() ? (
+          <Button onClick={() => void generate()} disabled={starting}>
+            {starting ? "Envoi…" : "Générer l'image"}
+          </Button>
+        ) : null}
       </div>
     </div>
   );
