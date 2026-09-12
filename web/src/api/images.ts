@@ -1,13 +1,30 @@
 import { request } from "./client";
-import { expectString, isRecord } from "./validate";
+import { expectNumber, expectInteger, expectString, isRecord } from "./validate";
+import { parsePartyMessage } from "./parties";
+import type { PartyMessage } from "./parties";
 
 export interface ImagePrompt {
   prompt: string;
 }
 
+export interface ImageGeneration {
+  /** The message whose row now shows the pending image; cancel targets it. */
+  messageId: number;
+  /** When the generation started; the elapsed time is computed from it. */
+  startedAt: number;
+}
+
 function parseImagePrompt(data: unknown): ImagePrompt {
   if (!isRecord(data)) throw new Error("Expected an image prompt object");
   return { prompt: expectString(data.prompt, "prompt") };
+}
+
+function parseImageGeneration(data: unknown): ImageGeneration {
+  if (!isRecord(data)) throw new Error("Expected an image generation object");
+  return {
+    messageId: expectInteger(data.message_id, "message_id"),
+    startedAt: expectNumber(data.started_at, "started_at"),
+  };
 }
 
 /**
@@ -19,5 +36,28 @@ export function composeImagePrompt(partyId: string, instruction: string): Promis
   return request(`/parties/${partyId}/image-prompt`, parseImagePrompt, {
     method: "POST",
     body: JSON.stringify({ instruction }),
+  });
+}
+
+/**
+ * Sends the final prompt — exactly the text the player has on screen — to
+ * ComfyUI and returns at once: the render runs in the background and lands
+ * in the story as an image message the player can cancel.
+ */
+export function startImageGeneration(
+  partyId: string,
+  prompt: string,
+  instruction: string,
+): Promise<ImageGeneration> {
+  return request(`/parties/${partyId}/images`, parseImageGeneration, {
+    method: "POST",
+    body: JSON.stringify({ prompt, instruction }),
+  });
+}
+
+/** Cancels a pending generation, interrupting ComfyUI only if it is rendering. */
+export function cancelImageGeneration(partyId: string, messageId: number): Promise<PartyMessage> {
+  return request(`/parties/${partyId}/images/${messageId}/cancel`, parsePartyMessage, {
+    method: "POST",
   });
 }

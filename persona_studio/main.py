@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import db
+from . import db, generation
 from .routes import characters, images, parties, personas, scenarios, settings, workflows
 
 WEB_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
@@ -18,6 +18,15 @@ async def lifespan(app: FastAPI):
     # Le schéma se met à niveau au démarrage : rien à lancer à la main, et une
     # base absente est créée au premier lancement.
     db.migrate()
+    # Image messages still `pending` can never complete: their watcher died
+    # with the process. The first startup marks them failed, so none of them
+    # claims to be working forever — and asks ComfyUI to stop whatever the
+    # dead watcher left queued or rendering.
+    generation.recover_pending()
+    # A `done` image whose PNG is missing — a death between the commit and
+    # the file write — is the one inconsistent state the pending recovery
+    # cannot see: it is not pending, so it can never be cancelled either.
+    generation.recover_missing_done_files()
     yield
 
 

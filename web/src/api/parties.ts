@@ -10,6 +10,8 @@ import {
 } from "./validate";
 
 export type PartyRole = "user" | "assistant";
+export type MessageKind = "text" | "image";
+export type MessageStatus = "pending" | "done" | "error";
 
 export interface MessageVariant {
   id: number;
@@ -23,6 +25,13 @@ export interface PartyMessage {
   content: string;
   ts: number;
   variants: MessageVariant[];
+  /** Image messages only: the generation's state, straight from the schema. */
+  kind: MessageKind;
+  imageId: string | null;
+  status: MessageStatus | null;
+  /** When the generation started; the elapsed time is computed from it. */
+  startedAt: number | null;
+  error: string | null;
 }
 
 export interface PartySummary {
@@ -58,7 +67,24 @@ function parseMessageVariant(data: unknown): MessageVariant {
   };
 }
 
-function parsePartyMessage(data: unknown): PartyMessage {
+function parseMessageStatus(value: unknown, field: string): MessageStatus | null {
+  if (value === null || value === undefined) return null;
+  const status = expectString(value, field);
+  if (status !== "pending" && status !== "done" && status !== "error") {
+    throw new Error(`Expected "pending", "done" or "error" for "${field}"`);
+  }
+  return status;
+}
+
+function parseMessageKind(value: unknown, field: string): MessageKind {
+  const kind = expectString(value, field);
+  if (kind !== "text" && kind !== "image") {
+    throw new Error(`Expected "text" or "image" for "${field}"`);
+  }
+  return kind;
+}
+
+export function parsePartyMessage(data: unknown): PartyMessage {
   if (!isRecord(data)) throw new Error("Expected a party message object");
   return {
     id: expectInteger(data.id, "id"),
@@ -68,6 +94,11 @@ function parsePartyMessage(data: unknown): PartyMessage {
     variants: expectArray(data.variants, "variants").map((item: unknown) =>
       parseMessageVariant(item),
     ),
+    kind: parseMessageKind(data.kind, "kind"),
+    imageId: data.image_id === null || data.image_id === undefined ? null : expectString(data.image_id, "image_id"),
+    status: parseMessageStatus(data.status, "status"),
+    startedAt: data.started_at === null || data.started_at === undefined ? null : expectNumber(data.started_at, "started_at"),
+    error: data.error === null || data.error === undefined ? null : expectString(data.error, "error"),
   };
 }
 

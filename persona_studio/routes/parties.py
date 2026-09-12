@@ -58,12 +58,22 @@ class MessageVariant(BaseModel):
     active: bool
 
 
+MessageStatus = Literal["pending", "done", "error"]
+
+
 class PartyMessage(BaseModel):
     id: int
     role: Literal["user", "assistant"]
     content: str
     ts: float
     variants: list[MessageVariant] = []
+    # Image messages only: the schema's own columns, surfaced so the interface
+    # can show the generation's state. A text message carries the defaults.
+    kind: Literal["text", "image"] = "text"
+    image_id: str | None = None
+    status: MessageStatus | None = None
+    started_at: float | None = None
+    error: str | None = None
 
 
 class PartySummary(BaseModel):
@@ -103,6 +113,9 @@ _SUMMARY_COLUMNS = (
     "instance.created_at, instance.updated_at, scenario.title AS scenario_title, "
     "instance.summary_text, instance.summary_upto, instance.world_state"
 )
+
+# Everything a message response carries, including the image columns.
+_MESSAGE_COLUMNS = "id, role, kind, content, ts, image_id, status, started_at, error"
 
 
 def _party_from_row(row: sqlite3.Row) -> PartySummary:
@@ -148,7 +161,7 @@ def _get_message_row(con: sqlite3.Connection, party_id: str, message_id: int) ->
     another party are the same mistake from the caller's side: nothing to act
     on, so both are 404 rather than 403."""
     row = con.execute(
-        "SELECT id, role, kind, content, ts FROM message WHERE id = ? AND instance_id = ?",
+        f"SELECT {_MESSAGE_COLUMNS} FROM message WHERE id = ? AND instance_id = ?",
         (message_id, party_id),
     ).fetchone()
     if row is None:
@@ -232,6 +245,11 @@ def _message_response(con: sqlite3.Connection, row: sqlite3.Row) -> PartyMessage
         role=row["role"],
         content=row["content"],
         ts=row["ts"],
+        kind=row["kind"],
+        image_id=row["image_id"],
+        status=row["status"],
+        started_at=row["started_at"],
+        error=row["error"],
         variants=[
             MessageVariant(id=v["id"], content=v["content"], active=bool(v["active"]))
             for v in variant_rows
@@ -334,7 +352,7 @@ def get_party(party_id: str) -> Party:
     with db.connect() as con:
         row = _get_party_row(con, party_id)
         message_rows = con.execute(
-            "SELECT id, role, content, ts FROM message WHERE instance_id = ? ORDER BY id",
+            f"SELECT {_MESSAGE_COLUMNS} FROM message WHERE instance_id = ? ORDER BY id",
             (party_id,),
         ).fetchall()
         variant_rows = con.execute(
@@ -369,6 +387,11 @@ def get_party(party_id: str) -> Party:
                 role=m["role"],
                 content=m["content"],
                 ts=m["ts"],
+                kind=m["kind"],
+                image_id=m["image_id"],
+                status=m["status"],
+                started_at=m["started_at"],
+                error=m["error"],
                 variants=variants_by_message.get(m["id"], []),
             )
             for m in message_rows
@@ -421,7 +444,7 @@ def edit_message(party_id: str, message_id: int, body: MessageEditInput) -> Part
         return _message_response(
             con,
             con.execute(
-                "SELECT id, role, kind, content, ts FROM message WHERE id = ?", (message_id,)
+                f"SELECT {_MESSAGE_COLUMNS} FROM message WHERE id = ?", (message_id,)
             ).fetchone(),
         )
 
@@ -445,7 +468,7 @@ def activate_variant(party_id: str, message_id: int, body: VariantInput) -> Part
         return _message_response(
             con,
             con.execute(
-                "SELECT id, role, kind, content, ts FROM message WHERE id = ?", (message_id,)
+                f"SELECT {_MESSAGE_COLUMNS} FROM message WHERE id = ?", (message_id,)
             ).fetchone(),
         )
 
