@@ -18,9 +18,9 @@ async def lifespan(app: FastAPI):
     # Le schéma se met à niveau au démarrage : rien à lancer à la main, et une
     # base absente est créée au premier lancement.
     db.migrate()
-    # Les messages d'image encore `pending` ne peuvent plus aboutir : leur
-    # observateur est mort avec le processus. Le premier démarrage les passe
-    # en erreur, pour qu'aucun ne prétende travailler pour toujours.
+    # Image messages still `pending` can never complete: their watcher died
+    # with the process. The first startup marks them failed, so none of them
+    # claims to be working forever.
     generation.recover_pending()
     yield
 
