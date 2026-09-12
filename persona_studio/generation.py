@@ -32,6 +32,14 @@ entry, never interrupt (an unrelated render is on the GPU); in neither →
 finished or never queued, ComfyUI is not touched at all. The local cancel is
 written before any of that, so an unreachable ComfyUI still leaves the player
 with a cancelled image rather than a spinner.
+
+That cancel cannot reach into the persist-to-submit window: there, a cancel
+lands on a row whose `gen_id` does not exist yet, so the stop path has
+nothing to aim at. `start` closes it: after the submission returns it
+re-reads the row under the write lock, and only a still-pending row gets the
+id stamped and a watcher started. A row a cancel already claimed gets its
+job stopped instead — the only moment that stop was ever possible — and a
+refused submission deletes nothing but its own still-pending row.
 """
 
 from __future__ import annotations
@@ -88,8 +96,9 @@ def start(party_id: str, prompt: str, instruction: str) -> StartResult:
     Raises `LookupError` for an unknown party and `WorkflowNotReady` (with
     the message `workflows.problem()` returns) when the active workflow
     cannot generate — both before a single row is written. A ComfyUI that
-    refuses the submission leaves nothing behind: the pending row is deleted,
-    because it would otherwise sit there claiming to work forever.
+    refuses the submission deletes the pending row it created — unless a
+    cancel landed during the round trip and already recorded its
+    cancellation, which stands.
     """
     with db.connect() as con:
         party = con.execute("SELECT id FROM instance WHERE id = ?", (party_id,)).fetchone()
@@ -124,12 +133,34 @@ def start(party_id: str, prompt: str, instruction: str) -> StartResult:
     try:
         gen_id = comfyui.submit(graph)
     except comfyui.ComfyUIError:
-        with db.connect() as con:
-            con.execute("DELETE FROM message WHERE id = ?", (message_id,))
+        # Only a still-pending row is ours to clean up: a cancel that landed
+        # during the round trip already turned it into a recorded
+        # cancellation, and deleting that would erase the player's message.
+        with db.connect(immediate=True) as con:
+            row = con.execute("SELECT status FROM message WHERE id = ?", (message_id,)).fetchone()
+            if row is not None and row["status"] == "pending":
+                con.execute("DELETE FROM message WHERE id = ?", (message_id,))
         raise
 
-    with db.connect() as con:
-        con.execute("UPDATE message SET gen_id = ? WHERE id = ?", (gen_id, message_id))
+    # The submission was the window a cancel could land in: its stop path saw
+    # a row with no `gen_id` and could do nothing. Re-read under the write
+    # lock before assuming the row is still pending — a cancel either
+    # committed before this transaction begins (this read sees it) or waits
+    # for this commit and then finds the `gen_id` it needs itself.
+    with db.connect(immediate=True) as con:
+        row = con.execute("SELECT status FROM message WHERE id = ?", (message_id,)).fetchone()
+        if row is not None and row["status"] == "pending":
+            con.execute("UPDATE message SET gen_id = ? WHERE id = ?", (gen_id, message_id))
+            cancelled = False
+        else:
+            # Cancelled, or gone with its party: either way nothing is
+            # watching the job now, and this is the only moment its id is
+            # known — stop it through the same queue-checked path.
+            cancelled = True
+
+    if cancelled:
+        _stop_on_comfy(gen_id)
+        return StartResult(message_id=message_id, started_at=now)
 
     plan = _Plan(
         party_id=party_id,
@@ -285,6 +316,12 @@ def _stop_on_comfy(gen_id: str | None) -> None:
     if gen_id is None:
         return
     try:
+        # Residual the queue check cannot close: between this read and the
+        # action below, the running job can finish and the next one start, so
+        # an interrupt can still land on a render that is not ours. ComfyUI's
+        # interrupt carries no target, so read-then-act is the best its API
+        # allows; the half that matters most — never interrupting a merely
+        # queued job — is airtight.
         state = comfyui.queue()
         if gen_id in state.running:
             comfyui.interrupt()
@@ -302,9 +339,15 @@ def recover_pending() -> None:
 
     - no `gen_id`: the process died inside the persist-to-submit window, so
       the job was never queued (or its id was never recorded);
-    - a `gen_id`: the job may still be on ComfyUI, but the prompt and
-      instruction the completion needs were held only in memory, so a result
-      could not be recorded honestly.
+    - a `gen_id`: the job may still be queued or rendering on ComfyUI, and
+      while the prompt and instruction the completion needs were held only
+      in memory no result could be recorded honestly — but the job can be
+      stopped. Before the rows are marked, each one carrying a `gen_id` goes
+      through the same queue-checked stop the cancel uses. Stopping happens
+      first, outside the write transaction: a process dying again mid-way
+      leaves the rows pending and lets the next startup try once more, and
+      an unreachable ComfyUI (whose errors the stop swallows) cannot prevent
+      the recovery from completing.
 
     Running at startup means a reader never sees one of these claim to be
     working: the application is down while it is dead, and the first startup
@@ -314,6 +357,11 @@ def recover_pending() -> None:
         rows = con.execute(
             "SELECT id, gen_id FROM message WHERE kind = 'image' AND status = 'pending'"
         ).fetchall()
+    if not rows:
+        return
+    for row in rows:
+        _stop_on_comfy(row["gen_id"])
+    with db.connect(immediate=True) as con:
         for row in rows:
             message = (
                 "The application restarted before the generation could start."
@@ -326,4 +374,33 @@ def recover_pending() -> None:
             con.execute(
                 "UPDATE message SET status = 'error', error = ? WHERE id = ?",
                 (message, row["id"]),
+            )
+
+
+def recover_missing_done_files() -> None:
+    """Heal `done` image messages whose PNG file is gone; called once at startup.
+
+    The completion commits its rows first and writes the PNG after, so a
+    process death exactly between the two leaves a message claiming `done`
+    with an image id that resolves to nothing. That ordering is deliberate —
+    a rolled-back transaction must never leave an orphan file — so the
+    inconsistency is healed here rather than reordered there. Such a message
+    is not pending, so `recover_pending` passes it by and it can never be
+    cancelled: this is the only reader that can notice it.
+    """
+    with db.connect(immediate=True) as con:
+        rows = con.execute(
+            "SELECT id, image_id FROM message "
+            "WHERE kind = 'image' AND status = 'done' AND image_id IS NOT NULL"
+        ).fetchall()
+        for row in rows:
+            if db.image_path(row["image_id"]).is_file():
+                continue
+            con.execute(
+                "UPDATE message SET status = 'error', error = ? WHERE id = ?",
+                (
+                    "The image was recorded as complete, but its file is missing "
+                    f"({db.image_path(row['image_id']).name}); it is shown as failed.",
+                    row["id"],
+                ),
             )

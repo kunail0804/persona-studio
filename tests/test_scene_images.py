@@ -121,7 +121,13 @@ class _FakeHandler(http.server.BaseHTTPRequestHandler):
             elif payload is not None:
                 self._json(payload)
             else:
-                self._json({"prompt_id": fake.next_prompt_id, "number": 1, "node_errors": {}})
+                # Incrementing ids under the lock: two submissions are two
+                # distinct jobs, which is what a real ComfyUI does and what
+                # the concurrency test below needs to observe.
+                with fake.lock:
+                    fake._prompt_counter += 1
+                    prompt_id = f"fake-prompt-{fake._prompt_counter}"
+                self._json({"prompt_id": prompt_id, "number": 1, "node_errors": {}})
         elif self.path == "/interrupt":
             fake.log(method="POST", path="/interrupt")
             self._empty_ok()
@@ -145,7 +151,9 @@ class FakeComfyUI:
     running), `queue_running` / `queue_pending` hold queue entries as lists
     whose second element is the prompt id, `submit_status` / `submit_body`
     shape the `POST /prompt` answer, and the `hold_submit` / `release_submit`
-    event pair parks a submission until the test releases it.
+    event pair parks a submission until the test releases it. Each accepted
+    submission is assigned the next incrementing prompt id, so two live jobs
+    are distinguishable the way they are on the real server.
     """
 
     def __init__(self) -> None:
@@ -153,7 +161,7 @@ class FakeComfyUI:
         self.requests: list[dict[str, Any]] = []
         self.hold_submit = threading.Event()
         self.release_submit = threading.Event()
-        self.next_prompt_id = "fake-prompt-1"
+        self._prompt_counter = 0
         self.submit_status = 200
         self.submit_body: dict[str, Any] | None = None
         self.history_entries: dict[str, dict[str, Any]] = {}
@@ -337,7 +345,7 @@ def _cancel(client: TestClient, party_id: str, message_id: int) -> Any:
 def _message_rows(party_id: str) -> list[dict[str, Any]]:
     with db.connect() as con:
         rows = con.execute(
-            "SELECT id, kind, status, gen_id, image_id, started_at, error "
+            "SELECT id, kind, content, status, gen_id, image_id, started_at, error "
             "FROM message WHERE instance_id = ? ORDER BY id",
             (party_id,),
         ).fetchall()
@@ -539,6 +547,110 @@ def test_a_result_whose_gen_id_moved_on_is_discarded(client: TestClient, monkeyp
     assert generation._finish(orphan, done=True, png=b"x") is False
 
 
+def test_a_cancel_during_the_submit_window_stops_the_job_and_stays_cancelled(
+    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+) -> None:
+    """A cancel landing while the submission is in flight cannot stop the job:
+    the row carries no `gen_id` yet, so the stop path has nothing to aim at.
+    When the submission then returns, it must not stamp the id onto the
+    cancelled row, must not start a watcher, and must stop the job itself —
+    now that the id is finally known — through the same queue-checked path
+    the cancel uses. Also names the stop path's no-id-yet line: the cancel
+    above runs it with `gen_id` still None, and ComfyUI is asked nothing."""
+    party_id = _create_party(client, monkeypatch)
+    _setup_ready_workflow()
+    comfy.hold_submit.set()
+
+    holder: dict[str, Any] = {}
+
+    def submit_request() -> None:
+        with TestClient(app) as blocking_client:
+            holder["response"] = _start(blocking_client, party_id)
+
+    thread = threading.Thread(target=submit_request)
+    thread.start()
+    assert _wait_until(lambda: comfy.logged("POST", "/prompt")), "the submission never arrived"
+
+    # The row is pending and id-less while the submission is held.
+    rows = _image_messages(party_id)
+    assert len(rows) == 1 and rows[0]["status"] == "pending" and rows[0]["gen_id"] is None
+    message_id = rows[0]["id"]
+
+    # The cancel sees no gen_id: it records the cancellation and can do
+    # nothing on ComfyUI. The queue entry staged below is answered only once
+    # the id becomes known — whoever reads it then must act on it.
+    comfy.queue_running = [["entry", "fake-prompt-1"]]
+    assert _cancel(client, party_id, message_id).status_code == 200
+    assert comfy.calls("GET", "/queue") == []
+
+    comfy.release_submit.set()
+    thread.join(WAIT)
+    assert not thread.is_alive()
+
+    # Whatever the implementation under test started, end it while the fake
+    # is still the addressed server — a red run must never leave a watcher
+    # polling the real address.
+    history_calls = comfy.calls("GET", "/history")
+    comfy.complete("fake-prompt-1")
+    assert _wait_until(
+        lambda: (
+            not any(t.is_alive() and t.name.startswith("image-gen-") for t in threading.enumerate())
+        )
+    )
+
+    assert holder["response"].status_code == 201
+    row = _image_messages(party_id)[0]
+    assert row["status"] == "error"
+    assert row["error"] == generation.CANCEL_MESSAGE
+    assert row["gen_id"] is None, "the job id must not be stamped onto a cancelled row"
+    assert history_calls == [], "no watcher may poll a job the cancel already recorded"
+    assert comfy.logged("GET", "/queue"), "the stopped job must be found through the queue"
+    assert comfy.logged("POST", "/interrupt"), "the job must be interrupted once its id is known"
+
+
+def test_a_refused_submission_after_a_cancel_keeps_the_recorded_cancellation(
+    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+) -> None:
+    """The other face of the same window: the submission is refused after a
+    cancel already turned the row into a recorded cancellation. The refused
+    path deletes the pending row it created — but a row a cancel has claimed
+    is no longer pending, and deleting it would erase the cancellation from
+    the story entirely."""
+    party_id = _create_party(client, monkeypatch)
+    _setup_ready_workflow()
+    comfy.submit_status = 500
+    comfy.hold_submit.set()
+
+    holder: dict[str, Any] = {}
+
+    def submit_request() -> None:
+        with TestClient(app) as blocking_client:
+            holder["response"] = _start(blocking_client, party_id)
+
+    thread = threading.Thread(target=submit_request)
+    thread.start()
+    assert _wait_until(lambda: comfy.logged("POST", "/prompt")), "the submission never arrived"
+
+    rows = _image_messages(party_id)
+    assert len(rows) == 1 and rows[0]["status"] == "pending" and rows[0]["gen_id"] is None
+    message_id = rows[0]["id"]
+    assert _cancel(client, party_id, message_id).status_code == 200
+
+    comfy.release_submit.set()
+    thread.join(WAIT)
+    assert not thread.is_alive()
+
+    assert holder["response"].status_code == 502
+    rows = _image_messages(party_id)
+    assert len(rows) == 1, "the recorded cancellation must not be deleted"
+    assert rows[0]["status"] == "error"
+    assert rows[0]["error"] == generation.CANCEL_MESSAGE
+    # The job id was never known: the stop path ran with None and ComfyUI was
+    # asked for nothing at all.
+    assert comfy.calls("GET", "/queue") == []
+    assert comfy.calls("POST", "/interrupt") == []
+
+
 # --- 4. Cancelling acts on the queue only as far as it is safe --------------------
 
 
@@ -613,6 +725,33 @@ def test_an_unreachable_comfyui_still_leaves_a_cancelled_message(
     assert row["error"] == generation.CANCEL_MESSAGE
 
 
+def test_the_cancel_is_recorded_locally_before_comfyui_is_touched(
+    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+) -> None:
+    """Pins the order the module docstring states: the row is marked
+    cancelled before the queue is read, so a process death between the two
+    leaves a pending row the next startup heals — never a rendering job a
+    cancellation never mentioned."""
+    party_id = _create_party(client, monkeypatch)
+    message_id = _insert_pending(party_id, "order-job")
+    comfy.queue_running = [["entry", "order-job"]]
+
+    observed: list[str] = []
+    real_queue = comfyui.queue
+
+    def spy_queue() -> comfyui.QueueState:
+        with db.connect() as con:
+            row = con.execute("SELECT status FROM message WHERE id = ?", (message_id,)).fetchone()
+        observed.append(row["status"])
+        return real_queue()
+
+    monkeypatch.setattr(comfyui, "queue", spy_queue)
+
+    assert _cancel(client, party_id, message_id).status_code == 200
+    assert observed == ["error"], "the queue was read before the cancellation was recorded"
+    assert _image_messages(party_id)[0]["status"] == "error"
+
+
 # --- 5. A failed workflow surfaces ComfyUI's real error --------------------------
 
 
@@ -638,6 +777,25 @@ def test_a_failed_execution_surfaces_comfyui_real_error(
     error = _image_messages(party_id)[0]["error"]
     assert "KSampler" in error
     assert "CUDA out of memory on device 0" in error
+    assert "did not finish within" not in error
+
+
+def test_comfyui_becoming_unreachable_mid_render_fails_the_job_with_its_reason(
+    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+) -> None:
+    """Criterion 5's promise applied to the failure mode nothing tested: the
+    watcher is polling and ComfyUI goes away. The first unusable answer fails
+    the job with the real reason — not a deadline, not a cancellation."""
+    party_id = _create_party(client, monkeypatch)
+    _setup_ready_workflow()
+    message_id, _ = _start_unfinished(client, party_id)
+
+    monkeypatch.setattr(comfyui, "COMFYUI_BASE_URL", "http://127.0.0.1:1")
+
+    assert _wait_until(lambda: _image_messages(party_id)[0]["status"] == "error")
+    assert _wait_watcher_done(message_id)
+    error = _image_messages(party_id)[0]["error"]
+    assert "unreachable" in error
     assert "did not finish within" not in error
 
 
@@ -994,6 +1152,136 @@ def test_recovery_marks_every_pending_image_failed(client: TestClient, monkeypat
     errors = [row["error"] for row in rows]
     assert any("before the generation could start" in error for error in errors)
     assert any("while the image was rendering" in error for error in errors)
+
+
+def test_startup_stops_a_render_that_was_still_live(
+    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+) -> None:
+    """A restart abandons a live render's record — the prompt lived only in
+    the dead thread's memory — but the render itself can still be stopped.
+    Before a pending row is marked error, its job goes through the same
+    queue-checked stop the cancel uses: running means interrupt."""
+    party_id = _create_party(client, monkeypatch)
+    _insert_pending(party_id, "still-live-job")
+    comfy.queue_running = [["entry", "still-live-job"]]
+
+    generation.recover_pending()
+
+    assert comfy.logged("GET", "/queue")
+    assert comfy.logged("POST", "/interrupt")
+    assert not comfy.logged("POST", "/queue")
+    row = _image_messages(party_id)[0]
+    assert row["status"] == "error"
+    assert "while the image was rendering" in row["error"]
+
+
+def test_startup_stops_a_merely_queued_job_by_removing_it(
+    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+) -> None:
+    """The same recovery, for a job that never started rendering: removed
+    from the queue, and never interrupted."""
+    party_id = _create_party(client, monkeypatch)
+    _insert_pending(party_id, "still-queued-job")
+    comfy.queue_pending = [["entry", "still-queued-job"]]
+
+    generation.recover_pending()
+
+    deletes = comfy.calls("POST", "/queue")
+    assert len(deletes) == 1
+    assert deletes[0]["body"] == {"delete": ["still-queued-job"]}
+    assert not comfy.logged("POST", "/interrupt")
+    assert _image_messages(party_id)[0]["status"] == "error"
+
+
+def test_startup_recovery_completes_even_when_comfyui_is_unreachable(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """The stop attempt must not prevent the recovery: an unreachable ComfyUI
+    still leaves every pending row marked failed."""
+    party_id = _create_party(client, monkeypatch)
+    _insert_pending(party_id, "unreachable-job")
+    monkeypatch.setattr(comfyui, "COMFYUI_BASE_URL", "http://127.0.0.1:1")
+
+    generation.recover_pending()
+
+    rows = _image_messages(party_id)
+    assert {row["status"] for row in rows} == {"error"}
+    assert "while the image was rendering" in rows[0]["error"]
+
+
+def test_a_done_message_whose_file_is_missing_becomes_an_error_at_startup(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """The completion commits its rows and writes the PNG after, so a death
+    between the two leaves a `done` message whose image id resolves to
+    nothing — not pending, so `recover_pending` passes it by and it can never
+    be cancelled. A fresh startup (a new lifespan, as a restart does) heals
+    it into an error that says what happened; a `done` message whose file is
+    present is left alone."""
+    party_id = _create_party(client, monkeypatch)
+    lost_id, intact_id = uuid.uuid4().hex, uuid.uuid4().hex
+    with db.connect() as con:
+        con.execute(
+            "INSERT INTO image (id, created_at) VALUES (?, ?), (?, ?)",
+            (lost_id, time.time(), intact_id, time.time()),
+        )
+        con.execute(
+            "INSERT INTO message (instance_id, role, kind, content, ts, status, image_id) "
+            "VALUES (?, 'assistant', 'image', 'perdue', ?, 'done', ?), "
+            "(?, 'assistant', 'image', 'intacte', ?, 'done', ?)",
+            (party_id, time.time(), lost_id, party_id, time.time(), intact_id),
+        )
+    db.image_path(intact_id).write_bytes(b"still-there")
+
+    with TestClient(app) as restarted:
+        assert restarted.get("/api/health").status_code == 200
+
+    rows = {row["content"]: row for row in _image_messages(party_id)}
+    assert rows["perdue"]["status"] == "error"
+    assert "missing" in rows["perdue"]["error"]
+    assert rows["intacte"]["status"] == "done"
+    assert rows["intacte"]["error"] is None
+
+
+def test_two_live_generations_keep_their_own_rows_files_and_outcomes(
+    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+) -> None:
+    """Two concurrent generations are independent end to end: their own rows,
+    their own `gen_id`s (the fake assigns incrementing ids), their own files.
+    Cancelling one leaves the other rendering, and each completion lands on
+    its own message."""
+    party_id = _create_party(client, monkeypatch)
+    _setup_ready_workflow()
+
+    first = _start(client, party_id)
+    second = _start(client, party_id)
+    assert first.status_code == 201 and second.status_code == 201
+    first_id, second_id = first.json()["message_id"], second.json()["message_id"]
+
+    rows = _image_messages(party_id)
+    assert [row["id"] for row in rows] == [first_id, second_id]
+    first_prompt = rows[0]["gen_id"]
+    second_prompt = rows[1]["gen_id"]
+    assert first_prompt and second_prompt and first_prompt != second_prompt
+
+    # Cancelling one leaves the other rendering.
+    assert _cancel(client, party_id, first_id).status_code == 200
+    rows = _image_messages(party_id)
+    assert rows[0]["status"] == "error"
+    assert rows[1]["status"] == "pending"
+
+    comfy.complete(first_prompt)
+    comfy.complete(second_prompt, filename="second.png")
+
+    assert _wait_watcher_done(first_id)
+    assert _wait_watcher_done(second_id)
+    rows = _image_messages(party_id)
+    assert rows[0]["status"] == "error"
+    assert rows[0]["image_id"] is None
+    assert rows[1]["status"] == "done"
+    assert rows[1]["gen_id"] == second_prompt
+    assert db.image_path(rows[1]["image_id"]).read_bytes() == comfy.view_bytes
+    assert [p.name for p in db.IMAGES_DIR.glob("*.png")] == [f"{rows[1]['image_id']}.png"]
 
 
 # --- Small extras -------------------------------------------------------------------
