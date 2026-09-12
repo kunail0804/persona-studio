@@ -62,6 +62,10 @@ DEADLINE_SECONDS = 3600.0
 
 CANCEL_MESSAGE = "Generation cancelled."
 
+# Every failure the module records — watcher errors, cancellations, the two
+# startup recoveries — marks its message row with the same statement.
+_MARK_FAILED_SQL = "UPDATE message SET status = 'error', error = ? WHERE id = ?"
+
 
 @dataclass(frozen=True)
 class _Plan:
@@ -112,7 +116,14 @@ def start(party_id: str, prompt: str, instruction: str) -> StartResult:
         # One seed drawn here and handed to `prepare_graph` is how the value
         # recorded on the image row is guaranteed to be the one that was used,
         # whatever the workflow maps.
-        seed = random.randint(0, workflows.MAX_SEED)
+        #
+        # The draw itself needs no cryptographic strength: a seed is recorded
+        # on the image row and shown to the player, it is not a secret, so
+        # `random.randint` is not a real weakness. Switching to SystemRandom
+        # costs nothing here anyway — one os.urandom read per image, never in
+        # a loop — and it is cheaper than re-justifying the insecure-PRNG
+        # finding at every new occurrence.
+        seed = random.SystemRandom().randint(0, workflows.MAX_SEED)
         graph = workflows.prepare_graph(row, prompt, seed=seed)
         now = time.time()
         # The image's id is drawn here because the PNG will carry it, but the
@@ -265,7 +276,7 @@ def _finish(plan: _Plan, *, done: bool, error: str | None = None, png: bytes | N
             )
         else:
             con.execute(
-                "UPDATE message SET status = 'error', error = ? WHERE id = ?",
+                _MARK_FAILED_SQL,
                 (error, plan.message_id),
             )
     if done and png is not None:
@@ -296,7 +307,7 @@ def cancel(party_id: str, message_id: int) -> sqlite3.Row:
         if row["kind"] != "image" or row["status"] != "pending":
             raise ValueError("Only a pending image generation can be cancelled.")
         con.execute(
-            "UPDATE message SET status = 'error', error = ? WHERE id = ?",
+            _MARK_FAILED_SQL,
             (CANCEL_MESSAGE, message_id),
         )
         gen_id = row["gen_id"]
@@ -372,7 +383,7 @@ def recover_pending() -> None:
                 )
             )
             con.execute(
-                "UPDATE message SET status = 'error', error = ? WHERE id = ?",
+                _MARK_FAILED_SQL,
                 (message, row["id"]),
             )
 
@@ -397,7 +408,7 @@ def recover_missing_done_files() -> None:
             if db.image_path(row["image_id"]).is_file():
                 continue
             con.execute(
-                "UPDATE message SET status = 'error', error = ? WHERE id = ?",
+                _MARK_FAILED_SQL,
                 (
                     "The image was recorded as complete, but its file is missing "
                     f"({db.image_path(row['image_id']).name}); it is shown as failed.",

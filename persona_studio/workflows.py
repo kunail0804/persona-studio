@@ -37,6 +37,10 @@ from . import settings
 # 2**32-1 sits inside the declared range of every stock node.
 MAX_SEED = 2**32 - 1
 
+# System entropy for the default seed draw, created once at import because a
+# parameter default must not perform a call (ruff B008).
+_SYSTEM_RANDOM = random.SystemRandom()
+
 # Unmapped seed fields whose names these are get randomised: ComfyUI caches
 # on the graph, so an identical graph returns the identical image and an
 # unrandomised seed makes "generate again" a silent no-op.
@@ -280,9 +284,11 @@ def prepare_graph(
     prompt: str,
     *,
     seed: int | None = None,
-    # The module-level `random.randint`, not a `Random` instance: one source
-    # of randomness, and a callable the tests can replace.
-    rng: Callable[[int, int], int] = random.randint,
+    # A callable over system entropy, not the `random` module's PRNG: an
+    # image seed is not a secret and `randint` is not a real weakness, but
+    # the switch costs nothing here — one draw per field, never in a loop —
+    # and the tests replace it wholesale to stay deterministic.
+    rng: Callable[[int, int], int] = _SYSTEM_RANDOM.randint,
 ) -> dict[str, Any]:
     """A private deep copy of the stored graph, with the prompt injected.
 

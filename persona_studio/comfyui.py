@@ -139,45 +139,77 @@ def history(prompt_id: str) -> HistoryEntry | None:
     data = _request_json("GET", f"/history/{prompt_id}")
     if not isinstance(data, dict):
         raise ComfyUIError("Unexpected /history response shape")
-    entry = data.get(prompt_id)
+    entry = _history_entry(data.get(prompt_id))
     if entry is None:
         return None
-    if not isinstance(entry, dict):
-        raise ComfyUIError("Unexpected /history entry shape")
-    status = entry.get("status")
-    if not isinstance(status, dict):
-        raise ComfyUIError("The /history entry carries no status object")
+    status = _history_status(entry.get("status"))
     completed = status.get("completed") is True
     error = (
         _error_from_messages(status.get("messages"))
         if status.get("status_str") == "error"
         else None
     )
+    return HistoryEntry(
+        completed=completed, error=error, images=_output_images(entry.get("outputs"))
+    )
 
+
+def _history_entry(entry: Any) -> dict[str, Any] | None:
+    """The job's entry in the response, or None while it has none yet."""
+    if entry is None:
+        return None
+    if not isinstance(entry, dict):
+        raise ComfyUIError("Unexpected /history entry shape")
+    return entry
+
+
+def _history_status(status: Any) -> dict[str, Any]:
+    """The entry's status object, refusing an entry that carries none."""
+    if not isinstance(status, dict):
+        raise ComfyUIError("The /history entry carries no status object")
+    return status
+
+
+def _output_images(outputs: Any) -> list[ImageRef]:
+    """Every usable image reference across all nodes' outputs.
+
+    Nodes with no output, outputs with no `images` list, and items without a
+    filename are skipped rather than trusted; the defaults match what `/view`
+    answers for stock output images.
+    """
     images: list[ImageRef] = []
-    outputs = entry.get("outputs")
-    if isinstance(outputs, dict):
-        for node_output in outputs.values():
-            if not isinstance(node_output, dict):
-                continue
-            produced = node_output.get("images")
-            if not isinstance(produced, list):
-                continue
-            for item in produced:
-                if not isinstance(item, dict):
-                    continue
-                filename = item.get("filename")
-                if isinstance(filename, str) and filename:
-                    subfolder = item.get("subfolder")
-                    image_type = item.get("type")
-                    images.append(
-                        ImageRef(
-                            filename=filename,
-                            subfolder=subfolder if isinstance(subfolder, str) else "",
-                            image_type=image_type if isinstance(image_type, str) else "output",
-                        )
-                    )
-    return HistoryEntry(completed=completed, error=error, images=images)
+    if not isinstance(outputs, dict):
+        return images
+    for node_output in outputs.values():
+        if not isinstance(node_output, dict):
+            continue
+        images.extend(_view_refs(node_output.get("images")))
+    return images
+
+
+def _view_refs(produced: Any) -> list[ImageRef]:
+    """Image refs from one node's `images` list, ignoring malformed items."""
+    refs: list[ImageRef] = []
+    if not isinstance(produced, list):
+        return refs
+    for item in produced:
+        if isinstance(item, dict) and (ref := _view_ref(item)) is not None:
+            refs.append(ref)
+    return refs
+
+
+def _view_ref(item: dict[str, Any]) -> ImageRef | None:
+    """One `images` item as `/view` needs to ask for it, or None without a filename."""
+    filename = item.get("filename")
+    if not isinstance(filename, str) or not filename:
+        return None
+    subfolder = item.get("subfolder")
+    image_type = item.get("type")
+    return ImageRef(
+        filename=filename,
+        subfolder=subfolder if isinstance(subfolder, str) else "",
+        image_type=image_type if isinstance(image_type, str) else "output",
+    )
 
 
 def image_bytes(ref: ImageRef) -> bytes:
