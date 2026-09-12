@@ -12,6 +12,7 @@ import type { Party, PartyMessage, TurnEvent } from "../api/parties";
 import { Narration } from "../components/Narration";
 import { Button } from "../components/Button";
 import { TextArea } from "../components/TextArea";
+import { ImagePanel } from "../components/ImagePanel";
 
 // The bubble re-renders at most this often while fragments arrive. Every
 // fragment is still accumulated; only the re-render is throttled. The
@@ -343,6 +344,10 @@ export function PartyPage() {
           </Button>
         )}
       </form>
+      {/* key: the panel keeps its composed prompt in local state, so a party
+          change must remount it rather than show one party's prompt on
+          another party's page. */}
+      <ImagePanel key={party.id} partyId={party.id} />
     </div>
   );
 }
