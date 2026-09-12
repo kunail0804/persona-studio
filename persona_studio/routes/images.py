@@ -12,9 +12,10 @@ ComfyUI, watch on a background thread. The player keeps playing while it
 renders.
 
 Cancelling is a separate endpoint on the message, and the file itself is
-served from `data/images/` under a strict id check: anything that is not a
-plain image id must not resolve to a path, so nothing can walk out of that
-directory.
+served from `data/images/` under a strict id check plus a containment check:
+anything that is not a plain image id must not resolve to a path, and the
+path that resolves must sit inside the images directory, so nothing can walk
+out of it.
 
 Composition follows the create-party discipline: the reads happen in one
 connection that closes before the model call, so no SQLite connection is ever
@@ -153,7 +154,13 @@ def get_image_file(image_id: str) -> FileResponse:
     """The PNG behind an image id, for the interface's `<img>` tags."""
     if not _IMAGE_ID_PATTERN.fullmatch(image_id):
         raise HTTPException(status_code=404, detail="Not found")
-    path = db.image_path(image_id)
-    if not path.is_file():
+    # The pattern is an early exit, not a containment proof. Resolving both
+    # sides and comparing them keeps the served file inside the images
+    # directory even if the pattern is ever loosened or a symlink lands
+    # there; the directory is resolved too, so a symlinked data directory is
+    # not refused by its own link.
+    images_dir = db.IMAGES_DIR.resolve()
+    path = db.image_path(image_id).resolve()
+    if not path.is_relative_to(images_dir) or not path.is_file():
         raise HTTPException(status_code=404, detail=f"Image {image_id!r} not found")
     return FileResponse(path, media_type="image/png")

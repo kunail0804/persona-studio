@@ -932,6 +932,23 @@ def test_the_image_route_refuses_anything_that_is_not_a_plain_id(
         assert response.status_code == 404, image_id
         assert "studio" not in response.text
 
+    # A value that passes the id pattern but resolves outside the images
+    # directory — here a symlink planted among the PNGs — is refused the
+    # same way: the served file must sit inside the directory, not merely
+    # carry a well-formed name.
+    image_id = uuid.uuid4().hex
+    outside = db.IMAGES_DIR.parent / "outside-the-images-dir.png"
+    outside.write_bytes(b"not-an-image")
+    link = db.IMAGES_DIR / f"{image_id}.png"
+    link.symlink_to(outside)
+    try:
+        response = client.get(f"/api/images/{image_id}/file")
+        assert response.status_code == 404, image_id
+        assert "studio" not in response.text
+    finally:
+        link.unlink(missing_ok=True)
+        outside.unlink(missing_ok=True)
+
 
 def test_the_image_route_serves_a_real_image(client: TestClient) -> None:
     image_id = uuid.uuid4().hex
