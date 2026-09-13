@@ -244,11 +244,21 @@ def test_the_request_rides_verbatim_and_last() -> None:
     assert messages[-1]["content"].rstrip().endswith(INPUTS.instruction)
 
 
-def test_the_scene_rides_whole() -> None:
+def test_the_scene_rides_whole_except_the_place() -> None:
     scene = build_messages(INPUTS)[-1]["content"]
     assert INPUTS.narration in scene
-    for value in INPUTS.world_state.values():
+    for key, value in INPUTS.world_state.items():
+        if key == "location":
+            continue
         assert json.dumps(value, ensure_ascii=False) in scene
+
+
+def test_the_stored_location_never_reaches_the_model() -> None:
+    """No bounded list of known places exists to scrub a location against,
+    unlike a character's name — so it is excluded before the call rather
+    than sent and cleaned. See the module docstring."""
+    scene = build_messages(INPUTS)[-1]["content"]
+    assert INPUTS.world_state["location"] not in scene
 
 
 def test_a_multiline_appearance_is_indented_under_its_label_in_the_scene() -> None:
@@ -396,7 +406,9 @@ def test_compose_returns_the_prompt_with_names_scrubbed(
     scene = calls[0]["messages"][-1]["content"]
     assert "Elena sur le quai au crépuscule" in scene
     assert "Elena attend près de la porte du port" in scene
-    assert "le port" in scene
+    # The stored location is excluded before the call: no bounded list of
+    # known places exists to scrub it against the way character names do.
+    assert "le port" not in scene
     assert ELENA.appearance in scene
     assert ASH.appearance in scene
     assert "Brusque, loyal." not in scene

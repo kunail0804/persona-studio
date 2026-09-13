@@ -15,11 +15,15 @@ is the deterministic second line. It works on the model's **answer**, not on
 the prompt: the model may see names (it must, to tell which appearance belongs
 to whom), the returned keywords may not.
 
-Place names are left alone on purpose. A location such as "la Tour Eiffel"
-rides into the prompt untouched: an image model does not know who Elena is,
-but it knows the Eiffel Tower, and a place has no appearance field to become —
-the criterion ties the scrub to characters becoming their description, not to
-every proper name.
+Place names are excluded, not scrubbed. There is no bounded list of known
+places to match against the way there is for characters — the `place` table
+carries no CRUD and nothing writes to it, so the only place-shaped text is
+`world_state["location"]`, free text the summariser writes. That single key
+is dropped before the call rather than sent and then cleaned, because there
+is nothing to clean it *against*. The rest of `world_state`, and the
+narration itself, can still name a place in passing prose; no deterministic
+pass can catch that without a list to check names against, the same limit
+`scrub_names` already lives with for an uncommon character name.
 """
 
 from __future__ import annotations
@@ -80,15 +84,23 @@ _SYSTEM_INSTRUCTION = (
 )
 
 
+# The one key excluded before the call: see the module docstring for why
+# exclusion, not a scrub, is the only honest way to keep a place name out.
+_EXCLUDED_WORLD_STATE_KEYS = frozenset({"location"})
+
+
 def _world_state_lines(world_state: dict[str, object]) -> str:
-    """The stored world state as `key: value` lines.
+    """The stored world state as `key: value` lines, `location` excluded.
 
     The shape is the summariser's (`location`, `present`, `established`, ...),
-    but it is rendered generically: a new key the summariser starts producing
-    rides along without this module learning about it.
+    and every key but `location` is rendered generically: a new key the
+    summariser starts producing rides along without this module learning
+    about it.
     """
     lines = (
-        f"{key}: {json.dumps(value, ensure_ascii=False)}" for key, value in world_state.items()
+        f"{key}: {json.dumps(value, ensure_ascii=False)}"
+        for key, value in world_state.items()
+        if key not in _EXCLUDED_WORLD_STATE_KEYS
     )
     return "\n".join(lines)
 
