@@ -16,9 +16,10 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 DATA_DIR = Path(os.environ.get("PS_DATA", Path(__file__).resolve().parent.parent / "data"))
 DB_PATH = DATA_DIR / "studio.db"
@@ -42,16 +43,48 @@ def _configure(con: sqlite3.Connection) -> None:
 
 
 @contextmanager
-def connect() -> Iterator[sqlite3.Connection]:
-    """Connexion transactionnelle : commit en sortie normale, rollback sur erreur."""
+def connect(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+    """Connexion transactionnelle : commit en sortie normale, rollback sur erreur.
+
+    With `immediate=True` the transaction starts with BEGIN IMMEDIATE, taking
+    the write lock before the first read instead of at the first write. A
+    read-check-write sequence — read a value, decide, write from it — is only
+    correct if no other writer can commit between the read and the write: on
+    the default deferred transaction, SQLite defers the write lock to the
+    first INSERT/UPDATE, and whatever was read can be stale by then. Writers
+    that only read or only write keep the default, which never blocks.
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     try:
         _configure(con)
+        if immediate:
+            # Legacy isolation_level would auto-begin a deferred transaction
+            # at the first DML, so hand control over: with isolation_level
+            # disabled the explicit BEGIN IMMEDIATE is the whole transaction,
+            # and `with con:` still commits (or rolls back) it at exit.
+            con.isolation_level = None
+            con.execute("BEGIN IMMEDIATE")
         with con:
             yield con
     finally:
         con.close()
+
+
+def assignments(columns: Sequence[str], fields: Mapping[str, Any]) -> tuple[str, list[Any]]:
+    """`"a = ?, b = ?"` and the matching values, for the columns actually given.
+
+    What a PATCH needs: only the fields the caller sent are written, and the
+    ones it omitted keep their stored value. `columns` is the caller's own
+    whitelist of column names — a module constant, never request data — so the
+    only thing interpolated into the SQL comes from the code itself; every
+    value stays bound.
+
+    Returns an empty clause when nothing matched, which the caller reads as
+    "no column to write".
+    """
+    present = [name for name in columns if name in fields]
+    return ", ".join(f"{name} = ?" for name in present), [fields[name] for name in present]
 
 
 # --------------------------------------------------------------------------
@@ -223,7 +256,23 @@ MIGRATIONS: list[str] = [
 
 
 def migrate() -> int:
-    """Applique les migrations manquantes. Retourne la version atteinte."""
+    """Applique les migrations manquantes. Retourne la version atteinte.
+
+    Une migration est tout-ou-rien, et c'est le seul point délicat ici.
+    `executescript` valide d'abord toute transaction en cours, puis exécute
+    ses instructions en autocommit : un `with con:` autour de lui n'a donc
+    plus rien à annuler quand une instruction tardive échoue. La base reste
+    alors à l'ancien `user_version` avec une partie des tables déjà créées, et
+    chaque démarrage suivant rejoue la même migration et meurt sur « table
+    already exists » — une application qui ne redémarre plus jamais.
+
+    D'où le BEGIN/COMMIT *dans* le script : c'est le seul endroit que
+    `executescript` ne contourne pas. `PRAGMA user_version` y entre aussi,
+    parce qu'il est transactionnel — la version et le schéma qu'elle décrit
+    arrivent ensemble ou pas du tout. Découper le script sur les points-virgules
+    serait l'autre option, et elle est fausse : les corps des triggers FTS en
+    contiennent.
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
@@ -231,14 +280,24 @@ def migrate() -> int:
         _configure(con)
         current = con.execute("PRAGMA user_version").fetchone()[0]
         for version in range(current, len(MIGRATIONS)):
-            with con:
-                con.executescript(MIGRATIONS[version])
-                # user_version n'accepte pas de paramètre lié.
-                con.execute(f"PRAGMA user_version = {version + 1}")
+            try:
+                con.executescript(
+                    "BEGIN IMMEDIATE;\n"
+                    f"{MIGRATIONS[version]}\n"
+                    # user_version n'accepte pas de paramètre lié.
+                    f"PRAGMA user_version = {version + 1};\n"
+                    "COMMIT;"
+                )
+            except sqlite3.Error:
+                # L'échec laisse la transaction ouverte : c'est elle qui porte
+                # les instructions déjà passées, et l'annuler est ce qui rend
+                # la migration réessayable une fois la faute corrigée.
+                con.rollback()
+                raise
         return con.execute("PRAGMA user_version").fetchone()[0]
     finally:
         con.close()
 
 
-def image_path(image_id: str):
+def image_path(image_id: str) -> Path:
     return IMAGES_DIR / f"{image_id}.png"

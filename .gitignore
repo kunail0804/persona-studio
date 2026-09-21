@@ -2,6 +2,8 @@
 __pycache__/
 *.py[cod]
 .venv/
+coverage.xml
+.coverage
 
 # Node
 node_modules/
