@@ -1784,3 +1784,300 @@ def test_a_commit_for_a_deleted_party_is_a_quiet_no(client: TestClient, monkeypa
     )
 
     assert applied is False
+
+
+# --- Refreshing a summary that has gone stale (audit finding 2) -------------------
+#
+# `summary_upto` is a message id and deliberately does not move — issue #11
+# pins that editing must not disturb the frontier. The consequence the audit
+# found: a corrected message behind the frontier is never re-sent verbatim,
+# and the summary standing in for it keeps describing the text the player
+# just replaced, so the correction reaches the screen and nothing else. The
+# summary is what changes now. Same background shape as the summariser, so
+# the same bounded waits apply.
+
+
+def _prepare_covered_party(
+    client: TestClient, monkeypatch: Any, summary: str = "Le héros entre dans le port."
+) -> tuple[str, list[int], int]:
+    """A party whose oldest messages sit behind a summary frontier.
+
+    Returns `(party_id, message_ids, frontier)`. `message_ids[1]` is safely
+    behind the frontier and `message_ids[-1]` safely past it.
+    """
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    ids = _fill_party(party_id, 4, "Tour")
+    frontier = ids[2]
+    _set_summary(party_id, summary, frontier, json.dumps({"location": "port"}))
+    return party_id, ids, frontier
+
+
+def test_editing_a_message_behind_the_frontier_refreshes_the_summary(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """The audit's finding 2, from the edit side. Without the refresh the
+    stored summary still described the pre-edit text, so the narrator read
+    the correction nowhere at all."""
+    party_id, ids, frontier = _prepare_covered_party(client, monkeypatch)
+    calls = _stub_summary_chat(
+        monkeypatch,
+        reply=_summary_reply("Le héros entre dans la crypte.", {"location": "crypte"}),
+    )
+
+    assert _edit(client, party_id, ids[1], "Il entre dans la crypte.").status_code == 200
+
+    assert _wait_until(lambda: len(calls) == 1), "no revision was scheduled"
+    assert _wait_unlocked(party_id)
+    text, upto, world = _summary_state(party_id)
+    assert text == "Le héros entre dans la crypte."
+    assert world == json.dumps({"location": "crypte"}, ensure_ascii=False)
+    # The whole point of revising rather than re-compressing: what the summary
+    # covers is unchanged, which is issue #11's own criterion.
+    assert upto == frontier
+
+
+def test_regenerating_a_message_behind_the_frontier_refreshes_the_summary(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """The same finding from the regenerate side, which reaches it through
+    `_persist_regenerated` rather than through the edit route."""
+    party_id, ids, frontier = _prepare_covered_party(client, monkeypatch)
+    calls = _stub_summary_chat(monkeypatch, reply=_summary_reply("Mémoire corrigée."))
+
+    parties_routes._persist_regenerated(ids[1], party_id, "Une autre version du tour.")
+
+    assert _wait_until(lambda: len(calls) == 1), "no revision was scheduled"
+    assert _wait_unlocked(party_id)
+    text, upto, _ = _summary_state(party_id)
+    assert text == "Mémoire corrigée."
+    assert upto == frontier
+
+
+def test_editing_a_message_past_the_frontier_leaves_the_summary_alone(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """Past the frontier the narrator still reads the message verbatim, so the
+    summary makes no claim about it and there is nothing to revise. The plan
+    returns None on the request thread, so no thread is ever spawned and
+    asserting on the call list immediately is not a race."""
+    party_id, ids, _ = _prepare_covered_party(client, monkeypatch)
+    calls = _stub_summary_chat(monkeypatch, reply=_summary_reply("Jamais écrit."))
+
+    assert _edit(client, party_id, ids[-1], "Un tour récent, corrigé.").status_code == 200
+
+    assert calls == []
+    assert party_id not in summarizer._locks
+    assert _summary_state(party_id)[0] == "Le héros entre dans le port."
+
+
+def test_a_revision_is_skipped_when_no_summary_has_been_written_yet(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """A frontier with an empty summary describes nothing, so there is no
+    stale claim to correct."""
+    party_id, ids, _ = _prepare_covered_party(client, monkeypatch, summary="")
+    calls = _stub_summary_chat(monkeypatch, reply=_summary_reply("Jamais écrit."))
+
+    assert _edit(client, party_id, ids[1], "Corrigé.").status_code == 200
+
+    assert calls == []
+
+
+def test_a_revision_is_skipped_without_a_configured_model(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    party_id, ids, _ = _prepare_covered_party(client, monkeypatch)
+    calls = _stub_summary_chat(monkeypatch, reply=_summary_reply("Jamais écrit."))
+    _configure_model(None)
+    try:
+        # The edit route needs no model of its own, so this still succeeds.
+        assert _edit(client, party_id, ids[1], "Corrigé.").status_code == 200
+    finally:
+        _configure_model("test-model")
+
+    assert calls == []
+
+
+def test_a_revision_for_an_unknown_party_does_nothing(monkeypatch: Any) -> None:
+    calls = _stub_summary_chat(monkeypatch, reply=_summary_reply("Jamais écrit."))
+
+    summarizer.schedule_revision("no-such-party", 1, "Corrigé.")
+
+    assert calls == []
+
+
+def test_a_revision_is_skipped_while_another_job_holds_the_party(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """One job at a time per party, on the same non-blocking lock the
+    summariser uses: a revision arriving while a job runs is skipped, not
+    queued. A stale sentence for one more turn is cheaper than two jobs
+    writing the same row from two different reads of it."""
+    party_id, ids, _ = _prepare_covered_party(client, monkeypatch)
+    calls = _stub_summary_chat(monkeypatch, reply=_summary_reply("Jamais écrit."))
+    held = summarizer._lock_for(party_id)
+    assert held is not None, "the party's lock was already taken"
+    try:
+        assert _edit(client, party_id, ids[1], "Corrigé.").status_code == 200
+    finally:
+        held.release()
+        summarizer._sweep_locks()
+
+    assert calls == []
+    assert _summary_state(party_id)[0] == "Le héros entre dans le port."
+
+
+def test_the_revision_call_carries_the_summary_and_the_corrected_text(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """The call is deliberately small: the summary, the world state and the
+    one corrected message — never the covered range, which is exactly what
+    the summary replaced and would grow without bound."""
+    party_id, ids, _ = _prepare_covered_party(client, monkeypatch)
+    calls = _stub_summary_chat(monkeypatch, reply=_summary_reply("Révisé."))
+
+    assert _edit(client, party_id, ids[1], "Le texte corrigé.").status_code == 200
+    assert _wait_until(lambda: len(calls) == 1)
+    assert _wait_unlocked(party_id)
+
+    messages = calls[0]["messages"]
+    assert [m["role"] for m in messages] == ["system", "user", "user"]
+    assert "Le héros entre dans le port." in messages[0]["content"]
+    assert '"location": "port"' in messages[0]["content"]
+    assert "Le texte corrigé." in messages[1]["content"]
+    # `format="json"` is what makes the answer parseable at all.
+    assert calls[0]["format"] == "json"
+    # None of the covered messages rides along.
+    assert not any("Tour 0." in m["content"] for m in messages)
+
+
+def test_a_failed_revision_keeps_the_previous_summary(client: TestClient, monkeypatch: Any) -> None:
+    """Write only on success, the same rule the summariser follows: an
+    unreachable Ollama costs a stale sentence, never a broken party."""
+    party_id, ids, frontier = _prepare_covered_party(client, monkeypatch)
+    calls = _stub_summary_chat(monkeypatch, error=OllamaUnreachable("Ollama est injoignable"))
+
+    assert _edit(client, party_id, ids[1], "Corrigé.").status_code == 200
+    assert _wait_until(lambda: len(calls) == 1)
+    assert _wait_unlocked(party_id)
+
+    assert _summary_state(party_id) == (
+        "Le héros entre dans le port.",
+        frontier,
+        json.dumps({"location": "port"}),
+    )
+
+
+def test_an_unparseable_revision_changes_nothing(client: TestClient, monkeypatch: Any) -> None:
+    """A local model gets JSON wrong sometimes. That is a job failure, not a
+    crash, and it must not overwrite a good summary with nonsense."""
+    party_id, ids, frontier = _prepare_covered_party(client, monkeypatch)
+    calls = _stub_summary_chat(monkeypatch, reply="Bien sûr ! Voici le résumé : ...")
+
+    assert _edit(client, party_id, ids[1], "Corrigé.").status_code == 200
+    assert _wait_until(lambda: len(calls) == 1)
+    assert _wait_unlocked(party_id)
+
+    assert _summary_state(party_id) == (
+        "Le héros entre dans le port.",
+        frontier,
+        json.dumps({"location": "port"}),
+    )
+
+
+# --- One turn at a time, per party (audit finding 3) -----------------------------
+
+
+def test_a_second_turn_while_one_is_playing_is_refused(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """Two turns at once used to interleave into `user, user, assistant,
+    assistant`, each reply answering a prompt holding the other's unanswered
+    turn. `message.id` is the order of the story, so that damage is permanent.
+
+    The lock is taken here directly rather than by racing two real requests:
+    the interleaving is what must be impossible, and a scheduler-dependent
+    test proves nothing about it either way.
+    """
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    _stub_chat_stream(monkeypatch, replies=["Jamais générée."])
+
+    release = parties_routes._acquire_turn_lock(party_id)
+    try:
+        response = _send_turn(client, party_id, "Deuxième tour.")
+    finally:
+        release()
+
+    assert response.status_code == 409
+    # Refused before anything is written: the lock is taken ahead of the
+    # player's insert, because that insert is already half the interleaving.
+    assert [m["content"] for m in _party_message_rows(party_id)] == [OPENING]
+
+
+def test_the_turn_lock_is_given_back_so_the_next_turn_plays(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """The release runs on the event loop while the acquire ran on a worker
+    thread. If it ever failed to, every later turn in the party would answer
+    409 — so this is the assertion that matters most about the lock."""
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    _stub_chat_stream(monkeypatch, replies=["Le quai s'éveille."])
+
+    assert _send_turn(client, party_id, "Premier tour.").status_code == 200
+    assert _send_turn(client, party_id, "Deuxième tour.").status_code == 200
+
+    assert party_id not in parties_routes._turn_locks
+    roles = [m["role"] for m in _party_message_rows(party_id)]
+    assert roles == ["assistant", "user", "assistant", "user", "assistant"]
+
+
+def test_a_refused_regeneration_gives_the_lock_back(client: TestClient, monkeypatch: Any) -> None:
+    """`_prepare_regenerate` raises 400 for a player's message. The lock is
+    taken before that check, so the failure path has to release it or the
+    party is wedged by a mistake the caller already got told about."""
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    _stub_chat_stream(monkeypatch, replies=["Le quai s'éveille."])
+    assert _send_turn(client, party_id, "Premier tour.").status_code == 200
+    player_message_id = _party_message_rows(party_id)[1]["id"]
+
+    assert _regenerate(client, party_id, player_message_id).status_code == 400
+
+    assert party_id not in parties_routes._turn_locks
+    assert _regenerate(client, party_id, _opening_message_id(client, party_id)).status_code == 200
+
+
+# --- Archiving both texts when an edit races a regeneration (audit finding 1) -----
+
+
+def test_an_edit_landing_during_a_regeneration_keeps_both_texts(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """The audit's worst finding. The regeneration used to decide what to
+    archive by re-reading `message.content` when its transaction opened — at
+    the *end* of the stream — so an edit that landed in the meantime was
+    archived in place of the text the regeneration actually started from, and
+    that text then existed nowhere: not in `content`, not in any variant.
+
+    No race to arrange: two ordinary calls, a second apart, is the realistic
+    shape. The regeneration carries the text it started from, and both survive.
+    """
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+    message_id = _opening_message_id(client, party_id)
+    started_from = _message_content(message_id)
+    edited = "Texte édité depuis un second onglet."
+
+    assert _edit(client, party_id, message_id, edited).status_code == 200
+    parties_routes._persist_regenerated(
+        message_id, party_id, "Nouvelle ouverture.", original=started_from
+    )
+
+    archived = [row["content"] for row in _variant_rows(message_id)]
+    assert started_from in archived, "the text the regeneration started from was lost"
+    assert edited in archived, "the edit was lost"
+    assert _message_content(message_id) == "Nouvelle ouverture."
+    _assert_invariant(message_id)
