@@ -77,6 +77,24 @@ def register_spa_fallback(app: FastAPI, web_dist: Path) -> None:
             raise HTTPException(status_code=404, detail="Not found")
         return FileResponse(web_dist / "index.html")
 
+    @app.api_route(
+        "/{full_path:path}",
+        methods=["POST", "PUT", "PATCH", "DELETE"],
+        include_in_schema=False,
+    )
+    def spa_not_found(full_path: str) -> None:
+        """Anything that is not a GET and reached this far is a 404, not a 405.
+
+        The catch-all above is GET-only, so every other method used to be
+        rejected at Starlette's method check: a 405 with no body, which reads
+        as "wrong verb on a real endpoint" when the truth is that no such
+        endpoint exists. Serving index.html here would be worse still — a
+        POST to a client-side route is not a page request. Real API routes are
+        registered before this one and match first; only what none of them
+        claimed arrives here.
+        """
+        raise HTTPException(status_code=404, detail="Not found")
+
 
 # Le front construit par Vite est servi tel quel. En dev, on passe plutôt par
 # `pnpm dev` sur :5173, qui relaie /api vers ce serveur.

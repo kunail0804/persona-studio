@@ -13,6 +13,7 @@ rules are enforced here rather than trusted to callers:
 from __future__ import annotations
 
 import json
+import weakref
 from collections.abc import Generator, Iterator
 from typing import Any
 
@@ -66,6 +67,37 @@ def list_models() -> list[str]:
     return sorted(names)
 
 
+# Unloading frees memory, it does not generate: there is no model work to wait
+# for, so it gets a far shorter read timeout than a completion. The one thing
+# that can still make it slow is a generation already running on the same
+# model, which Ollama serialises this request behind.
+UNLOAD_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
+
+
+def unload(model: str) -> None:
+    """Ask Ollama to drop `model` from memory now, instead of at its idle timer.
+
+    `keep_alive: 0` with no prompt is Ollama's documented way to do this. It
+    exists here for one reason: narration and image generation share a single
+    GPU, and on this machine's 12 GB a resident chat model plus a diffusion
+    pipeline is an out-of-memory error rather than a slowdown. The cost is
+    paid by the next narration turn, which reloads the model from disk.
+
+    Raises the same two errors every other call in this module raises. The
+    image path is expected to swallow them: an Ollama that cannot be reached
+    is holding no VRAM to begin with, and an unload that failed costs at worst
+    one render — never a row, and never the player's message.
+    """
+    with httpx.Client(base_url=OLLAMA_BASE_URL, timeout=UNLOAD_TIMEOUT) as client:
+        try:
+            response = client.post("/api/generate", json={"model": model, "keep_alive": 0})
+        except httpx.HTTPError as exc:
+            raise OllamaUnreachable(f"Ollama is unreachable at {OLLAMA_BASE_URL}: {exc}") from exc
+    if response.status_code >= 400:
+        detail = response.text.strip()[:500] or response.reason_phrase
+        raise OllamaError(f"Ollama returned HTTP {response.status_code}: {detail}")
+
+
 def chat(
     model: str, messages: list[dict[str, str]], num_ctx: int, *, format: str | None = None
 ) -> str:
@@ -112,13 +144,57 @@ def chat_stream(model: str, messages: list[dict[str, str]], num_ctx: int) -> Gen
         "stream": True,
         "options": {"num_ctx": num_ctx},
     }
-    return _stream_chat(payload)
+    holder: list[httpx.Response] = []
+    stream = _stream_chat(payload, holder)
+    _OPEN_RESPONSES[stream] = holder
+    return stream
 
 
-def _stream_chat(payload: dict[str, Any]) -> Generator[str]:
+# The live response behind each stream this module handed out, so `close_stream`
+# can reach it. Weak keys: a caller that drops its generator without closing it
+# takes the entry with it, and nothing here keeps a stream alive.
+_OPEN_RESPONSES: weakref.WeakKeyDictionary[Generator[str], list[httpx.Response]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def close_stream(stream: Generator[str]) -> None:
+    """Stop a chat stream at the HTTP level, from any thread.
+
+    `Generator.close()` is the ordinary way to end a stream, and it is not
+    enough on the path that matters. When the player presses stop, the
+    cancellation lands while a worker thread is still inside a pull; closing
+    the generator then raises `ValueError: generator already executing` and
+    does nothing, so the request to Ollama stays open and the model keeps
+    generating a reply nobody will ever read — holding the GPU for the rest of
+    its evaluation. Closing the response object works there: the in-flight
+    read fails, and the generator unwinds through its own `with` blocks.
+
+    Idempotent, and safe on a stream that already finished. A stream this
+    module did not create — a test stub, say — is not in the registry and is
+    left to its own `close()`.
+    """
+    try:
+        holder = _OPEN_RESPONSES.pop(stream, None)
+    except TypeError:
+        # Not weak-referenceable, so it cannot be one of ours: a plain
+        # iterator standing in for a stream, which owns no HTTP request.
+        return
+    if holder:
+        holder[0].close()
+
+
+def _stream_chat(payload: dict[str, Any], holder: list[httpx.Response]) -> Generator[str]:
+    """The streaming call itself; `holder` receives the response once it exists.
+
+    The response is published rather than returned because the caller holds a
+    generator, and a generator has nothing to hand back before its first pull.
+    `close_stream` is what reads it.
+    """
     try:
         with httpx.Client(base_url=OLLAMA_BASE_URL, timeout=TIMEOUT) as client:
             with client.stream("POST", "/api/chat", json=payload) as response:
+                holder.append(response)
                 if response.status_code >= 400:
                     body = response.read().decode("utf-8", errors="replace").strip()[:500]
                     raise OllamaError(

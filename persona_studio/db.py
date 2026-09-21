@@ -16,9 +16,10 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 DATA_DIR = Path(os.environ.get("PS_DATA", Path(__file__).resolve().parent.parent / "data"))
 DB_PATH = DATA_DIR / "studio.db"
@@ -68,6 +69,22 @@ def connect(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
             yield con
     finally:
         con.close()
+
+
+def assignments(columns: Sequence[str], fields: Mapping[str, Any]) -> tuple[str, list[Any]]:
+    """`"a = ?, b = ?"` and the matching values, for the columns actually given.
+
+    What a PATCH needs: only the fields the caller sent are written, and the
+    ones it omitted keep their stored value. `columns` is the caller's own
+    whitelist of column names — a module constant, never request data — so the
+    only thing interpolated into the SQL comes from the code itself; every
+    value stays bound.
+
+    Returns an empty clause when nothing matched, which the caller reads as
+    "no column to write".
+    """
+    present = [name for name in columns if name in fields]
+    return ", ".join(f"{name} = ?" for name in present), [fields[name] for name in present]
 
 
 # --------------------------------------------------------------------------
@@ -239,7 +256,23 @@ MIGRATIONS: list[str] = [
 
 
 def migrate() -> int:
-    """Applique les migrations manquantes. Retourne la version atteinte."""
+    """Applique les migrations manquantes. Retourne la version atteinte.
+
+    Une migration est tout-ou-rien, et c'est le seul point délicat ici.
+    `executescript` valide d'abord toute transaction en cours, puis exécute
+    ses instructions en autocommit : un `with con:` autour de lui n'a donc
+    plus rien à annuler quand une instruction tardive échoue. La base reste
+    alors à l'ancien `user_version` avec une partie des tables déjà créées, et
+    chaque démarrage suivant rejoue la même migration et meurt sur « table
+    already exists » — une application qui ne redémarre plus jamais.
+
+    D'où le BEGIN/COMMIT *dans* le script : c'est le seul endroit que
+    `executescript` ne contourne pas. `PRAGMA user_version` y entre aussi,
+    parce qu'il est transactionnel — la version et le schéma qu'elle décrit
+    arrivent ensemble ou pas du tout. Découper le script sur les points-virgules
+    serait l'autre option, et elle est fausse : les corps des triggers FTS en
+    contiennent.
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
@@ -247,10 +280,20 @@ def migrate() -> int:
         _configure(con)
         current = con.execute("PRAGMA user_version").fetchone()[0]
         for version in range(current, len(MIGRATIONS)):
-            with con:
-                con.executescript(MIGRATIONS[version])
-                # user_version n'accepte pas de paramètre lié.
-                con.execute(f"PRAGMA user_version = {version + 1}")
+            try:
+                con.executescript(
+                    "BEGIN IMMEDIATE;\n"
+                    f"{MIGRATIONS[version]}\n"
+                    # user_version n'accepte pas de paramètre lié.
+                    f"PRAGMA user_version = {version + 1};\n"
+                    "COMMIT;"
+                )
+            except sqlite3.Error:
+                # L'échec laisse la transaction ouverte : c'est elle qui porte
+                # les instructions déjà passées, et l'annuler est ce qui rend
+                # la migration réessayable une fois la faute corrigée.
+                con.rollback()
+                raise
         return con.execute("PRAGMA user_version").fetchone()[0]
     finally:
         con.close()

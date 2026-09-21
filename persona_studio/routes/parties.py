@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Generator, Iterator
@@ -85,11 +86,25 @@ class PartySummary(BaseModel):
     updated_at: float
 
 
+class ContextUsage(BaseModel):
+    """How full the next turn's prompt is against the configured window.
+
+    Ollama truncates an over-long prompt in silence, from the front, system
+    prompt first — the narrator then "forgets" the scenario for no visible
+    reason. This is what lets the interface say so before it happens.
+    """
+
+    estimated_tokens: int
+    num_ctx: int
+    near_limit: bool
+
+
 class Party(PartySummary):
     messages: list[PartyMessage]
     summary_text: str
     summary_upto: int | None
     world_state: dict[str, Any]
+    context: ContextUsage
 
 
 class PartyInput(BaseModel):
@@ -116,6 +131,70 @@ _SUMMARY_COLUMNS = (
 
 # Everything a message response carries, including the image columns.
 _MESSAGE_COLUMNS = "id, role, kind, content, ts, image_id, status, started_at, error"
+
+
+# --- One turn at a time, per party ----------------------------------------------
+#
+# A turn commits the player's text, releases its connection, calls the model
+# for as long as that takes, then appends the reply on a fresh connection.
+# That ordering is deliberate: a SQLite connection must not be held open for
+# minutes. It leaves a window, and nothing used to keep a second turn out of
+# it — two turns played at once interleaved into `user, user, assistant,
+# assistant`, each reply answering a prompt that held the other's unanswered
+# turn. `message.id` is the order of the story, so that damage is permanent:
+# there is no delete and no reorder endpoint to repair it with.
+#
+# The front end guards one tab (`controllerRef`, plus `disabled={streaming}`),
+# and that is per-tab React state — useless against a second tab, a second
+# window or a script. The guard has to be here.
+#
+# Process-local, keyed by party, and non-blocking, exactly like the
+# summarizer's: this application runs as a single uvicorn process, so an
+# in-process lock is the complete mutual exclusion rather than an
+# approximation of it. A second turn is refused outright rather than queued —
+# it was typed without knowledge of the first, so playing it afterwards would
+# answer a story the player has not read yet.
+_turn_locks: dict[str, threading.Lock] = {}
+_turn_locks_guard = threading.Lock()
+
+
+def _acquire_turn_lock(party_id: str) -> Callable[[], None]:
+    """Take the party's turn lock, or 409. Returns the matching release.
+
+    The release runs on the event loop thread while the acquire ran on a
+    worker thread, which `threading.Lock` allows — it is not an RLock and has
+    no owning thread.
+    """
+    with _turn_locks_guard:
+        lock = _turn_locks.get(party_id)
+        if lock is None:
+            lock = threading.Lock()
+            _turn_locks[party_id] = lock
+        acquired = lock.acquire(blocking=False)
+    if not acquired:
+        raise HTTPException(
+            status_code=409,
+            detail="A turn is already being played in this party. Wait for it to finish.",
+        )
+
+    def release() -> None:
+        lock.release()
+        _sweep_turn_locks()
+
+    return release
+
+
+def _sweep_turn_locks() -> None:
+    """Drop the locks no turn holds, so the map cannot grow without bound.
+
+    Safe for the same reason the summarizer's sweep is: every acquire happens
+    under `_turn_locks_guard`, so a lock another request is about to take
+    cannot be swept out from under it.
+    """
+    with _turn_locks_guard:
+        idle = [pid for pid, lock in _turn_locks.items() if lock.acquire(blocking=False)]
+        for party_id in idle:
+            _turn_locks.pop(party_id).release()
 
 
 def _party_from_row(row: sqlite3.Row) -> PartySummary:
@@ -171,6 +250,22 @@ def _get_message_row(con: sqlite3.Connection, party_id: str, message_id: int) ->
     return row
 
 
+def _archive_texts(original: str | None, current: str) -> list[str]:
+    """The texts a regeneration must archive, oldest first.
+
+    `current` is what the row holds when the archive runs; `original` is what
+    it held when the regeneration was requested. They differ when an edit
+    landed while the model was writing — an ordinary second tab, seconds
+    apart, no race to arrange — and archiving only one of them destroys the
+    other: the edit is an in-place UPDATE that keeps no copy, so the text the
+    regeneration started from would exist nowhere at all. Both go in, in the
+    order the player produced them.
+    """
+    if original is None or original == current:
+        return [current]
+    return [original, current]
+
+
 def _set_message_text(
     con: sqlite3.Connection,
     message_id: int,
@@ -178,6 +273,7 @@ def _set_message_text(
     *,
     archive_current: bool = False,
     from_variant_id: int | None = None,
+    original: str | None = None,
 ) -> None:
     """Make `content` the message's one active text.
 
@@ -192,7 +288,9 @@ def _set_message_text(
       as a variant first, unless the active row already holds it — on the
       first regeneration the message has no rows yet, afterwards the active
       row *is* the archive of the current text. `content` then becomes the
-      new active row.
+      new active row. `original` is the text the regeneration started from,
+      and it is archived alongside the current one when an edit changed the
+      row in between; see `_archive_texts`.
     - **Switch** (`from_variant_id`): the flags flip and the chosen row's
       content becomes the message text. No row is created — switching
       navigates the archive, it does not grow it.
@@ -217,10 +315,12 @@ def _set_message_text(
             is not None
         )
         if not already_archived:
-            con.execute(
-                "INSERT INTO variant (message_id, content, created_at, active) VALUES (?, ?, ?, 1)",
-                (message_id, current, time.time()),
-            )
+            for text in _archive_texts(original, current):
+                con.execute(
+                    "INSERT INTO variant (message_id, content, created_at, active) "
+                    "VALUES (?, ?, ?, 1)",
+                    (message_id, text, time.time()),
+                )
         con.execute("UPDATE variant SET active = 0 WHERE message_id = ?", (message_id,))
         con.execute(
             "INSERT INTO variant (message_id, content, created_at, active) VALUES (?, ?, ?, 1)",
@@ -361,6 +461,23 @@ def get_party(party_id: str) -> Party:
             "WHERE m.instance_id = ? ORDER BY v.id",
             (party_id,),
         ).fetchall()
+        # What the next turn's prompt would weigh, assembled exactly as the
+        # turn assembles it. The estimate rides with the party rather than on
+        # an endpoint of its own: the page already reads this one, and a
+        # warning nobody fetches is the state this feature was already in.
+        scenario = narrator.load_scenario(con, row["scenario_id"])
+        persona = narrator.load_active_persona(con)
+        num_ctx = settings.get_num_ctx(con)
+        history = narrator.load_history(
+            con,
+            party_id,
+            settings.get_history_window(con),
+            after_id=row["summary_upto"],
+        )
+    usage = narrator.context_usage(
+        narrator.build_chat_messages(scenario, persona, history, row["summary_text"]),
+        num_ctx,
+    )
     # Variants ride inline rather than behind a second endpoint: the interface
     # navigates them with arrow presses, and a round trip per press would show
     # visible lag on a local app whose payload is text it is already sending.
@@ -381,6 +498,11 @@ def get_party(party_id: str) -> Party:
         summary_text=row["summary_text"],
         summary_upto=row["summary_upto"],
         world_state=summarizer.parse_world_state(row["world_state"]),
+        context=ContextUsage(
+            estimated_tokens=usage.estimated_tokens,
+            num_ctx=usage.num_ctx,
+            near_limit=usage.near_limit,
+        ),
         messages=[
             PartyMessage(
                 id=m["id"],
@@ -441,12 +563,19 @@ def edit_message(party_id: str, message_id: int, body: MessageEditInput) -> Part
         if row["kind"] != "text":
             raise HTTPException(status_code=400, detail="Only a text message can be edited.")
         _set_message_text(con, message_id, content)
-        return _message_response(
+        response = _message_response(
             con,
             con.execute(
                 f"SELECT {_MESSAGE_COLUMNS} FROM message WHERE id = ?", (message_id,)
             ).fetchone(),
         )
+    # After the commit, so the revision job reads the corrected text. A message
+    # behind the rolling summary's frontier is never re-sent verbatim and the
+    # frontier does not move, so without this the correction would reach the
+    # screen and stop there while the summary kept describing the old text.
+    # Under the frontier this returns at once.
+    summarizer.schedule_revision(party_id, message_id, content)
+    return response
 
 
 @router.put("/parties/{party_id}/messages/{message_id}/variant", response_model=PartyMessage)
@@ -487,6 +616,17 @@ class _TurnContext:
     covered history, and `summarize` says whether the end of this stream may
     trigger one: a played turn appends to the story, a regeneration replaces
     an existing text and leaves the covered range exactly as it was.
+
+    `opening` marks the one message generated under different rules: a party's
+    opening scene comes from `build_opening_messages`, with the direction that
+    tells the narrator to set the scene and no history at all. Regenerating it
+    through the ordinary turn path sent the model a system prompt and
+    literally nothing else, because the history before the first message is
+    empty and the direction was never repeated.
+
+    `release` gives the party's turn lock back. It is held from the moment the
+    request is accepted until the stream has ended and its text is persisted,
+    which is the whole window a second turn must not enter.
     """
 
     party_id: str
@@ -498,6 +638,8 @@ class _TurnContext:
     num_ctx: int
     summarize: bool
     persist: Callable[[str], int | None]
+    release: Callable[[], None]
+    opening: bool = False
 
 
 def _ndjson_line(payload: dict[str, object]) -> str:
@@ -518,7 +660,23 @@ def _prepare_turn(party_id: str, body: TurnInput) -> _TurnContext:
     The player's text is written BEFORE generation starts, so it survives
     whatever the model does next, and the connection closes before the stream
     runs: nothing holds a SQLite connection across a model call.
+
+    The turn lock is taken first of all, before the player's text is written,
+    because writing it is already half the interleaving. Anything that raises
+    from here gives the lock straight back — the turn never happened, so the
+    next one must not be refused.
     """
+    release = _acquire_turn_lock(party_id)
+    try:
+        return _prepare_turn_locked(party_id, body, release)
+    except BaseException:
+        release()
+        raise
+
+
+def _prepare_turn_locked(
+    party_id: str, body: TurnInput, release: Callable[[], None]
+) -> _TurnContext:
     with db.connect() as con:
         party = _get_party_row(con, party_id)
         model = _require_model(con)
@@ -557,6 +715,7 @@ def _prepare_turn(party_id: str, body: TurnInput) -> _TurnContext:
         num_ctx=num_ctx,
         summarize=True,
         persist=partial(_persist_reply, party_id),
+        release=release,
     )
 
 
@@ -581,7 +740,9 @@ def _persist_reply(party_id: str, text: str) -> int | None:
         return message_id
 
 
-def _persist_regenerated(message_id: int, party_id: str, text: str) -> int | None:
+def _persist_regenerated(
+    message_id: int, party_id: str, text: str, *, original: str | None = None
+) -> int | None:
     """Replace a regenerated message's active text, on a fresh connection.
 
     An empty or whitespace-only accumulation replaces nothing: the message
@@ -589,6 +750,10 @@ def _persist_regenerated(message_id: int, party_id: str, text: str) -> int | Non
     exactly as it was before the call. A non-empty partial from a broken
     stream is kept, the same rule a played turn's reply follows. Only a text
     that survived `.strip()` is written, and writing it is story activity.
+
+    `original` is the text this regeneration started from, read when the
+    request arrived rather than now. Passing it is what keeps an edit that
+    landed in between from erasing it — see `_archive_texts`.
     """
     if not text.strip():
         return None
@@ -603,8 +768,14 @@ def _persist_regenerated(message_id: int, party_id: str, text: str) -> int | Non
     # gap. The same lock also keeps two concurrent regenerations from both
     # seeing `already_archived = False` and archiving the original twice.
     with db.connect(immediate=True) as con:
-        _set_message_text(con, message_id, text, archive_current=True)
+        _set_message_text(con, message_id, text, archive_current=True, original=original)
         con.execute("UPDATE instance SET updated_at = ? WHERE id = ?", (time.time(), party_id))
+    # The new text may sit behind the rolling summary's frontier, which does
+    # not move: the summary would keep describing the reply just replaced, and
+    # the message itself is never re-sent verbatim, so the regeneration would
+    # reach the screen and nothing else. Under the frontier this returns at
+    # once. See `summarizer.schedule_revision`.
+    summarizer.schedule_revision(party_id, message_id, text)
     return message_id
 
 
@@ -616,7 +787,25 @@ def _prepare_regenerate(party_id: str, message_id: int) -> _TurnContext:
     text has actually arrived. The history is loaded up to but excluding the
     message being regenerated: with its old text in the prompt, the model
     would continue its own reply instead of writing an alternative.
+
+    The message's current text is read here and carried to persist time. That
+    is the text this regeneration is replacing, and reading it now rather than
+    later is what stops an edit landing in between from erasing it.
+
+    A regeneration takes the same turn lock a played turn does: it rewrites
+    the transcript, and two of those at once on one party is the same defect.
     """
+    release = _acquire_turn_lock(party_id)
+    try:
+        return _prepare_regenerate_locked(party_id, message_id, release)
+    except BaseException:
+        release()
+        raise
+
+
+def _prepare_regenerate_locked(
+    party_id: str, message_id: int, release: Callable[[], None]
+) -> _TurnContext:
     with db.connect() as con:
         party = _get_party_row(con, party_id)
         model = _require_model(con)
@@ -636,6 +825,17 @@ def _prepare_regenerate(party_id: str, message_id: int) -> _TurnContext:
             before_id=message_id,
             after_id=party["summary_upto"],
         )
+        # The opening scene is the party's first text message: nothing in the
+        # story precedes it. It was generated with a direction the ordinary
+        # turn path does not carry, and regenerating it without that direction
+        # hands the model a system prompt and an empty conversation.
+        opening = (
+            con.execute(
+                "SELECT 1 FROM message WHERE instance_id = ? AND kind = 'text' AND id < ? LIMIT 1",
+                (party_id, message_id),
+            ).fetchone()
+            is None
+        )
     return _TurnContext(
         party_id=party_id,
         model=model,
@@ -645,7 +845,9 @@ def _prepare_regenerate(party_id: str, message_id: int) -> _TurnContext:
         summary=party["summary_text"],
         num_ctx=num_ctx,
         summarize=False,
-        persist=partial(_persist_regenerated, message_id, party_id),
+        persist=partial(_persist_regenerated, message_id, party_id, original=row["content"]),
+        release=release,
+        opening=opening,
     )
 
 
@@ -675,7 +877,13 @@ async def _turn_events(ctx: _TurnContext) -> AsyncIterator[str]:
     An error line carries the real reason, so the interface can say what
     happened instead of "something failed".
     """
-    messages = narrator.build_chat_messages(ctx.scenario, ctx.persona, ctx.history, ctx.summary)
+    messages = (
+        # Regenerating the opening: the same call that produced it in the
+        # first place, direction included, rather than an empty conversation.
+        narrator.build_opening_messages(ctx.scenario, ctx.persona)
+        if ctx.opening
+        else narrator.build_chat_messages(ctx.scenario, ctx.persona, ctx.history, ctx.summary)
+    )
     fragments: list[str] = []
     message_id: int | None = None
     stream: Generator[str] | None = None
@@ -696,26 +904,39 @@ async def _turn_events(ctx: _TurnContext) -> AsyncIterator[str]:
     except ollama.OllamaError as exc:
         yield _ndjson_line({"error": str(exc)})
     finally:
-        # Shielded: the cancellation that ended the stream is still being
-        # delivered, and anyio re-raises it at the next checkpoint — without
-        # the shield the persist await never starts (its first checkpoint
-        # re-raises before the worker thread begins) and the partial is
-        # lost. The write is one fast statement, so letting it finish is safe.
-        with anyio.CancelScope(shield=True):
-            message_id = await anyio.to_thread.run_sync(ctx.persist, "".join(fragments))
-            # Only after a persisted reply, and only for a played turn: the
-            # scheduler checks the trigger and returns immediately — the model
-            # call runs on its own thread, so the stream below closes on the
-            # narrator's last token, never on the summariser's.
-            if message_id is not None and ctx.summarize:
-                await anyio.to_thread.run_sync(summarizer.schedule, ctx.party_id)
-        if stream is not None:
-            try:
-                # Stop pulling Ollama when the stream is being abandoned; a
-                # pull still running in a worker thread makes this a no-op.
-                stream.close()
-            except ValueError:
-                pass
+        try:
+            # Shielded: the cancellation that ended the stream is still being
+            # delivered, and anyio re-raises it at the next checkpoint —
+            # without the shield the persist await never starts (its first
+            # checkpoint re-raises before the worker thread begins) and the
+            # partial is lost. The write is one fast statement, so letting it
+            # finish is safe.
+            with anyio.CancelScope(shield=True):
+                message_id = await anyio.to_thread.run_sync(ctx.persist, "".join(fragments))
+                # Only after a persisted reply, and only for a played turn: the
+                # scheduler checks the trigger and returns immediately — the model
+                # call runs on its own thread, so the stream below closes on the
+                # narrator's last token, never on the summariser's.
+                if message_id is not None and ctx.summarize:
+                    await anyio.to_thread.run_sync(summarizer.schedule, ctx.party_id)
+            if stream is not None:
+                try:
+                    # Stop pulling Ollama when the stream is being abandoned; a
+                    # pull still running in a worker thread makes this a no-op.
+                    stream.close()
+                except ValueError:
+                    pass
+                # And stop Ollama itself. The close above does nothing at all
+                # when a worker thread is mid-pull — which is exactly the
+                # case a player pressing stop creates — so the request stays
+                # open and the model keeps generating a reply nobody will
+                # read, holding the GPU. Closing the response reaches it from
+                # here; on a stream that ended normally this is a no-op.
+                ollama.close_stream(stream)
+        finally:
+            # Last of all, and unconditionally: the next turn in this party
+            # must not be refused because this one failed to let go.
+            ctx.release()
     yield _ndjson_line({"done": True, "message_id": message_id})
 
 

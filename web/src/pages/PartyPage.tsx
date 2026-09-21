@@ -359,6 +359,18 @@ export function PartyPage() {
       </ul>
       <div ref={endRef} />
       {streamError ? <p className="text-sm text-red-400">{streamError}</p> : null}
+      {/* The warning issue #6 exists for. Ollama truncates an over-long prompt
+          in silence, from the front, system prompt first — the narrator then
+          forgets the scenario with nothing on screen to explain it. */}
+      {party.context.nearLimit ? (
+        <p className="rounded border border-amber-800 bg-amber-950/40 px-3 py-2 text-sm text-amber-300">
+          Le prompt approche la fenêtre de contexte&nbsp;:{" "}
+          {party.context.estimatedTokens.toLocaleString("fr-FR")} jetons estimés sur{" "}
+          {party.context.numCtx.toLocaleString("fr-FR")}. Au-delà, Ollama coupe le début du
+          prompt sans le dire — le prompt système d'abord, donc le scénario. Augmentez la
+          fenêtre de contexte ou réduisez la fenêtre de mémoire dans les réglages.
+        </p>
+      ) : null}
       <form
         className="flex gap-2"
         onSubmit={(e) => {
