@@ -31,6 +31,8 @@ export function ScenarioEditorPage() {
   const [error, setError] = useState<string | null>(null);
   const [title, setTitle] = useState("");
   const [synopsis, setSynopsis] = useState("");
+  const [worldRules, setWorldRules] = useState("");
+  const [arcs, setArcs] = useState("");
   const [saving, setSaving] = useState(false);
   const [starting, setStarting] = useState(false);
   const [addingCharacter, setAddingCharacter] = useState(false);
@@ -47,6 +49,8 @@ export function ScenarioEditorPage() {
       setScenario(scenarioData);
       setTitle(scenarioData.title);
       setSynopsis(scenarioData.synopsis);
+      setWorldRules(scenarioData.worldRules);
+      setArcs(scenarioData.arcs);
       setCharacters(characterData);
       setError(null);
     } catch (err) {
@@ -78,8 +82,11 @@ export function ScenarioEditorPage() {
   async function handleSave() {
     try {
       setSaving(true);
-      const updated = await updateScenario(scenarioId, { title, synopsis });
+      const updated = await updateScenario(scenarioId, { title, synopsis, worldRules, arcs });
       setScenario(updated);
+      // The server falls back to a default for a blank title, so show what it
+      // actually stored rather than the empty field that was sent.
+      setTitle(updated.title);
       setError(null);
     } catch (err) {
       setError(messageFor(err, "Impossible d'enregistrer le scénario."));
@@ -174,11 +181,29 @@ export function ScenarioEditorPage() {
       ) : null}
 
       <section className="flex flex-col gap-3">
-        <TextField label="Titre" value={title} onChange={(event) => setTitle(event.target.value)} />
+        <TextField
+          label="Titre"
+          value={title}
+          onChange={(event) => setTitle(event.target.value)}
+          required
+          hint="Sert de nom par défaut aux parties de ce scénario."
+        />
         <TextArea
           label="Synopsis"
           value={synopsis}
           onChange={(event) => setSynopsis(event.target.value)}
+        />
+        <TextArea
+          label="Règles du monde"
+          value={worldRules}
+          onChange={(event) => setWorldRules(event.target.value)}
+          hint="Ce qui est vrai dans ce monde et ne change pas : magie, technologie, lois, tabous. Laissé vide, rien n'est envoyé au narrateur."
+        />
+        <TextArea
+          label="Arcs narratifs"
+          value={arcs}
+          onChange={(event) => setArcs(event.target.value)}
+          hint="Où l'histoire doit aller : intrigues en cours, révélations prévues, fins possibles. Le narrateur les lit, le joueur ne les voit pas."
         />
         <div className="flex justify-between">
           <Button variant="danger" onClick={() => setConfirmDeleteScenario(true)}>

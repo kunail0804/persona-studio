@@ -5,6 +5,9 @@ feeds image prompts later, so it must never carry the persona's name. The
 active persona is application-wide, stored in the `setting` table; per-party
 personas are a later improvement. Deleting a persona that is active clears the
 setting in the same transaction, so no dangling id is ever left behind.
+
+`PATCH` means partial: `PersonaUpdate` carries optional fields and only the
+ones actually sent are written.
 """
 
 from __future__ import annotations
@@ -12,13 +15,17 @@ from __future__ import annotations
 import sqlite3
 import time
 import uuid
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from .. import db, settings
 
 router = APIRouter(tags=["personas"])
+
+# The columns a PATCH may write. A whitelist the module owns, never request data.
+_UPDATABLE = ("name", "description", "appearance", "traits")
 
 
 class Persona(BaseModel):
@@ -32,10 +39,30 @@ class Persona(BaseModel):
 
 
 class PersonaInput(BaseModel):
+    """A whole persona, for a create: every field has a default."""
+
+    model_config = ConfigDict(extra="forbid")
+
     name: str = ""
     description: str = ""
     appearance: str = ""
     traits: str = ""
+
+
+class PersonaUpdate(BaseModel):
+    """A PATCH: only the fields actually sent are written.
+
+    `None` marks "not sent" rather than a value, so an omitted — or explicitly
+    null — field keeps what is stored. An unknown key is a 422 rather than a
+    silent no-op answering 200.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+    description: str | None = None
+    appearance: str | None = None
+    traits: str | None = None
 
 
 class ActivePersonaInput(BaseModel):
@@ -107,13 +134,21 @@ def get_persona(persona_id: str) -> Persona:
 
 
 @router.patch("/personas/{persona_id}", response_model=Persona)
-def update_persona(persona_id: str, body: PersonaInput) -> Persona:
+def update_persona(persona_id: str, body: PersonaUpdate) -> Persona:
+    """Write the fields this request carried, and only those."""
+    fields: dict[str, Any] = {
+        name: value
+        for name, value in body.model_dump(exclude_unset=True).items()
+        if value is not None
+    }
+    clause, values = db.assignments(_UPDATABLE, fields)
     with db.connect() as con:
         _get_persona_row(con, persona_id)
-        con.execute(
-            "UPDATE persona SET name = ?, description = ?, appearance = ?, traits = ? WHERE id = ?",
-            (body.name, body.description, body.appearance, body.traits, persona_id),
-        )
+        if clause:
+            con.execute(
+                f"UPDATE persona SET {clause} WHERE id = ?",
+                (*values, persona_id),
+            )
         row = _get_persona_row(con, persona_id)
         active_id = settings.get_active_persona_id(con)
     return _persona_from_row(row, active_id)

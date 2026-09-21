@@ -54,6 +54,28 @@ _SUMMARY_SYSTEM = (
 
 _SUMMARY_ASK = "Now write the JSON object summarizing the messages above."
 
+# Revising an existing summary rather than rebuilding one. The messages the
+# summary stands in for are gone from the prompt by design, so the model is
+# given the summary itself plus the correction and asked to reconcile them.
+# That keeps the call small and bounded, where re-reading the whole covered
+# range would grow with the party and eventually exceed `num_ctx`.
+_REVISION_SYSTEM = (
+    "You are the memory-keeper of an interactive story. Below is the summary "
+    "that stands in for the oldest part of the transcript, and the current "
+    "world state. One message inside that summarized range has been corrected "
+    "by the player, so the summary now describes text that no longer exists.\n"
+    "Answer with JSON only, exactly this shape:\n"
+    '{"summary": "...", "world_state": {"location": "...", "present": [...], '
+    '"established": [...], "unresolved": [...]}}\n'
+    "Rewrite the summary and the world state so they describe the corrected "
+    "message instead of the old one. Change nothing else: everything the "
+    "summary says about the rest of the range must survive word for word "
+    "unless the correction contradicts it. Write in the language of the "
+    "summary. Output only the JSON object, nothing before or after it."
+)
+
+_REVISION_ASK = "Now write the JSON object with the summary and world state corrected accordingly."
+
 
 @dataclass(frozen=True)
 class _SummaryPlan:
@@ -301,3 +323,130 @@ def _commit(
             (summary_text, frontier, json.dumps(world_state, ensure_ascii=False), party_id),
         )
     return True
+
+
+# --- Revising a summary that has gone stale --------------------------------------
+#
+# Editing or regenerating a message the summary already covers used to reach
+# the screen and nothing else: the frontier is a message id and deliberately
+# does not move, so the corrected text is never re-sent verbatim, while the
+# summary standing in for it keeps describing what the player just replaced.
+# The frontier still does not move — issue #11 pins that. The summary is what
+# changes.
+
+
+@dataclass(frozen=True)
+class _RevisionPlan:
+    """Everything the revision job needs, read before the thread starts."""
+
+    party_id: str
+    frontier: int
+    previous_summary: str
+    world_state: dict[str, Any]
+    corrected_text: str
+    model: str
+    num_ctx: int
+
+
+def schedule_revision(party_id: str, message_id: int, corrected_text: str) -> None:
+    """Refresh the summary after a message it covers was corrected.
+
+    Called once an edit or a regeneration has committed. For a message the
+    summary does not cover — the common case, since the frontier trails the
+    history window — this is one cheap read and a return.
+
+    Same shape as `schedule`, and for the same reasons: the read happens on
+    the request path, the model call and the write happen on a daemon thread
+    under the same per-party lock, and a failure leaves the stored summary
+    exactly as it was. There is no retry, and a lost revision costs a stale
+    sentence rather than a broken party.
+    """
+    with db.connect() as con:
+        plan = _revision_plan(con, party_id, message_id, corrected_text)
+    if plan is None:
+        return
+    lock = _lock_for(party_id)
+    if lock is None:
+        return
+    threading.Thread(
+        target=_run_revision,
+        args=(plan, lock),
+        daemon=True,
+        name=f"summary-revision-{party_id[:8]}",
+    ).start()
+
+
+def _revision_plan(
+    con: sqlite3.Connection, party_id: str, message_id: int, corrected_text: str
+) -> _RevisionPlan | None:
+    """The revision job's inputs, or None when there is nothing to revise."""
+    row = con.execute(
+        "SELECT summary_upto, summary_text, world_state FROM instance WHERE id = ?",
+        (party_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    frontier, previous_summary, world_state_raw = row
+    # Past the frontier the narrator still reads the message verbatim, so the
+    # summary makes no claim about it and has nothing to correct.
+    if frontier is None or message_id > frontier:
+        return None
+    if not previous_summary.strip():
+        return None
+    model = settings.get_llm_model(con)
+    if model is None:
+        return None
+    return _RevisionPlan(
+        party_id=party_id,
+        frontier=frontier,
+        previous_summary=previous_summary,
+        world_state=parse_world_state(world_state_raw),
+        corrected_text=corrected_text,
+        model=model,
+        num_ctx=settings.get_num_ctx(con),
+    )
+
+
+def _revision_messages(plan: _RevisionPlan) -> list[dict[str, str]]:
+    """The call's messages: the summary to fix, the correction, then the ask.
+
+    The corrected message rides alone rather than with the range around it:
+    that range is exactly what the summary replaced and is no longer cheap to
+    re-read, and the model's job here is to reconcile two texts, not to
+    re-summarize a transcript. Ending on a user message is the same rule
+    `_summary_messages` follows, for the same measured reason.
+    """
+    system = (
+        f"{_REVISION_SYSTEM}\n\n"
+        f"Summary so far:\n{plan.previous_summary}\n\n"
+        f"Current world state:\n{json.dumps(plan.world_state, ensure_ascii=False)}"
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"The corrected message now reads:\n{plan.corrected_text}"},
+        {"role": "user", "content": _REVISION_ASK},
+    ]
+
+
+def _run_revision(plan: _RevisionPlan, lock: threading.Lock) -> None:
+    """The background job: call the model, then commit — or change nothing."""
+    try:
+        _revise(plan)
+    finally:
+        lock.release()
+        _sweep_locks()
+
+
+def _revise(plan: _RevisionPlan) -> None:
+    messages = _revision_messages(plan)
+    try:
+        raw = ollama.chat(plan.model, messages, num_ctx=plan.num_ctx, format="json")
+    except ollama.OllamaError:
+        return
+    parsed = _parse_reply(raw)
+    if parsed is None:
+        return
+    summary, world_state = parsed
+    # The same frontier goes back in, which `_commit` accepts: this rewrites
+    # what the summary says, never how much of the story it covers.
+    _commit(plan.party_id, plan.frontier, summary, world_state, plan.world_state)

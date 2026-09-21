@@ -1328,3 +1328,57 @@ def test_cancelling_a_done_or_text_message_is_400(client: TestClient, monkeypatc
 
     opening_id = client.get(f"/api/parties/{party_id}").json()["messages"][0]["id"]
     assert _cancel(client, party_id, opening_id).status_code == 400
+
+
+# --- Freeing the narrator's VRAM before a render --------------------------------
+#
+# Measured by the user on this machine: a chat model still resident when a
+# diffusion pipeline loads is an out-of-memory error, not a slowdown.
+
+
+def test_starting_a_generation_evicts_the_narration_model(
+    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+) -> None:
+    """The wiring, through the real `start`: the eviction happens, and it
+    happens before ComfyUI is asked to render anything."""
+    unloaded: list[str] = []
+    monkeypatch.setattr(generation.ollama, "unload", lambda model: unloaded.append(model))
+    _setup_ready_workflow()
+    party_id = _create_party(client, monkeypatch)
+
+    message_id, prompt_id = _start_unfinished(client, party_id)
+    try:
+        assert unloaded == ["test-model"], "the narrator was not evicted before the submission"
+    finally:
+        _settle(comfy, message_id, prompt_id)
+
+
+def test_an_eviction_that_fails_does_not_fail_the_generation(
+    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+) -> None:
+    """Best effort on purpose. At that point the pending message is committed
+    and the player has asked for a render: an unreachable Ollama must not turn
+    that into an error, and it is holding no VRAM to begin with."""
+
+    def boom(model: str) -> None:
+        raise generation.ollama.OllamaUnreachable("Ollama est injoignable")
+
+    monkeypatch.setattr(generation.ollama, "unload", boom)
+    _setup_ready_workflow()
+    party_id = _create_party(client, monkeypatch)
+
+    message_id, prompt_id = _start_unfinished(client, party_id)
+    _settle(comfy, message_id, prompt_id)
+
+    assert _image_messages(party_id)[0]["status"] == "done"
+
+
+def test_no_configured_model_means_nothing_to_evict(monkeypatch: Any) -> None:
+    """Nothing is loaded, so there is nothing to unload and Ollama is not
+    contacted at all."""
+    called: list[str] = []
+    monkeypatch.setattr(generation.ollama, "unload", lambda model: called.append(model))
+
+    generation._evict_narrator(None)
+
+    assert called == []

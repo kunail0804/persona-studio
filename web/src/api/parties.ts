@@ -43,11 +43,33 @@ export interface PartySummary {
   updatedAt: number;
 }
 
+/**
+ * How full the next turn's prompt is against the configured window. Ollama
+ * truncates an over-long prompt in silence, from the front, system prompt
+ * first — so the narrator would forget the scenario with nothing on screen to
+ * explain it.
+ */
+export interface ContextUsage {
+  estimatedTokens: number;
+  numCtx: number;
+  nearLimit: boolean;
+}
+
 export interface Party extends PartySummary {
   messages: PartyMessage[];
   summaryText: string;
   summaryUpto: number | null;
   worldState: Record<string, unknown>;
+  context: ContextUsage;
+}
+
+function parseContextUsage(data: unknown): ContextUsage {
+  if (!isRecord(data)) throw new Error("Expected a context usage object");
+  return {
+    estimatedTokens: expectInteger(data.estimated_tokens, "estimated_tokens"),
+    numCtx: expectInteger(data.num_ctx, "num_ctx"),
+    nearLimit: expectBoolean(data.near_limit, "near_limit"),
+  };
 }
 
 function parsePartyRole(value: unknown, field: string): PartyRole {
@@ -122,6 +144,7 @@ function parseParty(data: unknown): Party {
     summaryText: expectString(data.summary_text, "summary_text"),
     summaryUpto: data.summary_upto === null ? null : expectInteger(data.summary_upto, "summary_upto"),
     worldState: expectRecord(data.world_state, "world_state"),
+    context: parseContextUsage(data.context),
     messages: expectArray(data.messages, "messages").map((item: unknown) =>
       parsePartyMessage(item),
     ),

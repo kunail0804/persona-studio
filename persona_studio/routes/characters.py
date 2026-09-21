@@ -4,18 +4,27 @@
 the sole source used to draw the character. `secrets` is narrator-only; making
 the narrator actually respect that is a later pull request's job, this one
 just stores and labels the field correctly.
+
+`PATCH` means partial: `CharacterUpdate` carries optional fields and only the
+ones actually sent are written. The trap this closes is `secrets` — content
+the player never sees rendered, so a request that omitted it used to blank it
+with nothing on screen to show for it.
 """
 
 from __future__ import annotations
 
 import sqlite3
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from .. import db
 
 router = APIRouter(tags=["characters"])
+
+# The columns a PATCH may write. A whitelist the module owns, never request data.
+_UPDATABLE = ("name", "appearance", "personality", "story", "relationships", "secrets")
 
 
 class Character(BaseModel):
@@ -31,12 +40,34 @@ class Character(BaseModel):
 
 
 class CharacterInput(BaseModel):
+    """A whole sheet, for a create: every field has a default."""
+
+    model_config = ConfigDict(extra="forbid")
+
     name: str = ""
     appearance: str = ""
     personality: str = ""
     story: str = ""
     relationships: str = ""
     secrets: str = ""
+
+
+class CharacterUpdate(BaseModel):
+    """A PATCH: only the fields actually sent are written.
+
+    `None` marks "not sent" rather than a value, so an omitted — or explicitly
+    null — field keeps what is stored. An unknown key is a 422 rather than a
+    silent no-op answering 200.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+    appearance: str | None = None
+    personality: str | None = None
+    story: str | None = None
+    relationships: str | None = None
+    secrets: str | None = None
 
 
 class CharacterOrder(BaseModel):
@@ -167,26 +198,21 @@ def reorder_characters(scenario_id: str, body: CharacterOrder) -> list[Character
 
 
 @router.patch("/scenarios/{scenario_id}/characters/{character_id:int}", response_model=Character)
-def update_character(scenario_id: str, character_id: int, body: CharacterInput) -> Character:
+def update_character(scenario_id: str, character_id: int, body: CharacterUpdate) -> Character:
+    """Write the fields this request carried, and only those."""
+    fields: dict[str, Any] = {
+        name: value
+        for name, value in body.model_dump(exclude_unset=True).items()
+        if value is not None
+    }
+    clause, values = db.assignments(_UPDATABLE, fields)
     with db.connect() as con:
         _get_character_row(con, scenario_id, character_id)
-        con.execute(
-            """
-            UPDATE character
-            SET name = ?, appearance = ?, personality = ?, story = ?, relationships = ?, secrets = ?
-            WHERE id = ? AND scenario_id = ?
-            """,
-            (
-                body.name,
-                body.appearance,
-                body.personality,
-                body.story,
-                body.relationships,
-                body.secrets,
-                character_id,
-                scenario_id,
-            ),
-        )
+        if clause:
+            con.execute(
+                f"UPDATE character SET {clause} WHERE id = ? AND scenario_id = ?",
+                (*values, character_id, scenario_id),
+            )
         row = _get_character_row(con, scenario_id, character_id)
     return _character_from_row(row)
 

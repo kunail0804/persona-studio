@@ -51,7 +51,7 @@ import time
 import uuid
 from dataclasses import dataclass
 
-from . import comfyui, db, workflows
+from . import comfyui, db, ollama, settings, workflows
 from .workflows import WorkflowNotReady
 
 # A render takes minutes: a poll every couple of seconds is a human cadence,
@@ -94,6 +94,37 @@ class StartResult:
     started_at: float
 
 
+def _evict_narrator(model: str | None) -> None:
+    """Free the narration model's VRAM before a render takes the GPU.
+
+    Narration and image generation share one card. Measured on this machine:
+    a chat model still resident when a diffusion pipeline loads is an
+    out-of-memory error, not a slowdown — so the narrator is evicted before
+    the render starts rather than after it has already failed. The reverse
+    direction needs nothing here: the workflows in use carry their own VRAM
+    and RAM management nodes, so narration reloads normally once a render is
+    done.
+
+    Best effort, and deliberately so. This runs after the pending message is
+    committed and before the submission, so the player has already asked for
+    a render: an unreachable or unhappy Ollama must not turn that into an
+    error, and it is holding no VRAM anyway. The cost of a failed eviction is
+    one render that may not fit — which is the situation this call was trying
+    to improve, never one it makes worse.
+
+    Where this sits lengthens the persist-to-submit window by one HTTP call.
+    That window is already handled: a cancel landing in it is recorded, and
+    the submission that returns afterwards respects the cancellation instead
+    of stamping a live job id over it.
+    """
+    if model is None:
+        return
+    try:
+        ollama.unload(model)
+    except ollama.OllamaError:
+        return
+
+
 def start(party_id: str, prompt: str, instruction: str) -> StartResult:
     """Start one generation: persist pending, submit, watch in the background.
 
@@ -113,6 +144,10 @@ def start(party_id: str, prompt: str, instruction: str) -> StartResult:
             raise WorkflowNotReady(
                 "No workflow is imported: import one in the settings and map its prompt field."
             )
+        # Read here, used after this connection closes: the eviction below is
+        # an HTTP call, and nothing in this project holds a SQLite connection
+        # across one.
+        narration_model = settings.get_llm_model(con)
         # One seed drawn here and handed to `prepare_graph` is how the value
         # recorded on the image row is guaranteed to be the one that was used,
         # whatever the workflow maps.
@@ -140,6 +175,8 @@ def start(party_id: str, prompt: str, instruction: str) -> StartResult:
         message_id = cursor.lastrowid
         if message_id is None:
             raise RuntimeError("The pending INSERT succeeded but returned no rowid")
+
+    _evict_narrator(narration_model)
 
     try:
         gen_id = comfyui.submit(graph)

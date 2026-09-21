@@ -71,3 +71,19 @@ def test_bare_api_is_a_404(spa_client: TestClient) -> None:
 def test_bare_assets_is_a_404(spa_client: TestClient) -> None:
     response = spa_client.get("/assets")
     assert response.status_code == 404
+
+
+def test_unmatched_api_path_is_a_404_for_every_method(spa_client: TestClient) -> None:
+    """The catch-all above is GET-only, so every other method used to be
+    rejected at Starlette's method check: a 405 with no body, which reads as
+    "wrong verb on a real endpoint" when no such endpoint exists at all."""
+    for method in ("post", "put", "patch", "delete"):
+        response = getattr(spa_client, method)("/api/nope")
+        assert response.status_code == 404, f"{method.upper()} answered {response.status_code}"
+        assert response.json()["detail"] == "Not found"
+
+
+def test_a_non_get_on_a_client_side_route_is_also_a_404(spa_client: TestClient) -> None:
+    """Serving index.html here would be worse than the 405 was: a POST to a
+    React Router path is not a page request."""
+    assert spa_client.post("/scenarios/abc").status_code == 404
