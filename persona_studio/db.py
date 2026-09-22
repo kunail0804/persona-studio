@@ -25,7 +25,7 @@ DATA_DIR = Path(os.environ.get("PS_DATA", Path(__file__).resolve().parent.parent
 DB_PATH = DATA_DIR / "studio.db"
 IMAGES_DIR = DATA_DIR / "images"
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _configure(con: sqlite3.Connection) -> None:
@@ -251,6 +251,23 @@ MIGRATIONS: list[str] = [
         VALUES ('delete', old.id, old.content);
         INSERT INTO message_fts(rowid, content) VALUES (new.id, new.content);
     END;
+    """,
+    # --- v2 : la graine sort de l'application -------------------------------
+    #
+    # Le format API de ComfyUI ne rejoue pas le « randomize » de son interface
+    # web : c'est une fonction du navigateur, absente du graphe exporté. Tant
+    # que l'application injectait une graine, elle compensait ça. Ce n'est plus
+    # son travail — le workflow gère ses graines lui-même — donc le mapping
+    # n'a plus de sens et la valeur enregistrée sur une image ne désigne plus
+    # rien que l'application ait choisi.
+    #
+    # `image.seed` part avec : une graine qu'on ne peut plus rejouer n'est pas
+    # un souvenir, c'est une colonne morte. Les valeurs déjà écrites sont dans
+    # la copie prise avant la migration.
+    """
+    ALTER TABLE workflow DROP COLUMN seed_node;
+    ALTER TABLE workflow DROP COLUMN seed_field;
+    ALTER TABLE image    DROP COLUMN seed;
     """,
 ]
 

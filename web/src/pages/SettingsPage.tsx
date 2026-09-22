@@ -151,8 +151,6 @@ export function SettingsPage() {
     name: string;
     promptNode: string;
     promptField: string;
-    seedNode: string;
-    seedField: string;
   }) {
     try {
       await updateWorkflow(workflowId, patch);
@@ -388,7 +386,7 @@ export function SettingsPage() {
 interface WorkflowListItemProps {
   workflow: Workflow;
   onSelect: () => void;
-  onPatch: (patch: { name: string; promptNode: string; promptField: string; seedNode: string; seedField: string }) => void;
+  onPatch: (patch: { name: string; promptNode: string; promptField: string }) => void;
   onDelete: () => void;
 }
 
@@ -400,11 +398,8 @@ function WorkflowListItem({ workflow, onSelect, onPatch, onDelete }: WorkflowLis
     workflow.promptNode && workflow.promptField
       ? optionValue(workflow.promptNode, workflow.promptField)
       : "";
-  const seedValue =
-    workflow.seedNode && workflow.seedField ? optionValue(workflow.seedNode, workflow.seedField) : "";
-
-  const patch = (promptNode: string, promptField: string, seedNode: string, seedField: string) =>
-    onPatch({ name: workflow.name, promptNode, promptField, seedNode, seedField });
+  const patch = (promptNode: string, promptField: string) =>
+    onPatch({ name: workflow.name, promptNode, promptField });
 
   return (
     <li className="rounded-lg border border-neutral-800 bg-neutral-900 p-4">
@@ -429,7 +424,7 @@ function WorkflowListItem({ workflow, onSelect, onPatch, onDelete }: WorkflowLis
 
       {workflow.problem ? <p className="mt-2 text-sm text-amber-400">{workflow.problem}</p> : null}
 
-      <div className="mt-3 grid gap-3 sm:grid-cols-2">
+      <div className="mt-3">
         <label className="flex flex-col gap-1 text-sm text-neutral-300">
           <span className="font-medium">Champ du prompt</span>
           <select
@@ -437,42 +432,17 @@ function WorkflowListItem({ workflow, onSelect, onPatch, onDelete }: WorkflowLis
             value={promptValue}
             onChange={(event) => {
               if (event.target.value === "") {
-                patch("", "", workflow.seedNode, workflow.seedField);
+                patch("", "");
                 return;
               }
               const option = workflow.promptOptions.find(
                 (o) => optionValue(o.node, o.field) === event.target.value,
               );
-              if (option) patch(option.node, option.field, workflow.seedNode, workflow.seedField);
+              if (option) patch(option.node, option.field);
             }}
           >
             <option value="">Non configuré</option>
             {workflow.promptOptions.map((o) => (
-              <option key={optionValue(o.node, o.field)} value={optionValue(o.node, o.field)}>
-                {o.label}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        <label className="flex flex-col gap-1 text-sm text-neutral-300">
-          <span className="font-medium">Champ de la graine</span>
-          <select
-            className={selectClasses}
-            value={seedValue}
-            onChange={(event) => {
-              if (event.target.value === "") {
-                patch(workflow.promptNode, workflow.promptField, "", "");
-                return;
-              }
-              const option = workflow.seedOptions.find(
-                (o) => optionValue(o.node, o.field) === event.target.value,
-              );
-              if (option) patch(workflow.promptNode, workflow.promptField, option.node, option.field);
-            }}
-          >
-            <option value="">Aucune (graine aléatoire)</option>
-            {workflow.seedOptions.map((o) => (
               <option key={optionValue(o.node, o.field)} value={optionValue(o.node, o.field)}>
                 {o.label}
               </option>
