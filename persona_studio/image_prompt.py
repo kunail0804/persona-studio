@@ -68,7 +68,20 @@ class ImagePromptInputs:
 # --- The prompt format ---------------------------------------------------------
 
 
-_SYSTEM_INSTRUCTION = (
+# The instruction that used to be the only one possible. It is the fallback
+# when no preset is active, so a database with no preset behaves exactly as it
+# did before presets existed.
+#
+# Note what it encodes: "a short comma-separated list of English keywords" is
+# Stable Diffusion's grammar, not a matter of tone. An image model that wants
+# prose wants a different text here — which is the whole reason this is a
+# preset now and not a constant.
+#
+# One rule is worth keeping in any preset a player writes, and it is not
+# enforced by keeping it: `scrub_names` works on the model's *answer*, so a
+# preset that forgets "never by name" is still covered. What a preset cannot
+# do is make a name appear.
+DEFAULT_INSTRUCTION = (
     "You compose the prompt of an image generator from a scene of an "
     "interactive story.\n"
     "Rules:\n"
@@ -118,7 +131,9 @@ def _beings_section(heading: str, beings: tuple[Appearance, ...]) -> str:
     return _section(heading, sheets)
 
 
-def build_messages(inputs: ImagePromptInputs) -> list[dict[str, str]]:
+def build_messages(
+    inputs: ImagePromptInputs, instruction: str = DEFAULT_INSTRUCTION
+) -> list[dict[str, str]]:
     """The two-message call: the rules, then the scene and the request.
 
     Pure: the same inputs always yield the same strings. The player's request
@@ -126,6 +141,10 @@ def build_messages(inputs: ImagePromptInputs) -> list[dict[str, str]]:
     every empty section is omitted, exactly as the narrator's prompt does. With
     no active persona the protagonist section is absent and the rest of the
     scene is unchanged — the same rule the narrator's prompt follows.
+
+    `instruction` is the active preset's text — the "master prompt" — and
+    defaults to the built-in one, so a caller that does not care about presets
+    gets the behaviour that predates them.
     """
     scene_parts = [
         _section("Current scene:", inputs.narration),
@@ -138,7 +157,7 @@ def build_messages(inputs: ImagePromptInputs) -> list[dict[str, str]]:
     ]
     scene = "\n\n".join(part for part in scene_parts if part)
     return [
-        {"role": "system", "content": _SYSTEM_INSTRUCTION},
+        {"role": "system", "content": instruction},
         {"role": "user", "content": scene},
     ]
 
@@ -317,3 +336,20 @@ def load_inputs(con: sqlite3.Connection, party_id: str) -> ImagePromptInputs:
         characters=characters,
         scenario_title=scenario_row["title"] if scenario_row is not None else "",
     )
+
+
+def load_active_instruction(con: sqlite3.Connection) -> str:
+    """The active preset's text, or the built-in instruction.
+
+    A preset id that no longer resolves degrades to the default rather than
+    failing the composition — the same rule `load_active_persona` follows for
+    a dangling persona. A preset whose text is blank is treated as unset too:
+    an empty system message is worse than no preset at all.
+    """
+    preset_id = settings.get_active_image_preset_id(con)
+    if preset_id is None:
+        return DEFAULT_INSTRUCTION
+    row = con.execute("SELECT instruction FROM image_preset WHERE id = ?", (preset_id,)).fetchone()
+    if row is None or not row["instruction"].strip():
+        return DEFAULT_INSTRUCTION
+    return row["instruction"]

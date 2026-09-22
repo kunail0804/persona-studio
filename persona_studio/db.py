@@ -25,7 +25,7 @@ DATA_DIR = Path(os.environ.get("PS_DATA", Path(__file__).resolve().parent.parent
 DB_PATH = DATA_DIR / "studio.db"
 IMAGES_DIR = DATA_DIR / "images"
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _configure(con: sqlite3.Connection) -> None:
@@ -268,6 +268,26 @@ MIGRATIONS: list[str] = [
     ALTER TABLE workflow DROP COLUMN seed_node;
     ALTER TABLE workflow DROP COLUMN seed_field;
     ALTER TABLE image    DROP COLUMN seed;
+    """,
+    # --- v3 : le master prompt de composition d'image devient une donnée ----
+    #
+    # L'instruction envoyée au modèle qui compose un prompt d'image était une
+    # constante du code, écrite pour Stable Diffusion : « une courte liste de
+    # mots-clés anglais séparés par des virgules ». C'est une grammaire, pas
+    # un détail de ton, et un autre modèle d'image en veut une autre. Elle
+    # devient donc un préset nommé, choisi dans les réglages.
+    #
+    # Aucune ligne n'est créée ici : sans préset actif, la composition utilise
+    # `image_prompt.DEFAULT_INSTRUCTION`, qui est exactement le texte d'avant.
+    # Une base existante se comporte donc à l'identique jusqu'à ce que
+    # l'utilisateur en crée un.
+    """
+    CREATE TABLE image_preset (
+        id          TEXT PRIMARY KEY,
+        name        TEXT NOT NULL DEFAULT '',
+        instruction TEXT NOT NULL DEFAULT '',
+        created_at  REAL NOT NULL
+    );
     """,
 ]
 

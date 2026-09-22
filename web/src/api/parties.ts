@@ -155,6 +155,56 @@ function parsePartyList(data: unknown): PartySummary[] {
   return expectArray(data, "parties").map((item: unknown) => parsePartySummary(item));
 }
 
+/** One message of the next turn's call, with what it weighs. */
+export interface PromptBlock {
+  role: string;
+  content: string;
+  estimatedTokens: number;
+}
+
+/** Exactly what the next turn would send the narrator, block by block. */
+export interface PromptView {
+  blocks: PromptBlock[];
+  context: ContextUsage;
+}
+
+function parsePromptView(data: unknown): PromptView {
+  if (!isRecord(data)) throw new Error("Expected a prompt view object");
+  return {
+    blocks: expectArray(data.blocks, "blocks").map((item: unknown) => {
+      if (!isRecord(item)) throw new Error("Expected a prompt block object");
+      return {
+        role: expectString(item.role, "role"),
+        content: expectString(item.content, "content"),
+        estimatedTokens: expectInteger(item.estimated_tokens, "estimated_tokens"),
+      };
+    }),
+    context: parseContextUsage(data.context),
+  };
+}
+
+/** What would go to the narrator right now — the debugging view. */
+export function getPartyPrompt(id: string, signal?: AbortSignal): Promise<PromptView> {
+  return request(`/parties/${id}/prompt`, parsePromptView, { signal });
+}
+
+/**
+ * Corrects the rolling summary or the world state by hand. The frontier does
+ * not move: this rewrites what the summary says, never how much it stands for.
+ */
+export function updatePartyMemory(
+  id: string,
+  memory: { summaryText?: string; worldState?: Record<string, unknown> },
+): Promise<Party> {
+  const body: Record<string, unknown> = {};
+  if (memory.summaryText !== undefined) body.summary_text = memory.summaryText;
+  if (memory.worldState !== undefined) body.world_state = memory.worldState;
+  return request(`/parties/${id}/memory`, parseParty, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+}
+
 export function listParties(): Promise<PartySummary[]> {
   return request("/parties", parsePartyList);
 }
