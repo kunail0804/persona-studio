@@ -22,18 +22,6 @@ def _clean_workflows(client: TestClient) -> None:
         con.execute("DELETE FROM setting")
 
 
-class SequentialRng:
-    """A deterministic rng whose randint returns 1, 2, 3, … in order."""
-
-    def __init__(self) -> None:
-        self.draws: list[int] = []
-
-    def randint(self, low: int, high: int) -> int:
-        assert low == 0 and high == workflows.MAX_SEED
-        self.draws.append(len(self.draws) + 1)
-        return self.draws[-1]
-
-
 def api_graph() -> dict[str, Any]:
     """A small hand-written API-format graph exercising every rule."""
     return {
@@ -52,7 +40,13 @@ def api_graph() -> dict[str, Any]:
             "class_type": "KSampler",
             # `flag` is a bool: `bool` is a subclass of `int`, it must not
             # pass for a seed.
-            "inputs": {"seed": 42, "noise_seed": 43, "model": ["4", 0], "flag": True},
+            "inputs": {
+                "seed": 42,
+                "noise_seed": 43,
+                "model": ["4", 0],
+                "flag": True,
+                "sampler_name": "euler",
+            },
         },
         "10": {"class_type": "UnknownCustomNode"},
     }
@@ -78,8 +72,6 @@ def _mapped_workflow(graph: dict[str, Any], **overrides: Any) -> dict[str, Any]:
         "graph": json.dumps(graph),
         "prompt_node": "",
         "prompt_field": "",
-        "seed_node": "",
-        "seed_field": "",
     }
     row.update(overrides)
     return row
@@ -100,8 +92,6 @@ def _set_mapping(
             "name": name,
             "prompt_node": prompt_node,
             "prompt_field": prompt_field,
-            "seed_node": "",
-            "seed_field": "",
         },
     )
     assert response.status_code == 200
@@ -155,7 +145,7 @@ def test_non_numeric_node_ids_sort_after_numeric_ones() -> None:
         "2": {"class_type": "B", "inputs": {"text": "a"}},
         "434:393": {"class_type": "C", "inputs": {"text": "c"}},
     }
-    prompts, _ = workflows.field_options(graph)
+    prompts = workflows.field_options(graph)
     assert [o.node for o in prompts] == ["2", "10", "434:393"]
 
 
@@ -199,7 +189,7 @@ def test_non_json_payload_is_rejected_by_the_body_model(client: TestClient) -> N
     assert response.status_code == 422
 
 
-# --- 2. Linked fields are never offered; bool is never a seed -----------------
+# --- 2. Only string literals are offered --------------------------------------
 
 
 def test_linked_fields_are_never_offered(client: TestClient) -> None:
@@ -207,13 +197,12 @@ def test_linked_fields_are_never_offered(client: TestClient) -> None:
 
     graph = api_graph()
     assert isinstance(graph["6"]["inputs"]["clip"], list)
-    prompts, seeds = workflows.field_options(graph)
-    offered = {(o.node, o.field) for o in prompts} | {(o.node, o.field) for o in seeds}
+    offered = {(o.node, o.field) for o in workflows.field_options(graph)}
     assert ("6", "clip") not in offered
     assert ("7", "model") not in offered
 
     body = client.get("/api/workflows").json()[0]
-    offered_fields = {(o["field"]) for o in body["prompt_options"]}
+    offered_fields = {o["field"] for o in body["prompt_options"]}
     assert "clip" not in offered_fields
     # A str literal on the same node is offered, with the node id in the label.
     text_option = next(o for o in body["prompt_options"] if o["field"] == "text")
@@ -221,14 +210,20 @@ def test_linked_fields_are_never_offered(client: TestClient) -> None:
     assert "Positive prompt" in text_option["label"]
     assert "6" in text_option["label"]
 
-    seed_fields = {o["field"] for o in body["seed_options"]}
-    assert "flag" not in seed_fields
 
+def test_non_string_literals_are_never_offered(client: TestClient) -> None:
+    """The prompt is text, so an int or a bool is not a slot it can go in.
 
-def test_seed_options_are_int_literals_only(client: TestClient) -> None:
+    This used to be the seed dropdown's rule in reverse; there is one list
+    now, and nothing but strings belongs in it.
+    """
     workflow = _import(client, "Krea", api_graph())
-    seed_options = {(o["node"], o["field"]) for o in workflow["seed_options"]}
-    assert seed_options == {("7", "seed"), ("7", "noise_seed"), ("4", "stop_at_clip_layer")}
+    offered = {(o["node"], o["field"]) for o in workflow["prompt_options"]}
+    assert offered == {
+        ("4", "ckpt_name"),
+        ("6", "text"),
+        ("7", "sampler_name"),
+    }
 
 
 def test_option_labels_fall_back_to_class_type_and_sort_is_stable(
@@ -236,8 +231,8 @@ def test_option_labels_fall_back_to_class_type_and_sort_is_stable(
 ) -> None:
     workflow = _import(client, "Krea", api_graph())
     # Node 7 has no _meta: the label falls back to class_type.
-    seed_label = next(o["label"] for o in workflow["seed_options"] if o["field"] == "seed")
-    assert "KSampler" in seed_label
+    label = next(o["label"] for o in workflow["prompt_options"] if o["node"] == "7")
+    assert "KSampler" in label
     prompt_nodes = [o["node"] for o in workflow["prompt_options"]]
     assert prompt_nodes == sorted(prompt_nodes, key=lambda n: int(n))
 
@@ -255,7 +250,7 @@ def test_unknown_nodes_import_without_breaking_the_inventory(client: TestClient)
         "field the prompt is injected into."
     )
     offered_nodes = {o["node"] for o in workflow["prompt_options"]}
-    assert offered_nodes == {"4", "6"}
+    assert offered_nodes == {"4", "6", "7"}
 
 
 # --- 4. The mapping round-trips through PATCH, stale ones are rejected --------
@@ -275,15 +270,13 @@ def test_mapping_round_trips_through_patch(client: TestClient) -> None:
 def test_patch_rejects_a_mapping_the_graph_does_not_offer(client: TestClient) -> None:
     workflow = _import(client, "Krea", api_graph())
 
-    def patch(prompt_node: str, prompt_field: str, seed_node: str = "", seed_field: str = ""):
+    def patch(prompt_node: str, prompt_field: str):
         return client.patch(
             f"/api/workflows/{workflow['id']}",
             json={
                 "name": "Krea",
                 "prompt_node": prompt_node,
                 "prompt_field": prompt_field,
-                "seed_node": seed_node,
-                "seed_field": seed_field,
             },
         )
 
@@ -298,26 +291,8 @@ def test_patch_rejects_a_mapping_the_graph_does_not_offer(client: TestClient) ->
     # A linked field is a real field, but it must still be rejected.
     assert patch("6", "clip").status_code == 422
 
-    # A seed mapping must name an int literal, not a string one.
-    assert patch("6", "text", seed_node="6", seed_field="text").status_code == 422
-
-
-def test_a_bool_field_is_rejected_as_a_seed_mapping(client: TestClient) -> None:
-    # Pinned on purpose: the bool exclusion in `_is_int_literal` is the rule
-    # that stops a raw PATCH mapping a boolean widget as a seed.
-    workflow = _import(client, "Krea", api_graph())
-    response = client.patch(
-        f"/api/workflows/{workflow['id']}",
-        json={
-            "name": "Krea",
-            "prompt_node": "6",
-            "prompt_field": "text",
-            "seed_node": "7",
-            "seed_field": "flag",
-        },
-    )
-    assert response.status_code == 422
-    assert "no longer holds an integer" in response.json()["detail"]
+    # So is a literal of the wrong type: the prompt is text.
+    assert patch("7", "seed").status_code == 422
 
 
 # --- 5. Healing ---------------------------------------------------------------
@@ -494,15 +469,11 @@ def test_first_import_with_a_dangling_setting_reports_itself_active(
 
 def test_prepare_graph_injects_the_prompt_and_touches_nothing_else() -> None:
     workflow = _mapped_workflow(api_graph(), prompt_node="6", prompt_field="text")
-    rng = SequentialRng()
 
-    prepared = workflows.prepare_graph(workflow, "un château en ruine", rng=rng.randint)
+    prepared = workflows.prepare_graph(workflow, "un château en ruine")
 
     expected = api_graph()
     expected["6"]["inputs"]["text"] = "un château en ruine"
-    # No seed mapping: the two seed literals were randomised, in draw order.
-    expected["7"]["inputs"]["seed"] = 1
-    expected["7"]["inputs"]["noise_seed"] = 2
     assert prepared == expected
     # The stored graph is never mutated.
     assert json.loads(workflow["graph"])["6"]["inputs"]["text"] == "a castle"
@@ -512,21 +483,14 @@ def test_prepare_graph_result_is_private_to_the_caller() -> None:
     # The returned graph is a copy: mutating it must not leak into a later
     # call, which would feed the generator a corrupted graph.
     workflow = _mapped_workflow(api_graph(), prompt_node="6", prompt_field="text")
-    rng = SequentialRng()
 
-    first = workflows.prepare_graph(workflow, "first", rng=rng.randint)
+    first = workflows.prepare_graph(workflow, "first")
     first["6"]["inputs"]["text"] = "mutated in place"
     first["7"]["inputs"]["noise_seed"] = ["4", 0]
 
-    second = workflows.prepare_graph(workflow, "second", rng=rng.randint)
+    second = workflows.prepare_graph(workflow, "second")
     assert second["6"]["inputs"]["text"] == "second"
-    assert isinstance(second["7"]["inputs"]["noise_seed"], int)
-
-
-def test_max_seed_stays_inside_the_stock_node_range() -> None:
-    # The comment on MAX_SEED promises 2**32-1 sits inside the declared range
-    # of every stock node; 2**64-1, the natural-looking value, would not.
-    assert workflows.MAX_SEED == 2**32 - 1
+    assert second["7"]["inputs"]["noise_seed"] == 43
 
 
 # --- 8. Unmapped refuses with the same message prepare would raise ------------
@@ -572,97 +536,33 @@ def test_half_mapped_workflow_refuses() -> None:
     assert workflows.problem(workflow) is not None
 
 
-# --- 9. No seed mapping randomises every seed field ---------------------------
+# --- 9. Seeds belong to the workflow -----------------------------------------
 
 
-def test_no_seed_mapping_randomises_every_seed_field() -> None:
+def test_every_seed_field_is_left_exactly_as_the_graph_carries_it() -> None:
+    """The application used to rewrite every unmapped field named `seed` or
+    `noise_seed`, to defeat ComfyUI's graph cache — its API format does not
+    carry the `control_after_generate` behaviour the web interface applies
+    between two runs. That is no longer this application's job: a workflow
+    that wants a fresh seed per run carries a node that draws one.
+
+    Pinned because the failure is silent in both directions. Writing a seed
+    again would overwrite a value the workflow chose; the guarantee here is
+    that the prompt is the only field that changes.
+    """
     graph = api_graph()
-    with db.connect() as con:
-        con.execute(
-            "INSERT INTO workflow (id, name, graph, created_at) VALUES (?, ?, ?, ?)",
-            ("w1", "Krea", json.dumps(graph), 1.0),
-        )
-    row = _workflow_row("w1")
+    graph["265:254"] = {"class_type": "KreaSeedVarianceEnhancer", "inputs": {"seed": 149357}}
+    graph["186:120"] = {"class_type": "RandomNoise", "inputs": {"noise_seed": 954747}}
     workflow = _mapped_workflow(graph, prompt_node="6", prompt_field="text")
-    rng = SequentialRng()
 
-    prepared = workflows.prepare_graph(workflow, "new prompt", rng=rng.randint)
+    prepared = workflows.prepare_graph(workflow, "un phare dans la brume")
 
-    # Both seed literals changed, each drew its own fresh value in order.
-    assert prepared["7"]["inputs"]["seed"] == 1
-    assert prepared["7"]["inputs"]["noise_seed"] == 2
-    assert rng.draws == [1, 2]
-    # A seed field holding a link is untouched.
-    assert prepared["7"]["inputs"]["model"] == ["4", 0]
-    # Everything else is exactly the stored graph plus the prompt.
-    expected = api_graph()
-    expected["6"]["inputs"]["text"] = "new prompt"
-    expected["7"]["inputs"]["seed"] = 1
-    expected["7"]["inputs"]["noise_seed"] = 2
-    assert prepared == expected
-    # The stored graph in the database is unchanged.
-    assert json.loads(row["graph"])["7"]["inputs"]["seed"] == 42
-
-
-def test_seed_field_names_beyond_ksampler_are_randomised() -> None:
-    graph = {
-        "3": {"class_type": "Custom", "inputs": {"noise_seed": 7}},
-        "8": {"class_type": "Other", "inputs": {"seed": 9}},
-        "9": {"class_type": "Unrelated", "inputs": {"steps": 20, "text": "hi"}},
-    }
-    workflow = _mapped_workflow(graph, prompt_node="9", prompt_field="text")
-    rng = SequentialRng()
-    prepared = workflows.prepare_graph(workflow, "p", rng=rng.randint)
-    assert prepared["3"]["inputs"]["noise_seed"] == 1
-    assert prepared["8"]["inputs"]["seed"] == 2
-    assert prepared["9"]["inputs"]["steps"] == 20
-
-
-def test_a_bool_typed_seed_field_is_never_randomised() -> None:
-    # A bool named "seed" is deliberately left exactly as stored: writing a
-    # random int into a boolean widget would send ComfyUI a wrong-typed value.
-    graph = {
-        "3": {"class_type": "Custom", "inputs": {"seed": True, "text": "hi"}},
-        "9": {"class_type": "Other", "inputs": {"text": "p"}},
-    }
-    workflow = _mapped_workflow(graph, prompt_node="9", prompt_field="text")
-    rng = SequentialRng()
-
-    prepared = workflows.prepare_graph(workflow, "p", rng=rng.randint)
-
-    assert prepared["3"]["inputs"]["seed"] is True
-    assert rng.draws == []
-
-
-# --- 10. A seed mapping writes only the mapped field --------------------------
-
-
-def test_seed_mapping_writes_only_the_mapped_field() -> None:
-    graph = api_graph()
-    workflow = _mapped_workflow(
-        graph, prompt_node="6", prompt_field="text", seed_node="7", seed_field="seed"
-    )
-    rng = SequentialRng()
-
-    prepared = workflows.prepare_graph(workflow, "p", rng=rng.randint)
-
-    assert prepared["7"]["inputs"]["seed"] == 1
-    # The other node's seed keeps its original value: the user chose to
-    # control this one field, and the rest must not be taken back.
+    assert prepared["7"]["inputs"]["seed"] == 42
     assert prepared["7"]["inputs"]["noise_seed"] == 43
-    assert prepared["4"]["inputs"]["stop_at_clip_layer"] == -1
-    assert rng.draws == [1]
-
-
-def test_stale_seed_mapping_refuses() -> None:
-    graph = api_graph()
-    del graph["7"]
-    workflow = _mapped_workflow(
-        graph, prompt_node="6", prompt_field="text", seed_node="7", seed_field="seed"
-    )
-    assert workflows.problem(workflow) is not None
-    with pytest.raises(workflows.WorkflowNotReady):
-        workflows.prepare_graph(workflow, "p")
+    assert prepared["265:254"]["inputs"]["seed"] == 149357
+    assert prepared["186:120"]["inputs"]["noise_seed"] == 954747
+    # And the one field that does change still changes.
+    assert prepared["6"]["inputs"]["text"] == "un phare dans la brume"
 
 
 # --- The active-workflow setting -----------------------------------------------

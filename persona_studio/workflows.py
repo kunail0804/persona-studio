@@ -25,26 +25,12 @@ from __future__ import annotations
 
 import copy
 import json
-import random
 import sqlite3
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
 from . import settings
-
-# Stock ComfyUI seed widgets declare 0..2**64-1, but some nodes cap lower;
-# 2**32-1 sits inside the declared range of every stock node.
-MAX_SEED = 2**32 - 1
-
-# System entropy for the default seed draw, created once at import because a
-# parameter default must not perform a call (ruff B008).
-_SYSTEM_RANDOM = random.SystemRandom()
-
-# Unmapped seed fields whose names these are get randomised: ComfyUI caches
-# on the graph, so an identical graph returns the identical image and an
-# unrandomised seed makes "generate again" a silent no-op.
-SEED_FIELD_NAMES = ("seed", "noise_seed")
 
 
 class InvalidWorkflow(ValueError):
@@ -141,23 +127,19 @@ def _make_option(graph: dict[str, Any], node_id: str, field: str) -> FieldOption
     )
 
 
-def field_options(graph: dict[str, Any]) -> tuple[list[FieldOption], list[FieldOption]]:
-    """The two dropdown lists: where a prompt can go, and where a seed can go.
+def field_options(graph: dict[str, Any]) -> list[FieldOption]:
+    """The dropdown list: every field a prompt can be injected into.
 
     The list check is the whole rule: a value that is a list is a link to
     another node's output, computed at run time, so writing to it would be a
-    silent no-op. Only literal `str` values offer a prompt slot and only
-    literal `int` values (never `bool`, a subclass of `int`) offer a seed
-    slot — regardless of the node's class name.
+    silent no-op. Only literal `str` values offer a prompt slot — regardless
+    of the node's class name.
     """
-    prompt_options: list[FieldOption] = []
-    seed_options: list[FieldOption] = []
-    for node_id, field, value in _iter_fields(graph):
-        if isinstance(value, str):
-            prompt_options.append(_make_option(graph, node_id, field))
-        elif isinstance(value, int) and not isinstance(value, bool):
-            seed_options.append(_make_option(graph, node_id, field))
-    return prompt_options, seed_options
+    return [
+        _make_option(graph, node_id, field)
+        for node_id, field, value in _iter_fields(graph)
+        if isinstance(value, str)
+    ]
 
 
 def _row_is_valid(row: sqlite3.Row) -> bool:
@@ -258,37 +240,12 @@ def problem(workflow: sqlite3.Row | dict[str, Any]) -> str | None:
     node, field = workflow["prompt_node"], workflow["prompt_field"]
     if not node or not field:
         return _NOT_MAPPED
-    message = _mapping_message(graph, node, field, lambda v: isinstance(v, str), "a string")
-    if message is not None:
-        return message
-
-    seed_node, seed_field = workflow["seed_node"], workflow["seed_field"]
-    if not seed_node or not seed_field:
-        return None
-    return _mapping_message(graph, seed_node, seed_field, _is_int_literal, "an integer")
-
-
-def _is_int_literal(value: Any) -> bool:
-    # The bool exclusion is deliberate, not an oversight: a real seed is an
-    # integer, and a bool field named "seed" must stay untouched. Writing a
-    # random int into a boolean widget would send ComfyUI a wrong-typed value;
-    # leaving the graph byte-identical instead is honest, even though it means
-    # ComfyUI's cache then serves the same image. A custom node that exposes a
-    # boolean "seed" simply cannot be used as a seed mapping — the user maps
-    # the node's real integer field.
-    return isinstance(value, int) and not isinstance(value, bool)
+    return _mapping_message(graph, node, field, lambda v: isinstance(v, str), "a string")
 
 
 def prepare_graph(
     workflow: sqlite3.Row | dict[str, Any],
     prompt: str,
-    *,
-    seed: int | None = None,
-    # A callable over system entropy, not the `random` module's PRNG: an
-    # image seed is not a secret and `randint` is not a real weakness, but
-    # the switch costs nothing here — one draw per field, never in a loop —
-    # and the tests replace it wholesale to stay deterministic.
-    rng: Callable[[int, int], int] = _SYSTEM_RANDOM.randint,
 ) -> dict[str, Any]:
     """A private deep copy of the stored graph, with the prompt injected.
 
@@ -300,11 +257,14 @@ def prepare_graph(
     Raises `WorkflowNotReady` with the message `problem()` returns when the
     workflow cannot be used.
 
-    The seed asymmetry is a decision, not an oversight: with no seed mapping,
-    every seed field is randomised — otherwise ComfyUI's graph cache returns
-    the identical image and rerolling does nothing. With a seed mapping, the
-    user chose to control that one field, so it alone is written and every
-    other seed field is left exactly as the graph carries it.
+    The prompt is the only thing written. Seeds belong to the workflow: the
+    application used to randomise every unmapped field named `seed` or
+    `noise_seed`, because ComfyUI's API format does not carry the
+    `control_after_generate` behaviour its web interface applies between two
+    runs — that is a browser-side feature, so an identical graph came back
+    from ComfyUI's cache as an identical image. Compensating for that is no
+    longer this application's job; a workflow that wants a fresh seed per run
+    carries a node that draws one.
     """
     message = problem(workflow)
     if message is not None:
@@ -312,39 +272,18 @@ def prepare_graph(
 
     graph = copy.deepcopy(parse_stored_graph(workflow["graph"]))
     graph[workflow["prompt_node"]]["inputs"][workflow["prompt_field"]] = prompt
-
-    seed_node, seed_field = workflow["seed_node"], workflow["seed_field"]
-    if seed_node and seed_field:
-        value = seed if seed is not None else rng(0, MAX_SEED)
-        graph[seed_node]["inputs"][seed_field] = value
-    else:
-        for node_id in sorted(graph, key=_node_sort_key):
-            inputs = graph[node_id].get("inputs")
-            if not isinstance(inputs, dict):
-                continue
-            for field, current in list(inputs.items()):
-                if field in SEED_FIELD_NAMES and _is_int_literal(current):
-                    inputs[field] = seed if seed is not None else rng(0, MAX_SEED)
     return graph
 
 
-def check_mapping(
-    graph: dict[str, Any],
-    *,
-    node: str,
-    field: str,
-    kind: str,
-) -> str | None:
+def check_mapping(graph: dict[str, Any], *, node: str, field: str) -> str | None:
     """Whether a mapping proposed by the client names a field the graph offers.
 
-    `kind` is "prompt" or "seed" and decides the literal type required; the
-    returned message names the node or field so a stale dropdown is fixable.
-    An empty mapping is legal — it means "not configured", not "invalid".
+    The returned message names the node or field so a stale dropdown is
+    fixable. An empty mapping is legal — it means "not configured", not
+    "invalid".
     """
     if not node and not field:
         return None
     if not node or not field:
-        return f"The {kind} mapping must name both a node and a field."
-    if kind == "prompt":
-        return _mapping_message(graph, node, field, lambda v: isinstance(v, str), "a string")
-    return _mapping_message(graph, node, field, _is_int_literal, "an integer")
+        return "The prompt mapping must name both a node and a field."
+    return _mapping_message(graph, node, field, lambda v: isinstance(v, str), "a string")

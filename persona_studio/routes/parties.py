@@ -46,7 +46,7 @@ from typing import Any, Literal
 import anyio.to_thread
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from .. import db, narrator, ollama, settings, summarizer
 
@@ -97,6 +97,30 @@ class ContextUsage(BaseModel):
     estimated_tokens: int
     num_ctx: int
     near_limit: bool
+
+
+class PromptBlock(BaseModel):
+    """One message of the next turn's call, with what it weighs."""
+
+    role: str
+    content: str
+    estimated_tokens: int
+
+
+class PromptView(BaseModel):
+    """Exactly what would be sent to the narrator, block by block."""
+
+    blocks: list[PromptBlock]
+    context: ContextUsage
+
+
+class MemoryInput(BaseModel):
+    """A correction to the party's memory. Only the fields sent are written."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary_text: str | None = None
+    world_state: dict[str, Any] | None = None
 
 
 class Party(PartySummary):
@@ -195,6 +219,36 @@ def _sweep_turn_locks() -> None:
         idle = [pid for pid, lock in _turn_locks.items() if lock.acquire(blocking=False)]
         for party_id in idle:
             _turn_locks.pop(party_id).release()
+
+
+def _next_turn_messages(
+    con: sqlite3.Connection, row: sqlite3.Row
+) -> tuple[list[dict[str, str]], int]:
+    """The call the next played turn would make, and the configured window.
+
+    One place assembles it, so the estimate the interface shows and the
+    prompt the player can read are the same object the turn would send — not
+    a second rendering of it that can drift.
+    """
+    scenario = narrator.load_scenario(con, row["scenario_id"])
+    persona = narrator.load_active_persona(con)
+    history = narrator.load_history(
+        con,
+        row["id"],
+        settings.get_history_window(con),
+        after_id=row["summary_upto"],
+    )
+    messages = narrator.build_chat_messages(scenario, persona, history, row["summary_text"])
+    return messages, settings.get_num_ctx(con)
+
+
+def _context_usage(messages: list[dict[str, str]], num_ctx: int) -> ContextUsage:
+    usage = narrator.context_usage(messages, num_ctx)
+    return ContextUsage(
+        estimated_tokens=usage.estimated_tokens,
+        num_ctx=usage.num_ctx,
+        near_limit=usage.near_limit,
+    )
 
 
 def _party_from_row(row: sqlite3.Row) -> PartySummary:
@@ -465,19 +519,8 @@ def get_party(party_id: str) -> Party:
         # turn assembles it. The estimate rides with the party rather than on
         # an endpoint of its own: the page already reads this one, and a
         # warning nobody fetches is the state this feature was already in.
-        scenario = narrator.load_scenario(con, row["scenario_id"])
-        persona = narrator.load_active_persona(con)
-        num_ctx = settings.get_num_ctx(con)
-        history = narrator.load_history(
-            con,
-            party_id,
-            settings.get_history_window(con),
-            after_id=row["summary_upto"],
-        )
-    usage = narrator.context_usage(
-        narrator.build_chat_messages(scenario, persona, history, row["summary_text"]),
-        num_ctx,
-    )
+        messages, num_ctx = _next_turn_messages(con, row)
+    usage = _context_usage(messages, num_ctx)
     # Variants ride inline rather than behind a second endpoint: the interface
     # navigates them with arrow presses, and a round trip per press would show
     # visible lag on a local app whose payload is text it is already sending.
@@ -498,11 +541,7 @@ def get_party(party_id: str) -> Party:
         summary_text=row["summary_text"],
         summary_upto=row["summary_upto"],
         world_state=summarizer.parse_world_state(row["world_state"]),
-        context=ContextUsage(
-            estimated_tokens=usage.estimated_tokens,
-            num_ctx=usage.num_ctx,
-            near_limit=usage.near_limit,
-        ),
+        context=usage,
         messages=[
             PartyMessage(
                 id=m["id"],
@@ -519,6 +558,63 @@ def get_party(party_id: str) -> Party:
             for m in message_rows
         ],
     )
+
+
+@router.get("/parties/{party_id}/prompt", response_model=PromptView)
+def get_party_prompt(party_id: str) -> PromptView:
+    """Exactly what the next turn would send the narrator, block by block.
+
+    The debugging tool the application was missing: when the narration goes
+    wrong, the question is almost always whether a section made it into the
+    prompt at all — an empty field is omitted by design, a summary can have
+    replaced the turns you remember, and Ollama truncates from the front in
+    silence. Reading the thing itself answers all three.
+
+    Assembled by `_next_turn_messages`, the same function the estimate on the
+    party uses, so this cannot drift from what is really sent.
+    """
+    with db.connect() as con:
+        row = _get_party_row(con, party_id)
+        messages, num_ctx = _next_turn_messages(con, row)
+    return PromptView(
+        blocks=[
+            PromptBlock(
+                role=message["role"],
+                content=message["content"],
+                estimated_tokens=narrator.estimate_tokens([message]),
+            )
+            for message in messages
+        ],
+        context=_context_usage(messages, num_ctx),
+    )
+
+
+@router.patch("/parties/{party_id}/memory", response_model=Party)
+def update_party_memory(party_id: str, body: MemoryInput) -> Party:
+    """Correct the rolling summary or the world state by hand.
+
+    The summariser is a local model compressing a transcript, and it gets
+    things wrong. Until now the panel was read-only, so a bad summary stayed
+    wrong for the rest of the party and every later turn read it.
+
+    The frontier is not touched: this rewrites what the summary says, never
+    how much of the story it stands for — the same rule
+    `summarizer.schedule_revision` follows. A summarisation committing right
+    after a manual edit can still overwrite it; that window is small, the
+    edit is one field away from being redone, and closing it would mean
+    holding the party's lock across a model call.
+    """
+    fields: dict[str, Any] = {}
+    if body.summary_text is not None:
+        fields["summary_text"] = body.summary_text
+    if body.world_state is not None:
+        fields["world_state"] = json.dumps(body.world_state, ensure_ascii=False)
+    clause, values = db.assignments(("summary_text", "world_state"), fields)
+    with db.connect() as con:
+        _get_party_row(con, party_id)
+        if clause:
+            con.execute(f"UPDATE instance SET {clause} WHERE id = ?", (*values, party_id))
+    return get_party(party_id)
 
 
 @router.patch("/parties/{party_id}", response_model=PartySummary)

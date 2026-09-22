@@ -13,10 +13,7 @@ export interface Workflow {
   isActive: boolean;
   promptNode: string;
   promptField: string;
-  seedNode: string;
-  seedField: string;
   promptOptions: WorkflowFieldOption[];
-  seedOptions: WorkflowFieldOption[];
   /** Why nothing can be generated with this workflow, or null when it is ready. */
   problem: string | null;
   createdAt: number;
@@ -31,8 +28,6 @@ export interface WorkflowPatch {
   name: string;
   promptNode: string;
   promptField: string;
-  seedNode: string;
-  seedField: string;
 }
 
 function parseFieldOption(data: unknown): WorkflowFieldOption {
@@ -52,10 +47,7 @@ function parseWorkflow(data: unknown): Workflow {
     isActive: expectBoolean(data.is_active, "is_active"),
     promptNode: expectString(data.prompt_node, "prompt_node"),
     promptField: expectString(data.prompt_field, "prompt_field"),
-    seedNode: expectString(data.seed_node, "seed_node"),
-    seedField: expectString(data.seed_field, "seed_field"),
     promptOptions: expectArray(data.prompt_options, "prompt_options").map(parseFieldOption),
-    seedOptions: expectArray(data.seed_options, "seed_options").map(parseFieldOption),
     problem: data.problem === null ? null : expectString(data.problem, "problem"),
     createdAt: expectNumber(data.created_at, "created_at"),
   };
@@ -83,8 +75,6 @@ export function updateWorkflow(id: string, input: WorkflowPatch): Promise<Workfl
       name: input.name,
       prompt_node: input.promptNode,
       prompt_field: input.promptField,
-      seed_node: input.seedNode,
-      seed_field: input.seedField,
     }),
   });
 }

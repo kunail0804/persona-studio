@@ -1,5 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError } from "../api/client";
+import type { ImagePreset } from "../api/imagePresets";
+import {
+  createImagePreset,
+  deleteImagePreset,
+  getDefaultInstruction,
+  listImagePresets,
+  setActiveImagePreset,
+  updateImagePreset,
+} from "../api/imagePresets";
 import type { Persona, PersonaInput } from "../api/personas";
 import { createPersona, deletePersona, listPersonas, setActivePersona, updatePersona } from "../api/personas";
 import type { LlmSettings } from "../api/settings";
@@ -9,6 +18,7 @@ import { deleteWorkflow, importWorkflow, listWorkflows, setActiveWorkflow, updat
 import { Button } from "../components/Button";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { PersonaForm } from "../components/PersonaForm";
+import { TextArea } from "../components/TextArea";
 import { TextField } from "../components/TextField";
 import { isRecord } from "../api/validate";
 
@@ -27,6 +37,10 @@ function optionValue(node: string, field: string): string {
 
 export function SettingsPage() {
   const [personas, setPersonas] = useState<Persona[]>([]);
+  const [presets, setPresets] = useState<ImagePreset[]>([]);
+  const [defaultInstruction, setDefaultInstruction] = useState("");
+  const [editingPresetId, setEditingPresetId] = useState<string | null>(null);
+  const [confirmDeletePresetId, setConfirmDeletePresetId] = useState<string | null>(null);
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
   const [llm, setLlm] = useState<LlmSettings | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -44,13 +58,17 @@ export function SettingsPage() {
 
   const load = useCallback(async (signal?: AbortSignal) => {
     try {
-      const [personaData, llmData, workflowData] = await Promise.all([
+      const [personaData, llmData, workflowData, presetData, defaultText] = await Promise.all([
         listPersonas(signal),
         getLlmSettings(signal),
         listWorkflows(signal),
+        listImagePresets(signal),
+        getDefaultInstruction(signal),
       ]);
       setPersonas(personaData);
       setWorkflows(workflowData);
+      setPresets(presetData);
+      setDefaultInstruction(defaultText);
       setLlm(llmData);
       setModel(llmData.model);
       setNumCtx(String(llmData.numCtx));
@@ -71,6 +89,52 @@ export function SettingsPage() {
 
   async function reload() {
     await load();
+  }
+
+  async function handleCreatePreset() {
+    try {
+      // A new preset starts from the built-in text rather than a blank box:
+      // it is a working instruction, and editing one is far easier than
+      // writing the rules of an image prompt from nothing.
+      const created = await createImagePreset({
+        name: "Nouveau préset",
+        instruction: defaultInstruction,
+      });
+      await reload();
+      setEditingPresetId(created.id);
+    } catch (err) {
+      setError(messageFor(err, "Impossible de créer le préset."));
+    }
+  }
+
+  async function handleSavePreset(presetId: string, name: string, instruction: string) {
+    try {
+      await updateImagePreset(presetId, { name, instruction });
+      setEditingPresetId(null);
+      await reload();
+    } catch (err) {
+      setError(messageFor(err, "Impossible d'enregistrer le préset."));
+    }
+  }
+
+  async function handleActivatePreset(presetId: string | null) {
+    try {
+      await setActiveImagePreset(presetId);
+      await reload();
+    } catch (err) {
+      setError(messageFor(err, "Impossible de choisir le préset."));
+    }
+  }
+
+  async function handleDeletePreset(presetId: string) {
+    try {
+      await deleteImagePreset(presetId);
+      await reload();
+    } catch (err) {
+      setError(messageFor(err, "Impossible de supprimer le préset."));
+    } finally {
+      setConfirmDeletePresetId(null);
+    }
   }
 
   async function handleCreatePersona(input: PersonaInput) {
@@ -151,8 +215,6 @@ export function SettingsPage() {
     name: string;
     promptNode: string;
     promptField: string;
-    seedNode: string;
-    seedField: string;
   }) {
     try {
       await updateWorkflow(workflowId, patch);
@@ -307,6 +369,56 @@ export function SettingsPage() {
         )}
       </section>
 
+      <section className="flex flex-col gap-4">
+        <div className="flex items-center justify-between">
+          <h2 className="text-xl font-semibold">Master prompt des images</h2>
+          <Button onClick={() => void handleCreatePreset()}>Nouveau préset</Button>
+        </div>
+        <p className="text-sm text-neutral-500">
+          L'instruction donnée au modèle qui compose le prompt d'une image. Le texte intégré
+          demande une liste de mots-clés anglais séparés par des virgules&nbsp;: c'est la
+          grammaire de Stable Diffusion. Un modèle qui attend de la prose en veut une autre.
+          Ce master prompt ne concerne que les images, jamais la narration.
+        </p>
+
+        <label className="flex flex-col gap-1 text-sm text-neutral-300">
+          <span className="font-medium">Préset actif</span>
+          <select
+            className={selectClasses}
+            value={presets.find((preset) => preset.isActive)?.id ?? ""}
+            onChange={(event) => void handleActivatePreset(event.target.value || null)}
+          >
+            <option value="">Texte intégré (Stable Diffusion)</option>
+            {presets.map((preset) => (
+              <option key={preset.id} value={preset.id}>
+                {preset.name || "Sans nom"}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        {presets.length === 0 ? (
+          <p className="text-sm text-neutral-500">
+            Aucun préset. Sans préset, le texte intégré est utilisé — le comportement d'avant
+            cette version.
+          </p>
+        ) : (
+          <ul className="flex flex-col gap-3">
+            {presets.map((preset) => (
+              <ImagePresetListItem
+                key={preset.id}
+                preset={preset}
+                isEditing={editingPresetId === preset.id}
+                onEdit={() => setEditingPresetId(preset.id)}
+                onCancelEdit={() => setEditingPresetId(null)}
+                onSave={(name, instruction) => void handleSavePreset(preset.id, name, instruction)}
+                onDelete={() => setConfirmDeletePresetId(preset.id)}
+              />
+            ))}
+          </ul>
+        )}
+      </section>
+
       <section className="flex flex-col gap-3">
         <h2 className="text-xl font-semibold">Modèle de narration</h2>
 
@@ -363,6 +475,15 @@ export function SettingsPage() {
       </section>
 
       <ConfirmDialog
+        open={confirmDeletePresetId !== null}
+        title="Supprimer ce préset ?"
+        description="Cette action est définitive. S'il était actif, le texte intégré reprend sa place."
+        onConfirm={() => {
+          if (confirmDeletePresetId !== null) void handleDeletePreset(confirmDeletePresetId);
+        }}
+        onCancel={() => setConfirmDeletePresetId(null)}
+      />
+      <ConfirmDialog
         open={confirmDeletePersonaId !== null}
         title="Supprimer cette persona ?"
         description="Cette action est définitive. Si elle était active, plus aucune persona ne le sera."
@@ -388,7 +509,7 @@ export function SettingsPage() {
 interface WorkflowListItemProps {
   workflow: Workflow;
   onSelect: () => void;
-  onPatch: (patch: { name: string; promptNode: string; promptField: string; seedNode: string; seedField: string }) => void;
+  onPatch: (patch: { name: string; promptNode: string; promptField: string }) => void;
   onDelete: () => void;
 }
 
@@ -400,11 +521,8 @@ function WorkflowListItem({ workflow, onSelect, onPatch, onDelete }: WorkflowLis
     workflow.promptNode && workflow.promptField
       ? optionValue(workflow.promptNode, workflow.promptField)
       : "";
-  const seedValue =
-    workflow.seedNode && workflow.seedField ? optionValue(workflow.seedNode, workflow.seedField) : "";
-
-  const patch = (promptNode: string, promptField: string, seedNode: string, seedField: string) =>
-    onPatch({ name: workflow.name, promptNode, promptField, seedNode, seedField });
+  const patch = (promptNode: string, promptField: string) =>
+    onPatch({ name: workflow.name, promptNode, promptField });
 
   return (
     <li className="rounded-lg border border-neutral-800 bg-neutral-900 p-4">
@@ -429,7 +547,7 @@ function WorkflowListItem({ workflow, onSelect, onPatch, onDelete }: WorkflowLis
 
       {workflow.problem ? <p className="mt-2 text-sm text-amber-400">{workflow.problem}</p> : null}
 
-      <div className="mt-3 grid gap-3 sm:grid-cols-2">
+      <div className="mt-3">
         <label className="flex flex-col gap-1 text-sm text-neutral-300">
           <span className="font-medium">Champ du prompt</span>
           <select
@@ -437,42 +555,17 @@ function WorkflowListItem({ workflow, onSelect, onPatch, onDelete }: WorkflowLis
             value={promptValue}
             onChange={(event) => {
               if (event.target.value === "") {
-                patch("", "", workflow.seedNode, workflow.seedField);
+                patch("", "");
                 return;
               }
               const option = workflow.promptOptions.find(
                 (o) => optionValue(o.node, o.field) === event.target.value,
               );
-              if (option) patch(option.node, option.field, workflow.seedNode, workflow.seedField);
+              if (option) patch(option.node, option.field);
             }}
           >
             <option value="">Non configuré</option>
             {workflow.promptOptions.map((o) => (
-              <option key={optionValue(o.node, o.field)} value={optionValue(o.node, o.field)}>
-                {o.label}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        <label className="flex flex-col gap-1 text-sm text-neutral-300">
-          <span className="font-medium">Champ de la graine</span>
-          <select
-            className={selectClasses}
-            value={seedValue}
-            onChange={(event) => {
-              if (event.target.value === "") {
-                patch(workflow.promptNode, workflow.promptField, "", "");
-                return;
-              }
-              const option = workflow.seedOptions.find(
-                (o) => optionValue(o.node, o.field) === event.target.value,
-              );
-              if (option) patch(workflow.promptNode, workflow.promptField, option.node, option.field);
-            }}
-          >
-            <option value="">Aucune (graine aléatoire)</option>
-            {workflow.seedOptions.map((o) => (
               <option key={optionValue(o.node, o.field)} value={optionValue(o.node, o.field)}>
                 {o.label}
               </option>
@@ -527,6 +620,82 @@ function PersonaListItem({
               </Button>
             ) : null}
             <Button variant="secondary" onClick={onEdit}>
+              Modifier
+            </Button>
+            <Button variant="danger" onClick={onDelete}>
+              Supprimer
+            </Button>
+          </div>
+        </div>
+      )}
+    </li>
+  );
+}
+
+
+interface ImagePresetListItemProps {
+  preset: ImagePreset;
+  isEditing: boolean;
+  onEdit: () => void;
+  onCancelEdit: () => void;
+  onSave: (name: string, instruction: string) => void;
+  onDelete: () => void;
+}
+
+function ImagePresetListItem({
+  preset,
+  isEditing,
+  onEdit,
+  onCancelEdit,
+  onSave,
+  onDelete,
+}: ImagePresetListItemProps) {
+  const [name, setName] = useState(preset.name);
+  const [instruction, setInstruction] = useState(preset.instruction);
+
+  const startEdit = () => {
+    setName(preset.name);
+    setInstruction(preset.instruction);
+    onEdit();
+  };
+
+  return (
+    <li className="rounded-lg border border-neutral-800 bg-neutral-900 p-4">
+      {isEditing ? (
+        <div className="flex flex-col gap-3">
+          <TextField
+            label="Nom"
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            required
+          />
+          <TextArea
+            label="Instruction"
+            value={instruction}
+            onChange={(event) => setInstruction(event.target.value)}
+            rows={12}
+            hint="Ce texte part en message système au modèle qui compose le prompt. Les noms propres restent retirés de sa réponse quoi qu'il dise."
+          />
+          <div className="flex gap-2">
+            <Button onClick={() => onSave(name, instruction)}>Enregistrer</Button>
+            <Button variant="secondary" onClick={onCancelEdit}>
+              Annuler
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <h3 className="font-medium">{preset.name || "Sans nom"}</h3>
+              {preset.isActive ? (
+                <span className="rounded bg-sky-900 px-2 py-0.5 text-xs text-sky-300">Actif</span>
+              ) : null}
+            </div>
+            <p className="mt-1 line-clamp-3 text-sm text-neutral-400">{preset.instruction}</p>
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
+            <Button variant="secondary" onClick={startEdit}>
               Modifier
             </Button>
             <Button variant="danger" onClick={onDelete}>
