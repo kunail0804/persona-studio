@@ -7,8 +7,12 @@ import { TextField } from "./TextField";
 
 interface ImagePanelProps {
   partyId: string;
+  /** Blocks composing and generating: the GPU is already busy. */
+  disabled?: boolean;
+  /** Why it is blocked, shown in place of the buttons. */
+  disabledReason?: string | null;
   /** Called once a generation has started, so the page reloads and the
-   * pending message appears in the story. */
+   * pending image appears in the gallery. */
   onGenerationStarted?: () => void;
 }
 
@@ -19,7 +23,12 @@ interface ImagePanelProps {
  * ComfyUI exactly as it is on screen, and the render continues in the
  * background while the player keeps playing.
  */
-export function ImagePanel({ partyId, onGenerationStarted }: ImagePanelProps) {
+export function ImagePanel({
+  partyId,
+  disabled = false,
+  disabledReason = null,
+  onGenerationStarted,
+}: ImagePanelProps) {
   const [instruction, setInstruction] = useState("");
   const [prompt, setPrompt] = useState("");
   const [composing, setComposing] = useState(false);
@@ -28,7 +37,7 @@ export function ImagePanel({ partyId, onGenerationStarted }: ImagePanelProps) {
 
   const compose = async () => {
     const request = instruction.trim();
-    if (!request || composing) return;
+    if (!request || composing || disabled) return;
     setComposing(true);
     setError(null);
     try {
@@ -43,7 +52,7 @@ export function ImagePanel({ partyId, onGenerationStarted }: ImagePanelProps) {
 
   const generate = async () => {
     const text = prompt.trim();
-    if (!text || starting) return;
+    if (!text || starting || disabled) return;
     setStarting(true);
     setError(null);
     try {
@@ -66,24 +75,35 @@ export function ImagePanel({ partyId, onGenerationStarted }: ImagePanelProps) {
             label="Ce que vous voulez voir"
             value={instruction}
             onChange={(e) => setInstruction(e.target.value)}
-            disabled={composing}
+            disabled={composing || disabled}
             placeholder="Ex.&nbsp;: Elena sur le quai au crépuscule, une lanterne bleue"
             className="flex-1"
           />
-          <Button onClick={() => void compose()} disabled={composing || !instruction.trim()}>
+          <Button
+            onClick={() => void compose()}
+            disabled={composing || disabled || !instruction.trim()}
+          >
             {composing ? "Composition…" : "Composer le prompt"}
           </Button>
         </div>
+        {/* One GPU: a diffusion pipeline loading while the narrator is
+            resident is an out-of-memory error, and two renders at once is
+            the same problem twice. The guard says which, rather than
+            greying out a button for no stated reason. */}
+        {disabled && disabledReason ? (
+          <p className="text-sm text-amber-400">{disabledReason}</p>
+        ) : null}
         {error ? <p className="text-sm text-red-400">{error}</p> : null}
         <TextArea
           label="Prompt"
           hint="Modifiez les mots-clés librement&nbsp;: c'est ce texte qui compte."
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
+          disabled={disabled}
           placeholder="Le prompt composé apparaîtra ici."
         />
         {prompt.trim() ? (
-          <Button onClick={() => void generate()} disabled={starting}>
+          <Button onClick={() => void generate()} disabled={starting || disabled}>
             {starting ? "Envoi…" : "Générer l'image"}
           </Button>
         ) : null}

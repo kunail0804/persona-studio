@@ -97,6 +97,27 @@ def _request_json(method: str, path: str, payload: dict[str, Any] | None = None)
         raise ComfyUIError(f"ComfyUI returned a non-JSON response: {response.text[:200]}") from exc
 
 
+# Same reasoning as `ollama.probe`: a status pill cannot wait on the
+# generous timeout a render needs.
+PROBE_TIMEOUT = httpx.Timeout(2.0, connect=2.0)
+
+
+def probe() -> str | None:
+    """None when ComfyUI answers, else why it did not.
+
+    `/queue` is the lightest endpoint that proves the server is up, and it is
+    read-only — this runs on a timer and must never disturb a render.
+    """
+    try:
+        with httpx.Client(base_url=COMFYUI_BASE_URL, timeout=PROBE_TIMEOUT) as client:
+            response = client.get("/queue")
+    except httpx.HTTPError as exc:
+        return f"ComfyUI is unreachable at {COMFYUI_BASE_URL}: {exc}"
+    if response.status_code >= 400:
+        return f"ComfyUI returned HTTP {response.status_code}"
+    return None
+
+
 def submit(graph: dict[str, Any]) -> str:
     """Queue a prepared graph and return the prompt id ComfyUI assigned it."""
     data = _request_json("POST", "/prompt", {"prompt": graph})

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any
 
 import httpx
@@ -8,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from persona_studio import db, ollama, settings
+from persona_studio.routes import settings as settings_routes
 
 
 @pytest.fixture(autouse=True)
@@ -340,3 +342,74 @@ def test_settings_round_trip_through_json_storage(client: TestClient) -> None:
     assert json.loads(raw[settings.NUM_CTX_KEY]) == 2048
     assert json.loads(raw[settings.ACTIVE_PERSONA_KEY]) == "abc123"
     assert json.loads(raw[settings.WORKFLOW_ACTIVE_KEY]) == "wf456"
+
+
+# --- Service status (V1.2) -------------------------------------------------------
+#
+# Two pills in the header. Until they existed you learned Ollama was down when
+# a turn failed, halfway through writing one.
+
+
+def test_status_reports_both_services_reachable(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings_routes.ollama, "probe", lambda: None)
+    monkeypatch.setattr(settings_routes.comfyui, "probe", lambda: None)
+
+    body = client.get("/api/status").json()
+
+    assert body == {
+        "ollama": {"reachable": True, "detail": None},
+        "comfyui": {"reachable": True, "detail": None},
+    }
+
+
+def test_status_carries_the_real_reason_for_each_failure(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The detail is what the pill's tooltip shows: "unreachable" alone sends
+    the reader to a terminal, which is the state this replaces."""
+    monkeypatch.setattr(settings_routes.ollama, "probe", lambda: "connection refused")
+    monkeypatch.setattr(settings_routes.comfyui, "probe", lambda: None)
+
+    body = client.get("/api/status").json()
+
+    assert body["ollama"] == {"reachable": False, "detail": "connection refused"}
+    assert body["comfyui"]["reachable"] is True
+
+
+def test_one_service_being_down_does_not_hide_the_other(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The two probes run concurrently and are independent: a failing one must
+    not take the other's answer with it."""
+    monkeypatch.setattr(settings_routes.ollama, "probe", lambda: "ollama est parti")
+    monkeypatch.setattr(settings_routes.comfyui, "probe", lambda: "comfyui aussi")
+
+    body = client.get("/api/status").json()
+
+    assert body["ollama"]["detail"] == "ollama est parti"
+    assert body["comfyui"]["detail"] == "comfyui aussi"
+
+
+def test_the_probes_run_at_the_same_time_not_one_after_the_other(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each probe has a two-second budget. Run in sequence the worst case is
+    four seconds of a header refresh; the route exists to make it two.
+
+    Measured rather than asserted about: both probes block on the same
+    barrier, and neither can pass it until the other has arrived.
+    """
+    barrier = threading.Barrier(2, timeout=5.0)
+
+    def blocking() -> str | None:
+        barrier.wait()
+        return None
+
+    monkeypatch.setattr(settings_routes.ollama, "probe", blocking)
+    monkeypatch.setattr(settings_routes.comfyui, "probe", blocking)
+
+    # Deadlocks if they are sequential: the first would wait for a second
+    # arrival that only comes after it returns.
+    assert client.get("/api/status").status_code == 200
