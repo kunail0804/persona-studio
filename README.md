@@ -6,9 +6,15 @@ the scenes on demand. Nothing leaves the machine.
 
 ## Status
 
-Being rebuilt from scratch. What runs today is the foundation: a FastAPI
-backend, a React front end, and a migrated SQLite schema. The features that make
-it playable are tracked in the [V1 — Playable core](../../milestone/1) milestone.
+Playable. [V1](../../releases/tag/v1.0.0) closed the sixteen issues of the
+[V1 — Playable core](../../milestone/1) milestone: scenarios and character
+sheets, a player persona, a narrator whose prompt and history window are
+explicit, streamed narration you can edit and regenerate without losing what
+was there, a rolling summary that gives a long party its memory, and scene
+images composed and generated through your own ComfyUI workflow.
+
+What it is not: a server. One machine, one player, no accounts, nothing
+leaving the host.
 
 ## Requirements
 

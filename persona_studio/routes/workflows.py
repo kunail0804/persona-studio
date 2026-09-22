@@ -1,5 +1,9 @@
-"""ComfyUI workflows: import an API-format graph export, pick from dropdowns
-where the prompt and the seed are injected, and keep exactly one active.
+"""ComfyUI workflows: import an API-format graph export, pick from a dropdown
+where the prompt is injected, and keep exactly one active.
+
+The prompt is the only thing this application writes into a graph. Seeds are
+the workflow's own business — see `workflows.prepare_graph` for why the
+application used to inject them and why it no longer does.
 
 The active workflow is a `setting`, exactly like the active persona. Every
 read path goes through `workflows.resolve_active`, which heals the choice on
@@ -37,10 +41,7 @@ class WorkflowOut(BaseModel):
     is_active: bool
     prompt_node: str
     prompt_field: str
-    seed_node: str
-    seed_field: str
     prompt_options: list[FieldOption]
-    seed_options: list[FieldOption]
     # Why nothing can be generated with this workflow, or None when it is
     # ready. Surfaced so the interface can say why, not just that.
     problem: str | None
@@ -56,8 +57,6 @@ class WorkflowPatch(BaseModel):
     name: str
     prompt_node: str = ""
     prompt_field: str = ""
-    seed_node: str = ""
-    seed_field: str = ""
 
 
 class ActiveWorkflowInput(BaseModel):
@@ -73,7 +72,6 @@ def _get_workflow_row(con: sqlite3.Connection, workflow_id: str) -> sqlite3.Row:
 
 def _workflow_item(row: sqlite3.Row, active_id: str | None) -> WorkflowOut:
     prompt_options: list[FieldOption] = []
-    seed_options: list[FieldOption] = []
     try:
         graph = workflows.parse_stored_graph(row["graph"])
     except workflows.InvalidWorkflow:
@@ -81,19 +79,17 @@ def _workflow_item(row: sqlite3.Row, active_id: str | None) -> WorkflowOut:
         # problem text below says why it is unusable.
         graph = None
     if graph is not None:
-        prompts, seeds = workflows.field_options(graph)
-        prompt_options = [FieldOption(node=o.node, field=o.field, label=o.label) for o in prompts]
-        seed_options = [FieldOption(node=o.node, field=o.field, label=o.label) for o in seeds]
+        prompt_options = [
+            FieldOption(node=o.node, field=o.field, label=o.label)
+            for o in workflows.field_options(graph)
+        ]
     return WorkflowOut(
         id=row["id"],
         name=row["name"],
         is_active=row["id"] == active_id,
         prompt_node=row["prompt_node"],
         prompt_field=row["prompt_field"],
-        seed_node=row["seed_node"],
-        seed_field=row["seed_field"],
         prompt_options=prompt_options,
-        seed_options=seed_options,
         problem=workflows.problem(row),
         created_at=row["created_at"],
     )
@@ -147,27 +143,15 @@ def update_workflow(workflow_id: str, body: WorkflowPatch) -> WorkflowOut:
         except workflows.InvalidWorkflow as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-        # The dropdowns can go stale between two tabs: reject a mapping that
+        # The dropdown can go stale between two tabs: reject a mapping that
         # names a node or field the graph does not offer, saying which.
-        for kind, node, field in (
-            ("prompt", body.prompt_node, body.prompt_field),
-            ("seed", body.seed_node, body.seed_field),
-        ):
-            message = workflows.check_mapping(graph, node=node, field=field, kind=kind)
-            if message is not None:
-                raise HTTPException(status_code=422, detail=message)
+        message = workflows.check_mapping(graph, node=body.prompt_node, field=body.prompt_field)
+        if message is not None:
+            raise HTTPException(status_code=422, detail=message)
 
         con.execute(
-            "UPDATE workflow SET name = ?, prompt_node = ?, prompt_field = ?, "
-            "seed_node = ?, seed_field = ? WHERE id = ?",
-            (
-                body.name,
-                body.prompt_node,
-                body.prompt_field,
-                body.seed_node,
-                body.seed_field,
-                workflow_id,
-            ),
+            "UPDATE workflow SET name = ?, prompt_node = ?, prompt_field = ? WHERE id = ?",
+            (body.name, body.prompt_node, body.prompt_field, workflow_id),
         )
         row = _get_workflow_row(con, workflow_id)
         # Default transaction is safe here: the UPDATE above already holds the

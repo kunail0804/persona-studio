@@ -69,10 +69,11 @@ def compose_image_prompt(party_id: str, body: ImagePromptInput) -> ImagePromptOu
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         model = _require_model(con)
         num_ctx = settings.get_num_ctx(con)
+        master_prompt = image_prompt.load_active_instruction(con)
     # The request arrives in the body, not the database: it fills the input
     # type here, once, and rides in both the call and the scrub below.
     inputs = replace(inputs, instruction=instruction)
-    messages = image_prompt.build_messages(inputs)
+    messages = image_prompt.build_messages(inputs, master_prompt)
     try:
         raw = ollama.chat(model, messages, num_ctx=num_ctx)
     except ollama.OllamaUnreachable as exc:

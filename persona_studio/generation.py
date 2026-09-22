@@ -44,7 +44,6 @@ refused submission deletes nothing but its own still-pending row.
 
 from __future__ import annotations
 
-import random
 import sqlite3
 import threading
 import time
@@ -82,7 +81,6 @@ class _Plan:
     gen_id: str
     prompt: str
     instruction: str
-    seed: int | None
 
 
 @dataclass(frozen=True)
@@ -148,18 +146,7 @@ def start(party_id: str, prompt: str, instruction: str) -> StartResult:
         # an HTTP call, and nothing in this project holds a SQLite connection
         # across one.
         narration_model = settings.get_llm_model(con)
-        # One seed drawn here and handed to `prepare_graph` is how the value
-        # recorded on the image row is guaranteed to be the one that was used,
-        # whatever the workflow maps.
-        #
-        # The draw itself needs no cryptographic strength: a seed is recorded
-        # on the image row and shown to the player, it is not a secret, so
-        # `random.randint` is not a real weakness. Switching to SystemRandom
-        # costs nothing here anyway — one os.urandom read per image, never in
-        # a loop — and it is cheaper than re-justifying the insecure-PRNG
-        # finding at every new occurrence.
-        seed = random.SystemRandom().randint(0, workflows.MAX_SEED)
-        graph = workflows.prepare_graph(row, prompt, seed=seed)
+        graph = workflows.prepare_graph(row, prompt)
         now = time.time()
         # The image's id is drawn here because the PNG will carry it, but the
         # `image` row itself is only inserted at completion: `message.image_id`
@@ -217,7 +204,6 @@ def start(party_id: str, prompt: str, instruction: str) -> StartResult:
         gen_id=gen_id,
         prompt=prompt,
         instruction=instruction,
-        seed=seed,
     )
     threading.Thread(
         target=_watch, args=(plan,), daemon=True, name=f"image-gen-{message_id}"
@@ -299,9 +285,9 @@ def _finish(plan: _Plan, *, done: bool, error: str | None = None, png: bytes | N
         if done:
             seconds = time.time() - row["started_at"] if row["started_at"] is not None else None
             con.execute(
-                "INSERT INTO image (id, prompt, instruction, seed, seconds, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (plan.image_id, plan.prompt, plan.instruction, plan.seed, seconds, time.time()),
+                "INSERT INTO image (id, prompt, instruction, seconds, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (plan.image_id, plan.prompt, plan.instruction, seconds, time.time()),
             )
             con.execute(
                 "UPDATE message SET status = 'done', image_id = ?, error = NULL WHERE id = ?",

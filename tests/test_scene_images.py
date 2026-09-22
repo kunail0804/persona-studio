@@ -530,7 +530,6 @@ def test_a_result_whose_gen_id_moved_on_is_discarded(client: TestClient, monkeyp
         gen_id="a-different-job",
         prompt=PROMPT,
         instruction=INSTRUCTION,
-        seed=1,
     )
     assert generation._finish(stale, done=True, png=b"late bytes") is False
     assert _image_messages(party_id)[0]["status"] == "pending"
@@ -542,7 +541,6 @@ def test_a_result_whose_gen_id_moved_on_is_discarded(client: TestClient, monkeyp
         gen_id="whatever",
         prompt=PROMPT,
         instruction=INSTRUCTION,
-        seed=1,
     )
     assert generation._finish(orphan, done=True, png=b"x") is False
 
@@ -1037,7 +1035,6 @@ def test_a_completed_render_writes_everything_and_bumps_updated_at(
     assert image is not None
     assert image["prompt"] == PROMPT
     assert image["instruction"] == INSTRUCTION
-    assert isinstance(image["seed"], int)
     assert image["seconds"] is not None and image["seconds"] > 0
     assert updated_at > updated_at_before
 

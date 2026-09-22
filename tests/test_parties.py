@@ -2081,3 +2081,121 @@ def test_an_edit_landing_during_a_regeneration_keeps_both_texts(
     assert edited in archived, "the edit was lost"
     assert _message_content(message_id) == "Nouvelle ouverture."
     _assert_invariant(message_id)
+
+
+# --- Reading the prompt, and correcting the memory (V1.1) -------------------------
+
+
+def test_the_prompt_view_is_what_a_turn_would_actually_send(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    """The point of the view is that it cannot drift from the real call, so
+    this compares it against the messages a played turn hands the model —
+    captured from the stream stub rather than rebuilt by the test."""
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+
+    view = client.get(f"/api/parties/{party_id}/prompt")
+    assert view.status_code == 200
+    blocks = view.json()["blocks"]
+
+    calls = _stub_chat_stream(monkeypatch, replies=["Le quai s'éveille."])
+    assert _send_turn(client, party_id, "J'avance.").status_code == 200
+
+    # The turn adds the player's own message; everything before it must match
+    # what the view showed, block for block.
+    sent = calls[0]["messages"]
+    assert [(b["role"], b["content"]) for b in blocks] == [
+        (m["role"], m["content"]) for m in sent[:-1]
+    ]
+    assert sent[-1]["content"] == "J'avance."
+
+
+def test_each_prompt_block_carries_its_own_estimate(client: TestClient, monkeypatch: Any) -> None:
+    scenario_id = _create_scenario(client)
+    party_id = _create_party(client, scenario_id, monkeypatch)["id"]
+
+    body = client.get(f"/api/parties/{party_id}/prompt").json()
+
+    assert body["blocks"], "the system prompt alone is already a block"
+    assert all(block["estimated_tokens"] > 0 for block in body["blocks"])
+    # The whole is the sum of its parts: the same estimator runs on each block
+    # and on the list, so a reader can trust the arithmetic on screen.
+    assert body["context"]["estimated_tokens"] == sum(
+        block["estimated_tokens"] for block in body["blocks"]
+    )
+    assert body["context"]["num_ctx"] == 4096
+
+
+def test_the_prompt_view_of_an_unknown_party_is_404(client: TestClient) -> None:
+    assert client.get("/api/parties/does-not-exist/prompt").status_code == 404
+
+
+def test_correcting_the_summary_reaches_the_narrator(client: TestClient, monkeypatch: Any) -> None:
+    """A bad summary used to be permanent: the panel was read-only, and every
+    later turn read the wrong text. The corrected one must be what the next
+    prompt carries."""
+    party_id, ids, frontier = _prepare_covered_party(client, monkeypatch)
+
+    response = client.patch(
+        f"/api/parties/{party_id}/memory",
+        json={"summary_text": "Le héros a quitté le port pour la crypte."},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["summary_text"] == "Le héros a quitté le port pour la crypte."
+    blocks = client.get(f"/api/parties/{party_id}/prompt").json()["blocks"]
+    assert "Le héros a quitté le port pour la crypte." in blocks[0]["content"]
+    # The frontier does not move: this rewrites what the summary says, never
+    # how much of the story it stands for.
+    assert _summary_state(party_id)[1] == frontier
+    assert ids  # the party really had messages behind the frontier
+
+
+def test_correcting_the_world_state_stores_an_object(client: TestClient, monkeypatch: Any) -> None:
+    party_id, _, _ = _prepare_covered_party(client, monkeypatch)
+
+    response = client.patch(
+        f"/api/parties/{party_id}/memory",
+        json={"world_state": {"location": "crypte", "present": ["le guide"]}},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["world_state"] == {"location": "crypte", "present": ["le guide"]}
+    assert json.loads(_summary_state(party_id)[2]) == {
+        "location": "crypte",
+        "present": ["le guide"],
+    }
+
+
+def test_a_memory_patch_writes_only_what_it_carried(client: TestClient, monkeypatch: Any) -> None:
+    party_id, _, _ = _prepare_covered_party(client, monkeypatch)
+
+    client.patch(f"/api/parties/{party_id}/memory", json={"summary_text": "Corrigé."})
+
+    text, _, world = _summary_state(party_id)
+    assert text == "Corrigé."
+    assert json.loads(world) == {"location": "port"}, "the world state was wiped by an edit"
+
+
+def test_a_memory_patch_refuses_an_unknown_key_and_a_bad_world_state(
+    client: TestClient, monkeypatch: Any
+) -> None:
+    party_id, _, _ = _prepare_covered_party(client, monkeypatch)
+
+    assert (
+        client.patch(f"/api/parties/{party_id}/memory", json={"summry_text": "x"}).status_code
+        == 422
+    )
+    # A list is not a world state: the summariser's own shape is an object.
+    assert (
+        client.patch(f"/api/parties/{party_id}/memory", json={"world_state": []}).status_code == 422
+    )
+    assert _summary_state(party_id)[0] == "Le héros entre dans le port."
+
+
+def test_correcting_the_memory_of_an_unknown_party_is_404(client: TestClient) -> None:
+    assert (
+        client.patch("/api/parties/does-not-exist/memory", json={"summary_text": "x"}).status_code
+        == 404
+    )

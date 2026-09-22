@@ -25,7 +25,7 @@ DATA_DIR = Path(os.environ.get("PS_DATA", Path(__file__).resolve().parent.parent
 DB_PATH = DATA_DIR / "studio.db"
 IMAGES_DIR = DATA_DIR / "images"
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 
 def _configure(con: sqlite3.Connection) -> None:
@@ -251,6 +251,43 @@ MIGRATIONS: list[str] = [
         VALUES ('delete', old.id, old.content);
         INSERT INTO message_fts(rowid, content) VALUES (new.id, new.content);
     END;
+    """,
+    # --- v2 : la graine sort de l'application -------------------------------
+    #
+    # Le format API de ComfyUI ne rejoue pas le « randomize » de son interface
+    # web : c'est une fonction du navigateur, absente du graphe exporté. Tant
+    # que l'application injectait une graine, elle compensait ça. Ce n'est plus
+    # son travail — le workflow gère ses graines lui-même — donc le mapping
+    # n'a plus de sens et la valeur enregistrée sur une image ne désigne plus
+    # rien que l'application ait choisi.
+    #
+    # `image.seed` part avec : une graine qu'on ne peut plus rejouer n'est pas
+    # un souvenir, c'est une colonne morte. Les valeurs déjà écrites sont dans
+    # la copie prise avant la migration.
+    """
+    ALTER TABLE workflow DROP COLUMN seed_node;
+    ALTER TABLE workflow DROP COLUMN seed_field;
+    ALTER TABLE image    DROP COLUMN seed;
+    """,
+    # --- v3 : le master prompt de composition d'image devient une donnée ----
+    #
+    # L'instruction envoyée au modèle qui compose un prompt d'image était une
+    # constante du code, écrite pour Stable Diffusion : « une courte liste de
+    # mots-clés anglais séparés par des virgules ». C'est une grammaire, pas
+    # un détail de ton, et un autre modèle d'image en veut une autre. Elle
+    # devient donc un préset nommé, choisi dans les réglages.
+    #
+    # Aucune ligne n'est créée ici : sans préset actif, la composition utilise
+    # `image_prompt.DEFAULT_INSTRUCTION`, qui est exactement le texte d'avant.
+    # Une base existante se comporte donc à l'identique jusqu'à ce que
+    # l'utilisateur en crée un.
+    """
+    CREATE TABLE image_preset (
+        id          TEXT PRIMARY KEY,
+        name        TEXT NOT NULL DEFAULT '',
+        instruction TEXT NOT NULL DEFAULT '',
+        created_at  REAL NOT NULL
+    );
     """,
 ]
 

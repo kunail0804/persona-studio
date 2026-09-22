@@ -4,11 +4,13 @@ import { ApiError } from "../api/client";
 import {
   editMessage,
   getParty,
+  getPartyPrompt,
   regenerateMessage,
   sendTurn,
   setMessageVariant,
+  updatePartyMemory,
 } from "../api/parties";
-import type { Party, PartyMessage, TurnEvent } from "../api/parties";
+import type { Party, PartyMessage, PromptView, TurnEvent } from "../api/parties";
 import { cancelImageGeneration } from "../api/images";
 import { Narration } from "../components/Narration";
 import { Button } from "../components/Button";
@@ -166,6 +168,20 @@ export function PartyPage() {
     [id],
   );
 
+  const saveMemory = useCallback(
+    async (memory: { summaryText?: string; worldState?: Record<string, unknown> }) => {
+      if (!id) return;
+      try {
+        setParty(await updatePartyMemory(id, memory));
+        setError(null);
+      } catch (err) {
+        setError(messageFor(err, "Impossible d'enregistrer la mémoire."));
+        throw err;
+      }
+    },
+    [id],
+  );
+
   const cancelImage = useCallback(
     async (messageId: number) => {
       if (!id) return;
@@ -291,36 +307,8 @@ export function PartyPage() {
         <p className="text-sm text-neutral-500">Scénario&nbsp;: {party.scenarioTitle}</p>
       </div>
       {error ? <p className="text-sm text-red-400">{error}</p> : null}
-      <details className="rounded-lg border border-neutral-800 bg-neutral-900 p-4 text-sm">
-        <summary className="cursor-pointer text-neutral-400 select-none">
-          Résumé et état du monde
-        </summary>
-        <div className="mt-3 flex flex-col gap-3">
-          <div>
-            <p className="text-xs font-medium uppercase tracking-wide text-neutral-500">Résumé</p>
-            {party.summaryText ? (
-              <p className="mt-1 whitespace-pre-wrap text-neutral-300">{party.summaryText}</p>
-            ) : (
-              <p className="mt-1 text-neutral-500">
-                Aucun résumé pour l'instant — il apparaît quand l'histoire dépasse la fenêtre de
-                mémoire.
-              </p>
-            )}
-          </div>
-          <div>
-            <p className="text-xs font-medium uppercase tracking-wide text-neutral-500">
-              État du monde
-            </p>
-            {Object.keys(party.worldState).length > 0 ? (
-              <pre className="mt-1 overflow-x-auto whitespace-pre-wrap text-neutral-300">
-                {JSON.stringify(party.worldState, null, 2)}
-              </pre>
-            ) : (
-              <p className="mt-1 text-neutral-500">Aucun état établi pour l'instant.</p>
-            )}
-          </div>
-        </div>
-      </details>
+      <MemoryPanel party={party} onSave={saveMemory} />
+      <PromptPanel partyId={party.id} />
       {party.messages.length === 0 && pending === null ? (
         <p className="text-neutral-500">Aucun message pour l'instant.</p>
       ) : null}
@@ -576,5 +564,189 @@ function StreamingBubble({ text }: { text: string }) {
       <p className="text-xs font-medium uppercase tracking-wide text-neutral-500">Narration</p>
       <Narration text={text} />
     </li>
+  );
+}
+
+
+interface MemoryPanelProps {
+  party: Party;
+  onSave: (memory: { summaryText?: string; worldState?: Record<string, unknown> }) => Promise<void>;
+}
+
+/**
+ * The rolling summary and the world state, editable. The summariser is a
+ * local model compressing a transcript and it gets things wrong; until this
+ * was editable, a bad summary stayed wrong for the rest of the party and
+ * every later turn read it.
+ */
+function MemoryPanel({ party, onSave }: MemoryPanelProps) {
+  const [editing, setEditing] = useState(false);
+  const [summary, setSummary] = useState("");
+  const [worldState, setWorldState] = useState("");
+  const [jsonError, setJsonError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const startEdit = () => {
+    setSummary(party.summaryText);
+    setWorldState(JSON.stringify(party.worldState, null, 2));
+    setJsonError(null);
+    setEditing(true);
+  };
+
+  const save = async () => {
+    let parsed: Record<string, unknown>;
+    try {
+      // An empty box means an empty state, not a parse error.
+      parsed = worldState.trim() ? (JSON.parse(worldState) as Record<string, unknown>) : {};
+    } catch {
+      setJsonError("L'état du monde doit être un objet JSON valide.");
+      return;
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      setJsonError("L'état du monde doit être un objet JSON, pas une liste ni une valeur seule.");
+      return;
+    }
+    setSaving(true);
+    try {
+      await onSave({ summaryText: summary, worldState: parsed });
+      setEditing(false);
+    } catch {
+      // The page shows the reason; the editor stays open on the draft.
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <details className="rounded-lg border border-neutral-800 bg-neutral-900 p-4 text-sm">
+      <summary className="cursor-pointer text-neutral-400 select-none">
+        Résumé et état du monde
+      </summary>
+      {editing ? (
+        <div className="mt-3 flex flex-col gap-3">
+          <TextArea
+            label="Résumé"
+            value={summary}
+            onChange={(event) => setSummary(event.target.value)}
+            disabled={saving}
+            rows={6}
+            hint="Ce que le narrateur lit à la place des messages les plus anciens."
+          />
+          <TextArea
+            label="État du monde (JSON)"
+            value={worldState}
+            onChange={(event) => setWorldState(event.target.value)}
+            disabled={saving}
+            rows={8}
+            hint="Un objet JSON. Corriger un lieu ou un fait ici le corrige pour tous les tours suivants."
+          />
+          {jsonError ? <p className="text-red-400">{jsonError}</p> : null}
+          <div className="flex gap-2">
+            <Button onClick={() => void save()} disabled={saving}>
+              Enregistrer
+            </Button>
+            <Button variant="secondary" onClick={() => setEditing(false)} disabled={saving}>
+              Annuler
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <div className="mt-3 flex flex-col gap-3">
+          <div>
+            <p className="text-xs font-medium uppercase tracking-wide text-neutral-500">Résumé</p>
+            {party.summaryText ? (
+              <p className="mt-1 whitespace-pre-wrap text-neutral-300">{party.summaryText}</p>
+            ) : (
+              <p className="mt-1 text-neutral-500">
+                Aucun résumé pour l'instant — il apparaît quand l'histoire dépasse la fenêtre de
+                mémoire.
+              </p>
+            )}
+          </div>
+          <div>
+            <p className="text-xs font-medium uppercase tracking-wide text-neutral-500">
+              État du monde
+            </p>
+            {Object.keys(party.worldState).length > 0 ? (
+              <pre className="mt-1 overflow-x-auto whitespace-pre-wrap text-neutral-300">
+                {JSON.stringify(party.worldState, null, 2)}
+              </pre>
+            ) : (
+              <p className="mt-1 text-neutral-500">Aucun état établi pour l'instant.</p>
+            )}
+          </div>
+          <div>
+            <Button variant="secondary" className="text-xs" onClick={startEdit}>
+              Corriger la mémoire
+            </Button>
+          </div>
+        </div>
+      )}
+    </details>
+  );
+}
+
+/**
+ * Exactly what the next turn would send the narrator. Loaded on demand rather
+ * than with the party: it is a debugging view, and assembling it costs a
+ * scenario and a history read.
+ */
+function PromptPanel({ partyId }: { partyId: string }) {
+  const [view, setView] = useState<PromptView | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      setView(await getPartyPrompt(partyId));
+      setError(null);
+    } catch (err) {
+      setError(messageFor(err, "Impossible de lire le prompt."));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <details
+      className="rounded-lg border border-neutral-800 bg-neutral-900 p-4 text-sm"
+      onToggle={(event) => {
+        if (event.currentTarget.open && view === null && !loading) void load();
+      }}
+    >
+      <summary className="cursor-pointer text-neutral-400 select-none">
+        Prompt envoyé au narrateur
+      </summary>
+      <div className="mt-3 flex flex-col gap-3">
+        {error ? <p className="text-red-400">{error}</p> : null}
+        {view === null ? (
+          <p className="text-neutral-500">{loading ? "Chargement…" : "—"}</p>
+        ) : (
+          <>
+            <p className="text-neutral-400">
+              {view.context.estimatedTokens.toLocaleString("fr-FR")} jetons estimés sur{" "}
+              {view.context.numCtx.toLocaleString("fr-FR")}, en {view.blocks.length} blocs. Au-delà
+              de la fenêtre, Ollama coupe par le début — le bloc système en premier.
+            </p>
+            {view.blocks.map((block, index) => (
+              <div key={index} className="rounded border border-neutral-800 p-2">
+                <p className="text-xs font-medium uppercase tracking-wide text-neutral-500">
+                  {block.role} · {block.estimatedTokens.toLocaleString("fr-FR")} jetons
+                </p>
+                <pre className="mt-1 overflow-x-auto whitespace-pre-wrap text-neutral-300">
+                  {block.content}
+                </pre>
+              </div>
+            ))}
+            <div>
+              <Button variant="secondary" className="text-xs" onClick={() => void load()}>
+                Rafraîchir
+              </Button>
+            </div>
+          </>
+        )}
+      </div>
+    </details>
   );
 }

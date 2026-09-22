@@ -30,6 +30,7 @@ NUM_CTX_KEY = "llm.num_ctx"
 HISTORY_WINDOW_KEY = "narrator.history_window"
 ACTIVE_PERSONA_KEY = "persona.active_id"
 WORKFLOW_ACTIVE_KEY = "workflow.active_id"
+IMAGE_PRESET_ACTIVE_KEY = "image_prompt.active_preset_id"
 
 
 def _read(con: sqlite3.Connection, key: str) -> Any:
@@ -118,3 +119,16 @@ def set_active_workflow_id(con: sqlite3.Connection, workflow_id: str | None) -> 
         _clear(con, WORKFLOW_ACTIVE_KEY)
     else:
         _write(con, WORKFLOW_ACTIVE_KEY, workflow_id)
+
+
+def get_active_image_preset_id(con: sqlite3.Connection) -> str | None:
+    """The chosen image-prompt preset, or None. None means the built-in text."""
+    value = _read(con, IMAGE_PRESET_ACTIVE_KEY)
+    return value if isinstance(value, str) and value else None
+
+
+def set_active_image_preset_id(con: sqlite3.Connection, preset_id: str | None) -> None:
+    if preset_id is None:
+        _clear(con, IMAGE_PRESET_ACTIVE_KEY)
+    else:
+        _write(con, IMAGE_PRESET_ACTIVE_KEY, preset_id)
