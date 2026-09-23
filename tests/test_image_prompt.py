@@ -27,7 +27,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from persona_studio import db, settings
-from persona_studio.image_prompt import Appearance, ImagePromptInputs, build_messages, scrub_names
+from persona_studio.image_prompt import (
+    CONTENT_RULES,
+    Appearance,
+    ImagePromptInputs,
+    build_messages,
+    scrub_names,
+)
 from persona_studio.ollama import OllamaError, OllamaUnreachable
 from persona_studio.routes import images as images_routes
 
@@ -290,7 +296,26 @@ def test_the_system_message_asks_for_english_keywords_that_keep_the_details() ->
     rules = build_messages(INPUTS)[0]["content"]
     assert "English keywords" in rules
     assert "Never drop a detail" in rules
-    assert "never by name" in rules
+    assert "Never write a proper name" in rules
+
+
+def test_the_content_rules_ride_after_any_preset() -> None:
+    """The preset decides how to write the prompt; the application decides
+    what must never appear in it. A preset that forgets the rules — or never
+    had them — cannot lose them: they are appended, not part of its text."""
+    messages = build_messages(INPUTS, "Write one sentence of English prose.")
+    system = messages[0]["content"]
+
+    assert system.startswith("Write one sentence of English prose.")
+    assert system.endswith(CONTENT_RULES)
+
+
+def test_the_content_rules_cover_real_landmarks() -> None:
+    """The user's rule is about the final prompt: no proper name at all, real
+    places included. A landmark is on no list the scrub could check, so this
+    is the only line of defence it has — a request, not a guarantee."""
+    assert "landmark" in CONTENT_RULES
+    assert "never by what it is called" in CONTENT_RULES
 
 
 def test_no_active_persona_still_composes() -> None:
@@ -372,6 +397,9 @@ def _seed_party(
                 "INSERT INTO persona (id, name, appearance, created_at) VALUES (?, ?, ?, ?)",
                 (persona_id, ASH.name, ASH.appearance, 0.0),
             )
+            # The party carries its own protagonist since schema v4; the
+            # global setting only chooses the default of a new party.
+            con.execute("UPDATE instance SET persona_id = ? WHERE id = ?", (persona_id, party_id))
             settings.set_active_persona_id(con, persona_id)
         else:
             # The persona setting lives in the one SQLite file the whole
@@ -574,3 +602,64 @@ def _nothing_written(party_id: str) -> bool:
             "SELECT COUNT(*) FROM message WHERE instance_id = ?", (party_id,)
         ).fetchone()[0]
     return images == 0 and messages == 1
+
+
+# --- Places (V1.3) -----------------------------------------------------------------
+#
+# The user's rule is about the final prompt: no proper name reaches the image
+# model, a place's included. A place of the scenario is on a list, so its name
+# can be driven out deterministically — replaced by its visual description,
+# the same way a character's appearance replaces theirs.
+
+CATHEDRAL = Appearance(name="La Cathédrale", appearance="a half-sunken gothic nave, green light")
+
+
+def test_a_place_name_becomes_its_description() -> None:
+    inputs = replace_instruction(INPUTS, places=(CATHEDRAL,))
+
+    prompt = scrub_names("dusk inside La Cathédrale, candles", inputs)
+
+    assert "Cathédrale" not in prompt
+    assert CATHEDRAL.appearance in prompt
+    assert "candles" in prompt
+
+
+def test_a_place_description_that_names_a_character_is_cleaned_first() -> None:
+    """The same guarantee characters have: a description is cleaned of every
+    known name before it replaces one, so no substitution can bring a name
+    back in."""
+    crypt = Appearance(name="La Crypte", appearance="Elena's crypt, low vaults")
+    inputs = replace_instruction(INPUTS, places=(crypt,))
+
+    prompt = scrub_names("La Crypte at night", inputs)
+
+    assert "Elena" not in prompt
+    assert "La Crypte" not in prompt
+    assert "low vaults" in prompt
+
+
+def test_the_composer_is_told_what_each_place_looks_like() -> None:
+    inputs = replace_instruction(INPUTS, places=(CATHEDRAL,))
+    scene = build_messages(inputs)[-1]["content"]
+    assert "Places:" in scene
+    assert CATHEDRAL.appearance in scene
+
+
+def test_the_party_persona_is_the_one_drawn(client: TestClient, monkeypatch: Any) -> None:
+    """Since schema v4 the image shows the protagonist this party is played
+    as, not whichever persona is the default for new parties."""
+    party_id = _seed_party()
+    with db.connect() as con:
+        other = uuid.uuid4().hex
+        con.execute(
+            "INSERT INTO persona (id, name, appearance, created_at) VALUES (?, 'Bea', ?, 0)",
+            (other, "Short black hair, a scar across the chin."),
+        )
+        settings.set_active_persona_id(con, other)
+    calls = _stub_chat(monkeypatch, reply="a figure on the quay")
+
+    assert _compose(client, party_id).status_code == 200
+
+    scene = calls[0]["messages"][-1]["content"]
+    assert ASH.appearance in scene
+    assert "a scar across the chin" not in scene

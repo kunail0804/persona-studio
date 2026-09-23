@@ -12,8 +12,10 @@ from .routes import (
     characters,
     image_presets,
     images,
+    lore,
     parties,
     personas,
+    places,
     scenarios,
     settings,
     workflows,
@@ -43,6 +45,8 @@ app = FastAPI(title="Persona Studio", lifespan=lifespan)
 
 app.include_router(scenarios.router, prefix="/api")
 app.include_router(characters.router, prefix="/api")
+app.include_router(places.router, prefix="/api")
+app.include_router(lore.router, prefix="/api")
 app.include_router(personas.router, prefix="/api")
 app.include_router(parties.router, prefix="/api")
 app.include_router(images.router, prefix="/api")

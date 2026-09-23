@@ -16,6 +16,9 @@ import { Button } from "../components/Button";
 import { CharacterForm } from "../components/CharacterForm";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { TextArea } from "../components/TextArea";
+import { LoreSection, PlacesSection } from "../components/WorldSections";
+import type { LoreEntry, Place } from "../api/world";
+import { listLore, listPlaces } from "../api/world";
 import { TextField } from "../components/TextField";
 
 function messageFor(error: unknown, fallback: string): string {
@@ -28,6 +31,8 @@ export function ScenarioEditorPage() {
 
   const [scenario, setScenario] = useState<Scenario | null>(null);
   const [characters, setCharacters] = useState<Character[]>([]);
+  const [places, setPlaces] = useState<Place[]>([]);
+  const [lore, setLore] = useState<LoreEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [title, setTitle] = useState("");
   const [synopsis, setSynopsis] = useState("");
@@ -42,9 +47,11 @@ export function ScenarioEditorPage() {
 
   const load = useCallback(async (scenarioId: string, signal?: AbortSignal) => {
     try {
-      const [scenarioData, characterData] = await Promise.all([
+      const [scenarioData, characterData, placeData, loreData] = await Promise.all([
         getScenario(scenarioId, signal),
         listCharacters(scenarioId, signal),
+        listPlaces(scenarioId, signal),
+        listLore(scenarioId, signal),
       ]);
       setScenario(scenarioData);
       setTitle(scenarioData.title);
@@ -52,6 +59,8 @@ export function ScenarioEditorPage() {
       setWorldRules(scenarioData.worldRules);
       setArcs(scenarioData.arcs);
       setCharacters(characterData);
+      setPlaces(placeData);
+      setLore(loreData);
       setError(null);
     } catch (err) {
       // A stale request aborted by the effect cleanup below, because `id`
@@ -256,6 +265,20 @@ export function ScenarioEditorPage() {
           ))}
         </ul>
       </section>
+
+      <PlacesSection
+        scenarioId={scenarioId}
+        places={places}
+        onChanged={() => load(scenarioId)}
+        onError={setError}
+      />
+
+      <LoreSection
+        scenarioId={scenarioId}
+        entries={lore}
+        onChanged={() => load(scenarioId)}
+        onError={setError}
+      />
 
       <ConfirmDialog
         open={confirmDeleteScenario}

@@ -25,7 +25,7 @@ DATA_DIR = Path(os.environ.get("PS_DATA", Path(__file__).resolve().parent.parent
 DB_PATH = DATA_DIR / "studio.db"
 IMAGES_DIR = DATA_DIR / "images"
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _configure(con: sqlite3.Connection) -> None:
@@ -287,6 +287,29 @@ MIGRATIONS: list[str] = [
         name        TEXT NOT NULL DEFAULT '',
         instruction TEXT NOT NULL DEFAULT '',
         created_at  REAL NOT NULL
+    );
+    """,
+    # --- v4 : une persona par partie ----------------------------------------
+    #
+    # La persona active était un réglage global : deux parties en cours ne
+    # pouvaient pas avoir deux protagonistes différents. Chaque partie porte
+    # désormais la sienne ; le réglage global devient le choix par défaut
+    # d'une nouvelle partie.
+    #
+    # La colonne existe depuis la v1 (`instance.persona_id`, `ON DELETE SET
+    # NULL`) mais rien ne l'avait jamais écrite : cette migration ne crée
+    # rien, elle la remplit. Les parties existantes reçoivent la persona
+    # active au moment de la migration — celle qu'elles jouaient déjà, donc
+    # rien ne change pour elles. La sous-requête ne retient qu'un identifiant
+    # qui existe vraiment dans `persona` : un réglage pendant vers une persona
+    # supprimée laisse la colonne à NULL au lieu de faire échouer la migration
+    # sur la clé étrangère.
+    """
+    UPDATE instance SET persona_id = (
+        SELECT persona.id FROM persona
+        WHERE persona.id = (
+            SELECT json_extract(value, '$') FROM setting WHERE key = 'persona.active_id'
+        )
     );
     """,
 ]
