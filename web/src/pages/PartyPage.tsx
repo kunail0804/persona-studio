@@ -426,12 +426,18 @@ export function PartyPage() {
         ) : null}
       </div>
 
-      <FloatingActions
-        targetRef={endRef}
-        imagesLabel={imagesButtonLabel(showImages, images.length)}
-        imagesOpen={showImages}
-        onToggleImages={() => setShowImages((open) => !open)}
-      />
+      <button
+        type="button"
+        onClick={() => setShowImages((open) => !open)}
+        aria-pressed={showImages}
+        // Fixed just under the sticky site header: the gallery belongs to the
+        // top of the page, but opening it must not require scrolling back up
+        // through a long story.
+        className={`fixed right-6 top-20 z-30 ${floatingButtonClasses}`}
+      >
+        {imagesButtonLabel(showImages, images.length)}
+      </button>
+      <ScrollToBottomButton targetRef={endRef} />
 
       <ConfirmDialog
         open={confirmDeleteImageId !== null}
@@ -460,61 +466,39 @@ function imagesButtonLabel(open: boolean, count: number): string {
   return count > 0 ? `Images (${count})` : "Images";
 }
 
-interface FloatingActionsProps {
-  targetRef: React.RefObject<HTMLDivElement | null>;
-  imagesLabel: string;
-  imagesOpen: boolean;
-  onToggleImages: () => void;
-}
-
 const floatingButtonClasses =
   "rounded-full border border-neutral-700 bg-neutral-900/95 px-3 py-2 text-sm text-neutral-200 shadow-lg backdrop-blur hover:bg-neutral-800";
 
 /**
- * The party's two controls that must stay in reach however far the
- * transcript is scrolled, stacked in one column at the bottom right.
- *
- * The images toggle is always there: it used to sit in the party header, so
- * opening the gallery meant scrolling back to the top of a long story. The
- * jump-to-end button appears only while the end is off screen — a button
- * that does nothing when you are already there is noise.
+ * A floating button that jumps to the end of the transcript, shown only when
+ * the end is off screen — a button that does nothing when you are already
+ * there is noise.
  */
-function FloatingActions({ targetRef, imagesLabel, imagesOpen, onToggleImages }: FloatingActionsProps) {
-  const [endOffScreen, setEndOffScreen] = useState(false);
+function ScrollToBottomButton({ targetRef }: { targetRef: React.RefObject<HTMLDivElement | null> }) {
+  const [visible, setVisible] = useState(false);
 
   useEffect(() => {
     const target = targetRef.current;
     if (target === null) return;
     const observer = new IntersectionObserver(
-      ([entry]) => setEndOffScreen(!entry.isIntersecting),
+      ([entry]) => setVisible(!entry.isIntersecting),
       { rootMargin: "0px 0px -80px 0px" },
     );
     observer.observe(target);
     return () => observer.disconnect();
   }, [targetRef]);
 
+  if (!visible) return null;
   return (
-    <div className="fixed bottom-6 right-6 z-30 flex flex-col items-end gap-2">
-      <button
-        type="button"
-        onClick={onToggleImages}
-        aria-pressed={imagesOpen}
-        className={floatingButtonClasses}
-      >
-        {imagesLabel}
-      </button>
-      {endOffScreen ? (
-        <button
-          type="button"
-          onClick={() => targetRef.current?.scrollIntoView({ behavior: "smooth" })}
-          aria-label="Aller en bas de la partie"
-          title="Aller en bas"
-          className={floatingButtonClasses}
-        >
-          ↓
-        </button>
-      ) : null}
-    </div>
+    <button
+      type="button"
+      onClick={() => targetRef.current?.scrollIntoView({ behavior: "smooth" })}
+      aria-label="Aller en bas de la partie"
+      title="Aller en bas"
+      className={`fixed bottom-6 right-6 z-30 ${floatingButtonClasses}`}
+    >
+      ↓
+    </button>
   );
 }
 
