@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { createPortal } from "react-dom";
 
 interface LightboxProps {
   src: string;
@@ -16,6 +17,13 @@ interface LightboxProps {
  * without a mouse. The image sits above the backdrop as a sibling, so a click
  * on the image lands on the image and does not close anything; no
  * `stopPropagation` is needed to make that true.
+ *
+ * Rendered into `document.body` through a portal, not where it is declared.
+ * The image panel it opens from has a `backdrop-filter`, and an ancestor with
+ * a filter becomes the containing block of every `position: fixed`
+ * descendant — so `inset-0` meant "the panel", and the full-screen viewer
+ * filled only the panel. A portal makes the viewport its only reference,
+ * whatever CSS a future parent carries.
  */
 export function Lightbox({ src, alt, onClose }: LightboxProps) {
   useEffect(() => {
@@ -32,7 +40,7 @@ export function Lightbox({ src, alt, onClose }: LightboxProps) {
     };
   }, [onClose]);
 
-  return (
+  return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <button
         type="button"
@@ -49,6 +57,7 @@ export function Lightbox({ src, alt, onClose }: LightboxProps) {
       >
         ✕
       </button>
-    </div>
+    </div>,
+    document.body,
   );
 }
