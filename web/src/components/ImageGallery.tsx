@@ -127,12 +127,21 @@ function GalleryItem({ image, onZoom, onCancel, onDelete }: GalleryItemProps) {
       // `group` is what makes the controls appear on hover only: the image is
       // the subject, the buttons are not.
       <li className="group relative overflow-hidden rounded-lg border border-neutral-800 bg-neutral-900">
-        <img
-          src={`/api/images/${image.imageId}/file`}
-          alt={image.content || "Image de la scène"}
-          className="w-full cursor-zoom-in"
+        {/* The image is the zoom target, so it is wrapped in a button: an
+            <img> with a click handler can be clicked but never reached or
+            activated from a keyboard. */}
+        <button
+          type="button"
           onClick={onZoom}
-        />
+          aria-label="Afficher l'image en plein écran"
+          className="block w-full cursor-zoom-in"
+        >
+          <img
+            src={`/api/images/${image.imageId}/file`}
+            alt={image.content || "Image de la scène"}
+            className="w-full"
+          />
+        </button>
         <div className="pointer-events-none absolute inset-x-0 top-0 flex justify-end gap-1 p-2 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
           <button
             type="button"

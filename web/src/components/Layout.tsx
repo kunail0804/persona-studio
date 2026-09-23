@@ -79,15 +79,20 @@ interface ServicePillProps {
   onClick: () => void;
 }
 
+function pillColour(state: ServicePillProps["state"]): string {
+  if (state === null) return "bg-neutral-600";
+  return state.reachable ? "bg-emerald-500" : "bg-red-500";
+}
+
+function pillTitle(label: string, state: ServicePillProps["state"]): string {
+  if (state === null) return `${label} : état inconnu`;
+  if (state.reachable) return `${label} : joignable`;
+  return state.detail ?? `${label} : injoignable`;
+}
+
 function ServicePill({ label, state, onClick }: ServicePillProps) {
-  const colour =
-    state === null ? "bg-neutral-600" : state.reachable ? "bg-emerald-500" : "bg-red-500";
-  const title =
-    state === null
-      ? `${label} : état inconnu`
-      : state.reachable
-        ? `${label} : joignable`
-        : (state.detail ?? `${label} : injoignable`);
+  const colour = pillColour(state);
+  const title = pillTitle(label, state);
   return (
     <button
       type="button"

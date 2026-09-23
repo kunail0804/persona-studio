@@ -1,5 +1,5 @@
 import { request } from "./client";
-import { expectBoolean, isRecord } from "./validate";
+import { expectBoolean, expectString, isRecord } from "./validate";
 
 /** One dependency: whether it answered, and why it did not. */
 export interface ServiceState {
@@ -16,7 +16,7 @@ function parseServiceState(data: unknown, field: string): ServiceState {
   if (!isRecord(data)) throw new Error(`Expected a service state object for "${field}"`);
   return {
     reachable: expectBoolean(data.reachable, "reachable"),
-    detail: data.detail === null || data.detail === undefined ? null : String(data.detail),
+    detail: data.detail === null || data.detail === undefined ? null : expectString(data.detail, "detail"),
   };
 }
 

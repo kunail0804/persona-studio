@@ -321,11 +321,7 @@ export function PartyPage() {
   // an out-of-memory error, and two renders at once is the same problem
   // twice — so composing is blocked during either, with the reason said out
   // loud rather than a button greyed for no stated cause.
-  const gpuBusyReason = streaming
-    ? "Le narrateur écrit. La génération d'image attend la fin du tour : les deux ne tiennent pas ensemble sur la carte."
-    : rendering
-      ? "Une image est déjà en cours de rendu."
-      : null;
+  const gpuBusy = gpuBusyReason(streaming, rendering);
 
   return (
     <div className="flex flex-col gap-6">
@@ -338,7 +334,7 @@ export function PartyPage() {
           <p className="text-sm text-neutral-500">Scénario&nbsp;: {party.scenarioTitle}</p>
         </div>
         <Button variant="secondary" onClick={() => setShowImages((open) => !open)}>
-          {showImages ? "Masquer les images" : `Images${images.length ? ` (${images.length})` : ""}`}
+          {imagesButtonLabel(showImages, images.length)}
         </Button>
       </div>
       {error ? <p className="text-sm text-red-400">{error}</p> : null}
@@ -425,8 +421,8 @@ export function PartyPage() {
               key={party.id}
               partyId={party.id}
               images={images}
-              busy={gpuBusyReason !== null}
-              busyReason={gpuBusyReason}
+              busy={gpuBusy !== null}
+              busyReason={gpuBusy}
               onGenerationStarted={() => void load(party.id)}
               onCancel={(messageId) => void cancelImage(messageId)}
               onDelete={(messageId) => setConfirmDeleteImageId(messageId)}
@@ -448,6 +444,20 @@ export function PartyPage() {
       />
     </div>
   );
+}
+
+/** Why the GPU cannot take an image right now, or null when it can. */
+function gpuBusyReason(streaming: boolean, rendering: boolean): string | null {
+  if (streaming) {
+    return "Le narrateur écrit. La génération d'image attend la fin du tour : les deux ne tiennent pas ensemble sur la carte.";
+  }
+  if (rendering) return "Une image est déjà en cours de rendu.";
+  return null;
+}
+
+function imagesButtonLabel(open: boolean, count: number): string {
+  if (open) return "Masquer les images";
+  return count > 0 ? `Images (${count})` : "Images";
 }
 
 /**
