@@ -334,8 +334,7 @@ export function PartyPage() {
       </div>
       {error ? <p className="text-sm text-red-400">{error}</p> : null}
 
-      <div className="flex items-start gap-6">
-        <div className="flex min-w-0 flex-1 flex-col gap-6">
+      <div className="flex flex-col gap-6">
           <MemoryPanel party={party} onSave={saveMemory} />
           <PromptPanel partyId={party.id} />
           {texts.length === 0 && pending === null ? (
@@ -403,28 +402,29 @@ export function PartyPage() {
               </Button>
             )}
           </form>
-        </div>
-
-        {showImages ? (
-          // Sticky under the header: the gallery stays put while the
-          // transcript scrolls past it.
-          <aside className="sticky top-24 w-80 shrink-0">
-            {/* key: the composer keeps its prompt in local state, so a party
-                change must remount it rather than show one party's prompt on
-                another party's page. */}
-            <ImageGallery
-              key={party.id}
-              partyId={party.id}
-              images={images}
-              busy={gpuBusy !== null}
-              busyReason={gpuBusy}
-              onGenerationStarted={() => void load(party.id)}
-              onCancel={(messageId) => void cancelImage(messageId)}
-              onDelete={(messageId) => setConfirmDeleteImageId(messageId)}
-            />
-          </aside>
-        ) : null}
       </div>
+
+      {showImages ? (
+        // An overlay, not a column: it floats above the page, so opening it
+        // leaves the transcript exactly where and as wide as it was. Its own
+        // scroll, because a fixed panel taller than the window would hide
+        // its last images; clear of the two floating buttons above and below.
+        <aside className="fixed bottom-20 right-6 top-32 z-20 w-96 overflow-y-auto rounded-lg border border-neutral-800 bg-neutral-950/95 p-4 shadow-2xl backdrop-blur">
+          {/* key: the composer keeps its prompt in local state, so a party
+              change must remount it rather than show one party's prompt on
+              another party's page. */}
+          <ImageGallery
+            key={party.id}
+            partyId={party.id}
+            images={images}
+            busy={gpuBusy !== null}
+            busyReason={gpuBusy}
+            onGenerationStarted={() => void load(party.id)}
+            onCancel={(messageId) => void cancelImage(messageId)}
+            onDelete={(messageId) => setConfirmDeleteImageId(messageId)}
+          />
+        </aside>
+      ) : null}
 
       <button
         type="button"
@@ -469,26 +469,8 @@ function imagesButtonLabel(open: boolean, count: number): string {
 const floatingButtonClasses =
   "rounded-full border border-neutral-700 bg-neutral-900/95 px-3 py-2 text-sm text-neutral-200 shadow-lg backdrop-blur hover:bg-neutral-800";
 
-/**
- * A floating button that jumps to the end of the transcript, shown only when
- * the end is off screen — a button that does nothing when you are already
- * there is noise.
- */
+/** A floating button that jumps to the end of the transcript. Always shown. */
 function ScrollToBottomButton({ targetRef }: { targetRef: React.RefObject<HTMLDivElement | null> }) {
-  const [visible, setVisible] = useState(false);
-
-  useEffect(() => {
-    const target = targetRef.current;
-    if (target === null) return;
-    const observer = new IntersectionObserver(
-      ([entry]) => setVisible(!entry.isIntersecting),
-      { rootMargin: "0px 0px -80px 0px" },
-    );
-    observer.observe(target);
-    return () => observer.disconnect();
-  }, [targetRef]);
-
-  if (!visible) return null;
   return (
     <button
       type="button"
