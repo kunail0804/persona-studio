@@ -39,6 +39,8 @@ export interface PartySummary {
   scenarioId: string;
   scenarioTitle: string;
   label: string;
+  /** The protagonist this party is played as; null plays without one. */
+  personaId: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -131,6 +133,10 @@ function parsePartySummary(data: unknown): PartySummary {
     scenarioId: expectString(data.scenario_id, "scenario_id"),
     scenarioTitle: expectString(data.scenario_title, "scenario_title"),
     label: expectString(data.label, "label"),
+    personaId:
+      data.persona_id === null || data.persona_id === undefined
+        ? null
+        : expectString(data.persona_id, "persona_id"),
     createdAt: expectNumber(data.created_at, "created_at"),
     updatedAt: expectNumber(data.updated_at, "updated_at"),
   };
@@ -224,6 +230,17 @@ export function renameParty(id: string, label: string): Promise<PartySummary> {
   return request(`/parties/${id}`, parsePartySummary, {
     method: "PATCH",
     body: JSON.stringify({ label }),
+  });
+}
+
+/**
+ * Chooses who this party is played as, or `null` for no protagonist. Takes
+ * effect from the next turn.
+ */
+export function setPartyPersona(id: string, personaId: string | null): Promise<PartySummary> {
+  return request(`/parties/${id}/persona`, parsePartySummary, {
+    method: "PUT",
+    body: JSON.stringify({ persona_id: personaId }),
   });
 }
 

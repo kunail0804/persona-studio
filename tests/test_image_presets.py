@@ -150,10 +150,12 @@ def test_the_composer_sends_the_active_preset_as_its_system_message(
     )
 
     assert response.status_code == 200
-    assert calls[0][0] == {
-        "role": "system",
-        "content": "Answer with one English sentence of prose.",
-    }
+    system = calls[0][0]
+    assert system["role"] == "system"
+    # The preset opens the system message; the application's content rules
+    # follow it, whatever the preset says.
+    assert system["content"].startswith("Answer with one English sentence of prose.")
+    assert system["content"].endswith(image_prompt.CONTENT_RULES)
     # And the scene still rides in the second message, unchanged by the preset.
     assert "la cité vue d'en haut" in calls[0][1]["content"]
 

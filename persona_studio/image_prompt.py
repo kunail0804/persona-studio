@@ -15,15 +15,30 @@ is the deterministic second line. It works on the model's **answer**, not on
 the prompt: the model may see names (it must, to tell which appearance belongs
 to whom), the returned keywords may not.
 
-Place names are excluded, not scrubbed. There is no bounded list of known
-places to match against the way there is for characters — the `place` table
-carries no CRUD and nothing writes to it, so the only place-shaped text is
-`world_state["location"]`, free text the summariser writes. That single key
-is dropped before the call rather than sent and then cleaned, because there
-is nothing to clean it *against*. The rest of `world_state`, and the
-narration itself, can still name a place in passing prose; no deterministic
-pass can catch that without a list to check names against, the same limit
-`scrub_names` already lives with for an uncommon character name.
+The rule is the user's, and it is about the final prompt only: no proper
+name reaches the image model — not a person's, not a place's, not a real
+landmark's. What the player writes in a scenario may name anything; what
+leaves this module describes instead.
+
+It is kept at two strengths, because only one of them can be proven:
+
+- **Names this application knows** — characters, the persona, the scenario's
+  places, the scenario title — are driven out deterministically by
+  `scrub_names`, each replaced by its description. That is a guarantee.
+- **Real-world landmarks** — the Eiffel Tower, a city — are on no list any
+  code could check against. Only the instruction can ask the model to
+  describe them instead of naming them. That is a request, not a guarantee;
+  a landmark the player adds as a place of the scenario moves to the first
+  kind.
+
+Both rules are appended by the application to whatever preset is active (see
+`CONTENT_RULES`), so they never depend on what a preset happens to say. The
+preset says *how* to write the prompt; the application says what must never
+appear in it.
+
+`world_state["location"]` is still dropped before the call: it is free text
+the summariser writes, and a place name there may not be one of the
+scenario's.
 """
 
 from __future__ import annotations
@@ -63,6 +78,9 @@ class ImagePromptInputs:
     persona: Appearance | None
     characters: tuple[Appearance, ...]
     scenario_title: str
+    # The scenario's places, each with its visual description as the thing it
+    # becomes in the prompt — the same role a character's appearance plays.
+    places: tuple[Appearance, ...] = ()
 
 
 # --- The prompt format ---------------------------------------------------------
@@ -90,10 +108,24 @@ DEFAULT_INSTRUCTION = (
     "- Keep every explicit detail the request asks for: objects, colours, "
     "counts, poses, actions. Never drop a detail and never summarise the "
     "request away.\n"
-    "- Describe people by their physical appearance, using the appearance "
-    "notes provided, and never by name.\n"
     "- Do not invent people, objects or events that the scene and the request "
     "do not mention."
+)
+
+
+# Appended by the application to every preset, whatever it says. The preset
+# decides the grammar — keywords for Stable Diffusion, prose for Krea — so
+# these are worded to hold under either. They are what must never appear, not
+# how to write, and they stay out of the editable text so a preset that
+# forgets them cannot lose them.
+CONTENT_RULES = (
+    "Whatever format the instructions above ask for, these rules always apply:\n"
+    "- Never write a proper name: not a person's, not a place's, not a real "
+    "landmark's, monument's or city's.\n"
+    "- Describe people by the appearance notes provided, and places by the "
+    "descriptions provided.\n"
+    "- Describe a real landmark, monument or city by what it looks like, never "
+    "by what it is called."
 )
 
 
@@ -153,11 +185,12 @@ def build_messages(
             "Protagonist (the player's character):", (inputs.persona,) if inputs.persona else ()
         ),
         _beings_section("Characters:", inputs.characters),
+        _beings_section("Places:", inputs.places),
         _section("The request from the player:", inputs.instruction),
     ]
     scene = "\n\n".join(part for part in scene_parts if part)
     return [
-        {"role": "system", "content": instruction},
+        {"role": "system", "content": f"{instruction.rstrip()}\n\n{CONTENT_RULES}"},
         {"role": "user", "content": scene},
     ]
 
@@ -235,7 +268,9 @@ def _name_pass(inputs: ImagePromptInputs) -> _NamePass:
     scenario title has no appearance at all and is bare the same way. A blank
     name is skipped: the empty pattern would match between every character.
     """
-    beings = [being for being in (*inputs.characters, inputs.persona) if being is not None]
+    beings = [
+        being for being in (*inputs.characters, *inputs.places, inputs.persona) if being is not None
+    ]
     named = [(being.name.strip(), being.appearance.strip()) for being in beings]
     title = inputs.scenario_title.strip()
     if title:
@@ -300,7 +335,7 @@ def load_inputs(con: sqlite3.Connection, party_id: str) -> ImagePromptInputs:
     read here — it arrives in the request body, not the database.
     """
     party = con.execute(
-        "SELECT scenario_id, world_state FROM instance WHERE id = ?", (party_id,)
+        "SELECT scenario_id, world_state, persona_id FROM instance WHERE id = ?", (party_id,)
     ).fetchone()
     if party is None:
         raise LookupError(f"Party {party_id!r} not found")
@@ -313,8 +348,10 @@ def load_inputs(con: sqlite3.Connection, party_id: str) -> ImagePromptInputs:
         "ORDER BY id DESC LIMIT 1",
         (party_id,),
     ).fetchone()
+    # The party's own persona — each party carries its protagonist since
+    # schema v4, and the image must show the one this party is played as.
     persona: Appearance | None = None
-    persona_id = settings.get_active_persona_id(con)
+    persona_id = party["persona_id"]
     if persona_id is not None:
         persona_row = con.execute(
             "SELECT name, appearance FROM persona WHERE id = ?", (persona_id,)
@@ -328,6 +365,13 @@ def load_inputs(con: sqlite3.Connection, party_id: str) -> ImagePromptInputs:
             (party["scenario_id"],),
         ).fetchall()
     )
+    places = tuple(
+        Appearance(name=row["name"], appearance=row["description"])
+        for row in con.execute(
+            "SELECT name, description FROM place WHERE scenario_id = ? ORDER BY position",
+            (party["scenario_id"],),
+        ).fetchall()
+    )
     return ImagePromptInputs(
         instruction="",
         narration=narration_row["content"] if narration_row is not None else "",
@@ -335,6 +379,7 @@ def load_inputs(con: sqlite3.Connection, party_id: str) -> ImagePromptInputs:
         persona=persona,
         characters=characters,
         scenario_title=scenario_row["title"] if scenario_row is not None else "",
+        places=places,
     )
 
 
