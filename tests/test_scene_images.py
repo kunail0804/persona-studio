@@ -1379,3 +1379,112 @@ def test_no_configured_model_means_nothing_to_evict(monkeypatch: Any) -> None:
     generation._evict_narrator(None)
 
     assert called == []
+
+
+# --- Deleting an image (V1.2) ----------------------------------------------------
+#
+# The first delete path of the project: no message could be removed before
+# this. The PNG goes with the row, and only after the transaction commits.
+
+
+def _completed_image(
+    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+) -> tuple[str, int, str]:
+    """A party with one finished image. Returns (party_id, message_id, image_id)."""
+    _setup_ready_workflow()
+    party_id = _create_party(client, monkeypatch)
+    message_id, prompt_id = _start_unfinished(client, party_id)
+    _settle(comfy, message_id, prompt_id)
+    row = _image_messages(party_id)[0]
+    assert row["status"] == "done"
+    return party_id, message_id, row["image_id"]
+
+
+def test_deleting_an_image_removes_its_message_row_and_file(
+    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+) -> None:
+    party_id, message_id, image_id = _completed_image(client, comfy, monkeypatch)
+    assert db.image_path(image_id).is_file()
+
+    response = client.delete(f"/api/parties/{party_id}/images/{message_id}")
+
+    assert response.status_code == 204
+    assert _image_messages(party_id) == []
+    with db.connect() as con:
+        assert con.execute("SELECT 1 FROM image WHERE id = ?", (image_id,)).fetchone() is None
+    assert not db.image_path(image_id).exists(), "the PNG outlived its row"
+
+
+def test_deleting_an_image_leaves_the_story_alone(
+    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+) -> None:
+    """Images are messages, so a delete that reached too far would take the
+    narration with it."""
+    party_id, message_id, _ = _completed_image(client, comfy, monkeypatch)
+    before = [row["id"] for row in _message_rows(party_id) if row["kind"] == "text"]
+
+    client.delete(f"/api/parties/{party_id}/images/{message_id}")
+
+    after = [row["id"] for row in _message_rows(party_id) if row["kind"] == "text"]
+    assert after == before
+
+
+def test_a_generation_still_running_is_refused_rather_than_torn_out(
+    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+) -> None:
+    """Its watcher is about to write to that row. A completion landing on a
+    deleted message is a state nothing here handles, so the delete refuses and
+    names the way out."""
+    _setup_ready_workflow()
+    party_id = _create_party(client, monkeypatch)
+    message_id, prompt_id = _start_unfinished(client, party_id)
+    try:
+        response = client.delete(f"/api/parties/{party_id}/images/{message_id}")
+
+        assert response.status_code == 409
+        assert "Cancel it" in response.json()["detail"]
+        assert _image_messages(party_id)[0]["status"] == "pending"
+    finally:
+        _settle(comfy, message_id, prompt_id)
+
+
+def test_a_cancelled_image_can_be_deleted(
+    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+) -> None:
+    """The way out the refusal names has to actually work.
+
+    The job is settled on the fake's side after the cancel so the watcher
+    ends inside the test: cancelling marks the row locally and does not, on
+    its own, stop the thread from polling.
+    """
+    _setup_ready_workflow()
+    party_id = _create_party(client, monkeypatch)
+    message_id, prompt_id = _start_unfinished(client, party_id)
+    assert _cancel(client, party_id, message_id).status_code == 200
+    comfy.complete(prompt_id)
+    assert _wait_watcher_done(message_id)
+    assert _image_messages(party_id)[0]["status"] == "error"
+
+    assert client.delete(f"/api/parties/{party_id}/images/{message_id}").status_code == 204
+    assert _image_messages(party_id) == []
+
+
+def test_deleting_a_text_message_through_the_image_route_is_refused(
+    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+) -> None:
+    _setup_ready_workflow()
+    party_id = _create_party(client, monkeypatch)
+    opening_id = _message_rows(party_id)[0]["id"]
+
+    response = client.delete(f"/api/parties/{party_id}/images/{opening_id}")
+
+    assert response.status_code == 400
+    assert len(_message_rows(party_id)) == 1, "the narration was deleted"
+
+
+def test_deleting_an_unknown_image_is_404(
+    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+) -> None:
+    _setup_ready_workflow()
+    party_id = _create_party(client, monkeypatch)
+    assert client.delete(f"/api/parties/{party_id}/images/999999").status_code == 404

@@ -9,12 +9,56 @@ stored setting is never touched.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
+import anyio.to_thread
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
-from .. import db, ollama, settings
+from .. import comfyui, db, ollama, settings
 
 router = APIRouter(tags=["settings"])
+
+
+class ServiceState(BaseModel):
+    """One dependency: whether it answered, and why it did not."""
+
+    reachable: bool
+    detail: str | None
+
+
+class ServiceStatus(BaseModel):
+    ollama: ServiceState
+    comfyui: ServiceState
+
+
+@router.get("/status", response_model=ServiceStatus)
+async def get_service_status() -> ServiceStatus:
+    """Whether Ollama and ComfyUI are answering right now.
+
+    The interface polls this to light two pills in the header. Until it
+    existed you learned Ollama was down when a turn failed — halfway through
+    writing one.
+
+    Async, and the two probes run at once: they are independent, each has a
+    two-second budget, and running them in sequence would double the worst
+    case for no reason. Nothing here writes, and the ComfyUI probe is
+    read-only on purpose — this runs on a timer and must never disturb a
+    render.
+    """
+    results: dict[str, str | None] = {}
+
+    async def run(name: str, check: Callable[[], str | None]) -> None:
+        results[name] = await anyio.to_thread.run_sync(check)
+
+    async with anyio.create_task_group() as group:
+        group.start_soon(run, "ollama", ollama.probe)
+        group.start_soon(run, "comfyui", comfyui.probe)
+
+    return ServiceStatus(
+        ollama=ServiceState(reachable=results["ollama"] is None, detail=results["ollama"]),
+        comfyui=ServiceState(reachable=results["comfyui"] is None, detail=results["comfyui"]),
+    )
 
 
 class LlmSettings(BaseModel):

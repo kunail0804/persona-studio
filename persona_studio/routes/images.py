@@ -34,6 +34,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from .. import comfyui, db, generation, image_prompt, ollama, settings, workflows
+from ..images import delete_orphan_images, unlink_images
 from .parties import PartyMessage, _message_response, _require_model
 
 router = APIRouter(tags=["images"])
@@ -145,6 +146,46 @@ def cancel_image_generation(party_id: str, message_id: int) -> PartyMessage:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     with db.connect() as con:
         return _message_response(con, row)
+
+
+@router.delete("/parties/{party_id}/images/{message_id}", status_code=204)
+def delete_image_message(party_id: str, message_id: int) -> None:
+    """Remove an image from a party: its message, its row, and its PNG.
+
+    A generation still running is refused rather than torn out from under its
+    watcher: the thread is about to write to that very row, and a completion
+    landing on a deleted message is a state nothing else in this module has
+    to handle. Cancel first, then delete — the cancel endpoint exists and
+    already stops ComfyUI when our job is the one on the GPU.
+
+    The PNG is unlinked only after the transaction commits, the same
+    discipline `delete_scenario` follows: a rolled-back delete must never
+    leave a row pointing at a file that is gone.
+    """
+    with db.connect() as con:
+        row = con.execute(
+            "SELECT id, kind, status FROM message WHERE id = ? AND instance_id = ?",
+            (message_id, party_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Message {message_id} not found in party {party_id!r}",
+            )
+        if row["kind"] != "image":
+            raise HTTPException(
+                status_code=400, detail="Only an image message can be deleted here."
+            )
+        if row["status"] == "pending":
+            raise HTTPException(
+                status_code=409,
+                detail="This image is still being generated. Cancel it before deleting it.",
+            )
+        con.execute("DELETE FROM message WHERE id = ?", (message_id,))
+        # Inside the same transaction, so the query sees the row gone and the
+        # image it referenced counted as an orphan.
+        orphan_ids = delete_orphan_images(con)
+    unlink_images(orphan_ids)
 
 
 # --- Serving the file -------------------------------------------------------------
