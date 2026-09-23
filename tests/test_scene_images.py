@@ -449,9 +449,14 @@ def test_pending_message_is_persisted_before_the_submission(
 # --- 2. The turn is never blocked -------------------------------------------------
 
 
-def test_the_start_returns_immediately_and_the_party_keeps_answering(
+def test_the_start_returns_immediately_and_the_narrator_waits_for_the_render(
     client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
 ) -> None:
+    """The start still returns at once and the party still answers. What
+    changed in V1.3 is the turn: issue #17 asked to keep chatting while an
+    image renders, and on this machine's single 12 GB card the narrator
+    loading back in mid-render is an out-of-memory error. The turn is refused
+    with the reason, and nothing is written."""
     party_id = _create_party(client, monkeypatch)
     _setup_ready_workflow()
 
@@ -466,12 +471,14 @@ def test_the_start_returns_immediately_and_the_party_keeps_answering(
     assert detail.status_code == 200
     assert any(m["kind"] == "image" and m["status"] == "pending" for m in detail.json()["messages"])
 
-    # And a turn can still be played — stubbed, but through the whole
-    # streaming path, which a blocked start would have starved.
+    # A turn is refused while the render runs, before the player's text is
+    # written — a refused turn must leave nothing behind.
     _stub_stream(monkeypatch, ["Réponse."])
+    before = len(_message_rows(party_id))
     turn = client.post(f"/api/parties/{party_id}/messages", json={"content": "J'avance."})
-    assert turn.status_code == 200
-    assert '"delta"' in turn.text
+    assert turn.status_code == 409
+    assert turn.json()["detail"] == generation.RENDER_IN_PROGRESS_DETAIL
+    assert len(_message_rows(party_id)) == before
 
     _settle(comfy, message_id, "fake-prompt-1")
 
@@ -1488,3 +1495,71 @@ def test_deleting_an_unknown_image_is_404(
     _setup_ready_workflow()
     party_id = _create_party(client, monkeypatch)
     assert client.delete(f"/api/parties/{party_id}/images/999999").status_code == 404
+
+
+# --- The narrator waits for the render (V1.3) -------------------------------------
+#
+# The other half of the GPU guard. The narrator is evicted before a render
+# starts; nothing may load it back while the render runs. Every route that
+# calls the narrator is refused with the same reason, and once the render is
+# done they all work again.
+
+
+def test_every_narrator_call_is_refused_during_a_render(
+    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+) -> None:
+    _setup_ready_workflow()
+    party_id = _create_party(client, monkeypatch)
+    opening_id = _message_rows(party_id)[0]["id"]
+    scenario = client.post("/api/scenarios", json={"title": "Autre monde", "synopsis": ""})
+    message_id, prompt_id = _start_unfinished(client, party_id)
+    try:
+        regenerate = client.post(f"/api/parties/{party_id}/messages/{opening_id}/regenerate")
+        new_party = client.post(
+            f"/api/scenarios/{scenario.json()['id']}/parties", json={"label": ""}
+        )
+        compose = client.post(
+            f"/api/parties/{party_id}/image-prompt", json={"instruction": "le port"}
+        )
+
+        for name, response in (
+            ("regenerate", regenerate),
+            ("new party", new_party),
+            ("compose", compose),
+        ):
+            assert response.status_code == 409, f"{name} answered {response.status_code}"
+            assert response.json()["detail"] == generation.RENDER_IN_PROGRESS_DETAIL
+    finally:
+        _settle(comfy, message_id, prompt_id)
+
+
+def test_the_narrator_answers_again_once_the_render_is_done(
+    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+) -> None:
+    """A guard that never lets go would be worse than the out-of-memory."""
+    _setup_ready_workflow()
+    party_id = _create_party(client, monkeypatch)
+    message_id, prompt_id = _start_unfinished(client, party_id)
+    _settle(comfy, message_id, prompt_id)
+
+    _stub_stream(monkeypatch, ["Le quai s'éveille."])
+    turn = client.post(f"/api/parties/{party_id}/messages", json={"content": "J'avance."})
+
+    assert turn.status_code == 200
+    assert '"delta"' in turn.text
+
+
+def test_a_render_in_another_party_blocks_this_one_too(
+    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+) -> None:
+    """The GPU is one card, not one per party."""
+    _setup_ready_workflow()
+    rendering = _create_party(client, monkeypatch)
+    other = _create_party(client, monkeypatch)
+    message_id, prompt_id = _start_unfinished(client, rendering)
+    try:
+        _stub_stream(monkeypatch, ["Réponse."])
+        turn = client.post(f"/api/parties/{other}/messages", json={"content": "J'avance."})
+        assert turn.status_code == 409
+    finally:
+        _settle(comfy, message_id, prompt_id)

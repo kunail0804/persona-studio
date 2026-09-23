@@ -92,6 +92,32 @@ class StartResult:
     started_at: float
 
 
+RENDER_IN_PROGRESS_DETAIL = (
+    "An image is being rendered. The narrator waits until it is done: on this "
+    "card the two do not fit in memory together."
+)
+
+
+def render_in_progress(con: sqlite3.Connection) -> bool:
+    """Whether any image, in any party, is rendering right now.
+
+    Global on purpose: the GPU is one card, not one per party, so a render in
+    one party and a narrator call in another are the same out-of-memory as
+    both in the same party. The narrator is evicted before a render starts
+    (`_evict_narrator`); this is the other half — nothing loads it back while
+    the render runs.
+
+    A `pending` row whose watcher died with the process is marked failed at
+    startup by `recover_pending`, so a crash cannot leave this true forever.
+    """
+    return (
+        con.execute(
+            "SELECT 1 FROM message WHERE kind = 'image' AND status = 'pending' LIMIT 1"
+        ).fetchone()
+        is not None
+    )
+
+
 def _evict_narrator(model: str | None) -> None:
     """Free the narration model's VRAM before a render takes the GPU.
 

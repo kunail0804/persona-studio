@@ -48,7 +48,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
-from .. import db, narrator, ollama, settings, summarizer
+from .. import db, generation, narrator, ollama, settings, summarizer
 
 router = APIRouter(tags=["parties"])
 
@@ -82,6 +82,8 @@ class PartySummary(BaseModel):
     scenario_id: str
     scenario_title: str
     label: str
+    # The protagonist this party is played as; None plays without one.
+    persona_id: str | None
     created_at: float
     updated_at: float
 
@@ -147,9 +149,16 @@ class VariantInput(BaseModel):
     variant_id: int
 
 
+class PartyPersonaInput(BaseModel):
+    # None is "play without a protagonist", a real choice rather than a
+    # missing value.
+    persona_id: str | None
+
+
 _SUMMARY_COLUMNS = (
     "instance.id, instance.scenario_id, instance.label, "
     "instance.created_at, instance.updated_at, scenario.title AS scenario_title, "
+    "instance.persona_id, "
     "instance.summary_text, instance.summary_upto, instance.world_state"
 )
 
@@ -231,7 +240,7 @@ def _next_turn_messages(
     a second rendering of it that can drift.
     """
     scenario = narrator.load_scenario(con, row["scenario_id"])
-    persona = narrator.load_active_persona(con)
+    persona = narrator.load_persona(con, row["persona_id"])
     history = narrator.load_history(
         con,
         row["id"],
@@ -257,9 +266,21 @@ def _party_from_row(row: sqlite3.Row) -> PartySummary:
         scenario_id=row["scenario_id"],
         scenario_title=row["scenario_title"],
         label=row["label"],
+        persona_id=row["persona_id"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
+
+
+def _refuse_while_rendering(con: sqlite3.Connection) -> None:
+    """409 when an image is rendering: the narrator would reload on the GPU.
+
+    Every route that calls the narrator goes through here — a played turn, a
+    regeneration, a party's opening. The eviction before a render frees the
+    card; this keeps it free until the render is done.
+    """
+    if generation.render_in_progress(con):
+        raise HTTPException(status_code=409, detail=generation.RENDER_IN_PROGRESS_DETAIL)
 
 
 def _party_label(raw: str, scenario_title: str) -> str:
@@ -448,8 +469,15 @@ def create_party(scenario_id: str, body: PartyInput) -> PartySummary:
     with db.connect() as con:
         scenario_row = _get_scenario_row(con, scenario_id)
         model = _require_model(con)
+        _refuse_while_rendering(con)
         scenario = narrator.load_scenario(con, scenario_id)
-        persona = narrator.load_active_persona(con)
+        # A new party starts as the default persona. The id is kept only if
+        # it resolves: a setting left pointing at a deleted persona must not
+        # become this party's protagonist.
+        persona_id = settings.get_active_persona_id(con)
+        persona = narrator.load_persona(con, persona_id)
+        if persona is None:
+            persona_id = None
         num_ctx = settings.get_num_ctx(con)
 
     # Nothing above wrote a row: a failure past this point — including the
@@ -460,11 +488,25 @@ def create_party(scenario_id: str, body: PartyInput) -> PartySummary:
     party_id = uuid.uuid4().hex
     try:
         with db.connect() as con:
+            # The persona is bound through a subquery rather than as a value:
+            # one deleted while the opening was generated leaves the party
+            # without a protagonist, instead of failing the foreign key and
+            # surfacing below as "the scenario was deleted", which it was not.
             con.execute(
-                "INSERT INTO instance (id, scenario_id, label, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (party_id, scenario_id, _party_label(body.label, scenario_row["title"]), now, now),
+                "INSERT INTO instance (id, scenario_id, label, persona_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, (SELECT id FROM persona WHERE id = ?), ?, ?)",
+                (
+                    party_id,
+                    scenario_id,
+                    _party_label(body.label, scenario_row["title"]),
+                    persona_id,
+                    now,
+                    now,
+                ),
             )
+            stored = con.execute(
+                "SELECT persona_id FROM instance WHERE id = ?", (party_id,)
+            ).fetchone()
             con.execute(
                 "INSERT INTO message (instance_id, role, kind, content, ts) "
                 "VALUES (?, 'assistant', 'text', ?, ?)",
@@ -483,6 +525,7 @@ def create_party(scenario_id: str, body: PartyInput) -> PartySummary:
         scenario_id=scenario_id,
         scenario_title=scenario_row["title"],
         label=_party_label(body.label, scenario_row["title"]),
+        persona_id=stored["persona_id"],
         created_at=now,
         updated_at=now,
     )
@@ -534,6 +577,7 @@ def get_party(party_id: str) -> Party:
         scenario_id=row["scenario_id"],
         scenario_title=row["scenario_title"],
         label=row["label"],
+        persona_id=row["persona_id"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         # Read-only for now: making the summary editable is a separate,
@@ -625,6 +669,29 @@ def rename_party(party_id: str, body: PartyInput) -> PartySummary:
         # A rename is metadata, not story activity: `updated_at` stays put, so
         # renaming never reorders the most-recently-active list.
         con.execute("UPDATE instance SET label = ? WHERE id = ?", (label, party_id))
+        row = _get_party_row(con, party_id)
+    return _party_from_row(row)
+
+
+@router.put("/parties/{party_id}/persona", response_model=PartySummary)
+def set_party_persona(party_id: str, body: PartyPersonaInput) -> PartySummary:
+    """Choose who this party is played as, or `null` for no protagonist.
+
+    Takes effect from the next turn: what the narrator already wrote about the
+    previous protagonist stays in the transcript, as it would in a story. Like
+    a rename, this is not story activity and leaves `updated_at` alone.
+    """
+    with db.connect() as con:
+        _get_party_row(con, party_id)
+        if body.persona_id is not None:
+            exists = con.execute(
+                "SELECT 1 FROM persona WHERE id = ?", (body.persona_id,)
+            ).fetchone()
+            if exists is None:
+                raise HTTPException(
+                    status_code=404, detail=f"Persona {body.persona_id!r} not found"
+                )
+        con.execute("UPDATE instance SET persona_id = ? WHERE id = ?", (body.persona_id, party_id))
         row = _get_party_row(con, party_id)
     return _party_from_row(row)
 
@@ -779,8 +846,11 @@ def _prepare_turn_locked(
         content = body.content.strip()
         if not content:
             raise HTTPException(status_code=400, detail="A turn cannot be empty.")
+        # After the checks the order tests pin, before the player's text is
+        # written: a refused turn must leave nothing behind.
+        _refuse_while_rendering(con)
         scenario = narrator.load_scenario(con, party["scenario_id"])
-        persona = narrator.load_active_persona(con)
+        persona = narrator.load_persona(con, party["persona_id"])
         num_ctx = settings.get_num_ctx(con)
         now = time.time()
         con.execute(
@@ -911,8 +981,9 @@ def _prepare_regenerate_locked(
                 status_code=400,
                 detail="Only a narrator's text message can be regenerated.",
             )
+        _refuse_while_rendering(con)
         scenario = narrator.load_scenario(con, party["scenario_id"])
-        persona = narrator.load_active_persona(con)
+        persona = narrator.load_persona(con, party["persona_id"])
         num_ctx = settings.get_num_ctx(con)
         history = narrator.load_history(
             con,

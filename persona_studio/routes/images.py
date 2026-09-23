@@ -69,6 +69,10 @@ def compose_image_prompt(party_id: str, body: ImagePromptInput) -> ImagePromptOu
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         model = _require_model(con)
+        # Composing calls the narrator's model: during a render it would load
+        # back onto the card the render is using.
+        if generation.render_in_progress(con):
+            raise HTTPException(status_code=409, detail=generation.RENDER_IN_PROGRESS_DETAIL)
         num_ctx = settings.get_num_ctx(con)
         master_prompt = image_prompt.load_active_instruction(con)
     # The request arrives in the body, not the database: it fills the input

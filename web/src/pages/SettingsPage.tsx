@@ -294,6 +294,10 @@ export function SettingsPage() {
             <Button onClick={() => setAddingPersona(true)}>Nouvelle persona</Button>
           ) : null}
         </div>
+        <p className="text-sm text-neutral-500">
+          Chaque partie a son propre protagoniste, choisi en haut de sa page. La persona par défaut
+          n'est que celle avec laquelle une nouvelle partie commence.
+        </p>
 
         {addingPersona ? (
           <div className="rounded-lg border border-neutral-800 bg-neutral-900 p-4">
@@ -486,7 +490,7 @@ export function SettingsPage() {
       <ConfirmDialog
         open={confirmDeletePersonaId !== null}
         title="Supprimer cette persona ?"
-        description="Cette action est définitive. Si elle était active, plus aucune persona ne le sera."
+        description="Cette action est définitive. Les parties jouées avec elle continuent, sans protagoniste."
         onConfirm={() => {
           if (confirmDeletePersonaId !== null) void handleDeletePersona(confirmDeletePersonaId);
         }}
@@ -606,7 +610,7 @@ function PersonaListItem({
             <div className="flex items-center gap-2">
               <h3 className="font-medium">{persona.name || "Sans nom"}</h3>
               {persona.isActive ? (
-                <span className="rounded bg-sky-900 px-2 py-0.5 text-xs text-sky-300">Active</span>
+                <span className="rounded bg-sky-900 px-2 py-0.5 text-xs text-sky-300">Par défaut</span>
               ) : null}
             </div>
             {persona.description ? (
@@ -616,7 +620,7 @@ function PersonaListItem({
           <div className="flex shrink-0 items-center gap-1">
             {!persona.isActive ? (
               <Button variant="secondary" onClick={onActivate}>
-                Activer
+                Par défaut
               </Button>
             ) : null}
             <Button variant="secondary" onClick={onEdit}>

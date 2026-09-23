@@ -8,8 +8,11 @@ import {
   regenerateMessage,
   sendTurn,
   setMessageVariant,
+  setPartyPersona,
   updatePartyMemory,
 } from "../api/parties";
+import type { Persona } from "../api/personas";
+import { listPersonas } from "../api/personas";
 import type { Party, PartyMessage, PromptView, TurnEvent } from "../api/parties";
 import { cancelImageGeneration, deleteImageMessage } from "../api/images";
 import { Narration } from "../components/Narration";
@@ -331,6 +334,15 @@ export function PartyPage() {
         </Link>
         <h1 className="text-2xl font-semibold">{party.label}</h1>
         <p className="text-sm text-neutral-500">Scénario&nbsp;: {party.scenarioTitle}</p>
+        <PartyPersonaPicker
+          partyId={party.id}
+          personaId={party.personaId}
+          disabled={streaming}
+          onChanged={(personaId) =>
+            setParty((current) => (current ? { ...current, personaId } : current))
+          }
+          onError={setError}
+        />
       </div>
       {error ? <p className="text-sm text-red-400">{error}</p> : null}
 
@@ -345,7 +357,7 @@ export function PartyPage() {
               <MessageBubble
                 key={message.id}
                 message={message}
-                disabled={streaming}
+                disabled={streaming || rendering}
                 regenerating={regeneratingId === message.id}
                 // The old reply stays on screen until the first token of the
                 // new one arrives: `overrideText` is undefined until then.
@@ -366,6 +378,16 @@ export function PartyPage() {
           </ul>
           <div ref={endRef} />
           {streamError ? <p className="text-sm text-red-400">{streamError}</p> : null}
+          {/* The other half of the GPU guard: the narrator was evicted to
+              make room for the render, and loading it back mid-render is the
+              out-of-memory. The server refuses the turn too; this says why
+              before the player types it. */}
+          {rendering && !streaming ? (
+            <p className="text-sm text-amber-400">
+              Une image est en cours de rendu. Le narrateur reprend dès qu'elle est terminée&nbsp;:
+              les deux ne tiennent pas ensemble sur la carte.
+            </p>
+          ) : null}
           {/* The warning issue #6 exists for. Ollama truncates an over-long
               prompt in silence, from the front, system prompt first — the
               narrator then forgets the scenario with nothing to explain it. */}
@@ -388,7 +410,7 @@ export function PartyPage() {
             <input
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              disabled={streaming}
+              disabled={streaming || rendering}
               placeholder="Que faites-vous&nbsp;?"
               className="flex-1 rounded border border-neutral-700 bg-neutral-900 px-3 py-2 text-neutral-100 placeholder:text-neutral-600 focus:border-sky-700 focus:outline-none disabled:opacity-50"
             />
@@ -397,7 +419,7 @@ export function PartyPage() {
                 Arrêter
               </Button>
             ) : (
-              <Button type="submit" disabled={!input.trim()}>
+              <Button type="submit" disabled={!input.trim() || rendering}>
                 Envoyer
               </Button>
             )}
@@ -848,5 +870,62 @@ function PromptPanel({ partyId }: { partyId: string }) {
         )}
       </div>
     </details>
+  );
+}
+
+interface PartyPersonaPickerProps {
+  partyId: string;
+  personaId: string | null;
+  disabled: boolean;
+  onChanged: (personaId: string | null) => void;
+  onError: (message: string) => void;
+}
+
+/**
+ * Who this party is played as. Each party carries its own protagonist since
+ * V1.3; the default in the settings only chooses the one a new party starts
+ * with. A change takes effect from the next turn.
+ */
+function PartyPersonaPicker({ partyId, personaId, disabled, onChanged, onError }: PartyPersonaPickerProps) {
+  const [personas, setPersonas] = useState<Persona[]>([]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    listPersonas(controller.signal)
+      .then(setPersonas)
+      .catch((err: unknown) => {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        onError(messageFor(err, "Impossible de charger les personas."));
+      });
+    return () => controller.abort();
+  }, [onError]);
+
+  const change = async (value: string) => {
+    const next = value === "" ? null : value;
+    try {
+      const updated = await setPartyPersona(partyId, next);
+      onChanged(updated.personaId);
+    } catch (err) {
+      onError(messageFor(err, "Impossible de changer de persona."));
+    }
+  };
+
+  return (
+    <label className="mt-1 flex items-center gap-2 text-sm text-neutral-500">
+      <span>Joué par&nbsp;:</span>
+      <select
+        value={personaId ?? ""}
+        disabled={disabled}
+        onChange={(event) => void change(event.target.value)}
+        className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-200 focus:border-sky-700 focus:outline-none"
+      >
+        <option value="">Aucun protagoniste</option>
+        {personas.map((persona) => (
+          <option key={persona.id} value={persona.id}>
+            {persona.name || "Sans nom"}
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }
