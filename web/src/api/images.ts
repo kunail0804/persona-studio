@@ -1,4 +1,4 @@
-import { request } from "./client";
+import { request, requestVoid } from "./client";
 import { expectNumber, expectInteger, expectString, isRecord } from "./validate";
 import { parsePartyMessage } from "./parties";
 import type { PartyMessage } from "./parties";
@@ -60,4 +60,12 @@ export function cancelImageGeneration(partyId: string, messageId: number): Promi
   return request(`/parties/${partyId}/images/${messageId}/cancel`, parsePartyMessage, {
     method: "POST",
   });
+}
+/**
+ * Removes an image from the party: its message, its row and its PNG. A
+ * generation still running is refused — cancel it first, so its watcher is
+ * never left writing to a row that no longer exists.
+ */
+export function deleteImageMessage(partyId: string, messageId: number): Promise<void> {
+  return requestVoid(`/parties/${partyId}/images/${messageId}`, { method: "DELETE" });
 }

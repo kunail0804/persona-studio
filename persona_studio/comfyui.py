@@ -97,6 +97,30 @@ def _request_json(method: str, path: str, payload: dict[str, Any] | None = None)
         raise ComfyUIError(f"ComfyUI returned a non-JSON response: {response.text[:200]}") from exc
 
 
+# Same reasoning as `ollama.probe`: a status pill cannot wait on the
+# generous timeout a render needs.
+PROBE_TIMEOUT = httpx.Timeout(2.0, connect=2.0)
+
+# Read by the probe and by `queue`, written by `delete_queued`.
+_QUEUE_PATH = "/queue"
+
+
+def probe() -> str | None:
+    """None when ComfyUI answers, else why it did not.
+
+    `/queue` is the lightest endpoint that proves the server is up, and it is
+    read-only — this runs on a timer and must never disturb a render.
+    """
+    try:
+        with httpx.Client(base_url=COMFYUI_BASE_URL, timeout=PROBE_TIMEOUT) as client:
+            response = client.get(_QUEUE_PATH)
+    except httpx.HTTPError as exc:
+        return f"ComfyUI is unreachable at {COMFYUI_BASE_URL}: {exc}"
+    if response.status_code >= 400:
+        return f"ComfyUI returned HTTP {response.status_code}"
+    return None
+
+
 def submit(graph: dict[str, Any]) -> str:
     """Queue a prepared graph and return the prompt id ComfyUI assigned it."""
     data = _request_json("POST", "/prompt", {"prompt": graph})
@@ -236,7 +260,7 @@ def image_bytes(ref: ImageRef) -> bytes:
 
 def queue() -> QueueState:
     """What the queue is doing right now: the prompt ids running and waiting."""
-    data = _request_json("GET", "/queue")
+    data = _request_json("GET", _QUEUE_PATH)
     if not isinstance(data, dict):
         raise ComfyUIError("Unexpected /queue response shape")
 
@@ -266,4 +290,4 @@ def interrupt() -> None:
 
 def delete_queued(prompt_id: str) -> None:
     """Remove one waiting job from the queue, leaving the running one alone."""
-    _request_json("POST", "/queue", {"delete": [prompt_id]})
+    _request_json("POST", _QUEUE_PATH, {"delete": [prompt_id]})

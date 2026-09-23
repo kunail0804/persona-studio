@@ -11,12 +11,12 @@ import {
   updatePartyMemory,
 } from "../api/parties";
 import type { Party, PartyMessage, PromptView, TurnEvent } from "../api/parties";
-import { cancelImageGeneration } from "../api/images";
+import { cancelImageGeneration, deleteImageMessage } from "../api/images";
 import { Narration } from "../components/Narration";
 import { Button } from "../components/Button";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import { TextArea } from "../components/TextArea";
-import { ImagePanel } from "../components/ImagePanel";
-import { ImageMessage } from "../components/ImageMessage";
+import { ImageGallery } from "../components/ImageGallery";
 
 // The bubble re-renders at most this often while fragments arrive. Every
 // fragment is still accumulated; only the re-render is throttled. The
@@ -59,6 +59,8 @@ export function PartyPage() {
   const [streamError, setStreamError] = useState<string | null>(null);
   const [streaming, setStreaming] = useState(false);
   const [regeneratingId, setRegeneratingId] = useState<number | null>(null);
+  const [showImages, setShowImages] = useState(false);
+  const [confirmDeleteImageId, setConfirmDeleteImageId] = useState<number | null>(null);
 
   const load = useCallback(async (partyId: string, signal?: AbortSignal): Promise<boolean> => {
     try {
@@ -195,6 +197,21 @@ export function PartyPage() {
     [id],
   );
 
+  const deleteImage = useCallback(
+    async (messageId: number) => {
+      if (!id) return;
+      try {
+        await deleteImageMessage(id, messageId);
+        await load(id);
+      } catch (err) {
+        setError(messageFor(err, "Impossible de supprimer l'image."));
+      } finally {
+        setConfirmDeleteImageId(null);
+      }
+    },
+    [id, load],
+  );
+
   // Both run before the early returns below: hooks must not be conditional.
   const hasPendingImage =
     party?.messages.some((m) => m.kind === "image" && m.status === "pending") ?? false;
@@ -297,6 +314,15 @@ export function PartyPage() {
     controllerRef.current?.abort();
   };
 
+  const images = party.messages.filter((m) => m.kind === "image");
+  const texts = party.messages.filter((m) => m.kind !== "image");
+  const rendering = images.some((m) => m.status === "pending");
+  // One GPU. A diffusion pipeline loading while the narrator is resident is
+  // an out-of-memory error, and two renders at once is the same problem
+  // twice — so composing is blocked during either, with the reason said out
+  // loud rather than a button greyed for no stated cause.
+  const gpuBusy = gpuBusyReason(streaming, rendering);
+
   return (
     <div className="flex flex-col gap-6">
       <div className="flex flex-col gap-1">
@@ -307,91 +333,154 @@ export function PartyPage() {
         <p className="text-sm text-neutral-500">Scénario&nbsp;: {party.scenarioTitle}</p>
       </div>
       {error ? <p className="text-sm text-red-400">{error}</p> : null}
-      <MemoryPanel party={party} onSave={saveMemory} />
-      <PromptPanel partyId={party.id} />
-      {party.messages.length === 0 && pending === null ? (
-        <p className="text-neutral-500">Aucun message pour l'instant.</p>
-      ) : null}
-      <ul className="flex flex-col gap-4">
-        {party.messages.map((message) =>
-          message.kind === "image" ? (
-            <ImageMessage
-              key={message.id}
-              message={message}
+
+      <div className="flex flex-col gap-6">
+          <MemoryPanel party={party} onSave={saveMemory} />
+          <PromptPanel partyId={party.id} />
+          {texts.length === 0 && pending === null ? (
+            <p className="text-neutral-500">Aucun message pour l'instant.</p>
+          ) : null}
+          <ul className="flex flex-col gap-3">
+            {texts.map((message) => (
+              <MessageBubble
+                key={message.id}
+                message={message}
+                disabled={streaming}
+                regenerating={regeneratingId === message.id}
+                // The old reply stays on screen until the first token of the
+                // new one arrives: `overrideText` is undefined until then.
+                overrideText={
+                  regeneratingId === message.id && streamText !== null ? streamText : undefined
+                }
+                onSaveEdit={saveEdit}
+                onRegenerate={(messageTarget) => void regenerate(messageTarget)}
+                onSwitchVariant={(messageTarget, variantId) =>
+                  void switchVariant(messageTarget, variantId)
+                }
+              />
+            ))}
+            {pending !== null ? <MessageBubble message={pendingMessage(pending)} disabled /> : null}
+            {streamText !== null && regeneratingId === null ? (
+              <StreamingBubble text={streamText} />
+            ) : null}
+          </ul>
+          <div ref={endRef} />
+          {streamError ? <p className="text-sm text-red-400">{streamError}</p> : null}
+          {/* The warning issue #6 exists for. Ollama truncates an over-long
+              prompt in silence, from the front, system prompt first — the
+              narrator then forgets the scenario with nothing to explain it. */}
+          {party.context.nearLimit ? (
+            <p className="rounded border border-amber-800 bg-amber-950/40 px-3 py-2 text-sm text-amber-300">
+              Le prompt approche la fenêtre de contexte&nbsp;:{" "}
+              {party.context.estimatedTokens.toLocaleString("fr-FR")} jetons estimés sur{" "}
+              {party.context.numCtx.toLocaleString("fr-FR")}. Au-delà, Ollama coupe le début du
+              prompt sans le dire — le prompt système d'abord, donc le scénario. Augmentez la
+              fenêtre de contexte ou réduisez la fenêtre de mémoire dans les réglages.
+            </p>
+          ) : null}
+          <form
+            className="flex gap-2"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void send();
+            }}
+          >
+            <input
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
               disabled={streaming}
-              onCancel={(messageTarget) => void cancelImage(messageTarget)}
+              placeholder="Que faites-vous&nbsp;?"
+              className="flex-1 rounded border border-neutral-700 bg-neutral-900 px-3 py-2 text-neutral-100 placeholder:text-neutral-600 focus:border-sky-700 focus:outline-none disabled:opacity-50"
             />
-          ) : (
-            <MessageBubble
-              key={message.id}
-              message={message}
-              disabled={streaming}
-              regenerating={regeneratingId === message.id}
-              // The old reply stays on screen until the first token of the new
-              // one arrives: `overrideText` is undefined until then.
-              overrideText={
-                regeneratingId === message.id && streamText !== null ? streamText : undefined
-              }
-              onSaveEdit={saveEdit}
-              onRegenerate={(messageTarget) => void regenerate(messageTarget)}
-              onSwitchVariant={(messageTarget, variantId) =>
-                void switchVariant(messageTarget, variantId)
-              }
-            />
-          ),
-        )}
-        {pending !== null ? <MessageBubble message={pendingMessage(pending)} disabled /> : null}
-        {streamText !== null && regeneratingId === null ? (
-          <StreamingBubble text={streamText} />
-        ) : null}
-      </ul>
-      <div ref={endRef} />
-      {streamError ? <p className="text-sm text-red-400">{streamError}</p> : null}
-      {/* The warning issue #6 exists for. Ollama truncates an over-long prompt
-          in silence, from the front, system prompt first — the narrator then
-          forgets the scenario with nothing on screen to explain it. */}
-      {party.context.nearLimit ? (
-        <p className="rounded border border-amber-800 bg-amber-950/40 px-3 py-2 text-sm text-amber-300">
-          Le prompt approche la fenêtre de contexte&nbsp;:{" "}
-          {party.context.estimatedTokens.toLocaleString("fr-FR")} jetons estimés sur{" "}
-          {party.context.numCtx.toLocaleString("fr-FR")}. Au-delà, Ollama coupe le début du
-          prompt sans le dire — le prompt système d'abord, donc le scénario. Augmentez la
-          fenêtre de contexte ou réduisez la fenêtre de mémoire dans les réglages.
-        </p>
+            {streaming ? (
+              <Button type="button" variant="danger" onClick={stop}>
+                Arrêter
+              </Button>
+            ) : (
+              <Button type="submit" disabled={!input.trim()}>
+                Envoyer
+              </Button>
+            )}
+          </form>
+      </div>
+
+      {showImages ? (
+        // An overlay, not a column: it floats above the page, so opening it
+        // leaves the transcript exactly where and as wide as it was. Its own
+        // scroll, because a fixed panel taller than the window would hide
+        // its last images; clear of the two floating buttons above and below.
+        <aside className="fixed bottom-20 right-6 top-32 z-20 w-96 overflow-y-auto rounded-lg border border-neutral-800 bg-neutral-950/95 p-4 shadow-2xl backdrop-blur">
+          {/* key: the composer keeps its prompt in local state, so a party
+              change must remount it rather than show one party's prompt on
+              another party's page. */}
+          <ImageGallery
+            key={party.id}
+            partyId={party.id}
+            images={images}
+            busy={gpuBusy !== null}
+            busyReason={gpuBusy}
+            onGenerationStarted={() => void load(party.id)}
+            onCancel={(messageId) => void cancelImage(messageId)}
+            onDelete={(messageId) => setConfirmDeleteImageId(messageId)}
+          />
+        </aside>
       ) : null}
-      <form
-        className="flex gap-2"
-        onSubmit={(e) => {
-          e.preventDefault();
-          void send();
-        }}
+
+      <button
+        type="button"
+        onClick={() => setShowImages((open) => !open)}
+        aria-pressed={showImages}
+        // Fixed just under the sticky site header: the gallery belongs to the
+        // top of the page, but opening it must not require scrolling back up
+        // through a long story.
+        className={`fixed right-6 top-20 z-30 ${floatingButtonClasses}`}
       >
-        <input
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          disabled={streaming}
-          placeholder="Que faites-vous&nbsp;?"
-          className="flex-1 rounded border border-neutral-700 bg-neutral-900 px-3 py-2 text-neutral-100 placeholder:text-neutral-600 focus:border-sky-700 focus:outline-none disabled:opacity-50"
-        />
-        {streaming ? (
-          <Button type="button" variant="danger" onClick={stop}>
-            Arrêter
-          </Button>
-        ) : (
-          <Button type="submit" disabled={!input.trim()}>
-            Envoyer
-          </Button>
-        )}
-      </form>
-      {/* key: the panel keeps its composed prompt in local state, so a party
-          change must remount it rather than show one party's prompt on
-          another party's page. */}
-      <ImagePanel
-        key={party.id}
-        partyId={party.id}
-        onGenerationStarted={() => void load(party.id)}
+        {imagesButtonLabel(showImages, images.length)}
+      </button>
+      <ScrollToBottomButton targetRef={endRef} />
+
+      <ConfirmDialog
+        open={confirmDeleteImageId !== null}
+        title="Supprimer cette image ?"
+        description="L'image et son fichier sont supprimés définitivement."
+        onConfirm={() => {
+          if (confirmDeleteImageId !== null) void deleteImage(confirmDeleteImageId);
+        }}
+        onCancel={() => setConfirmDeleteImageId(null)}
       />
     </div>
+  );
+}
+
+/** Why the GPU cannot take an image right now, or null when it can. */
+function gpuBusyReason(streaming: boolean, rendering: boolean): string | null {
+  if (streaming) {
+    return "Le narrateur écrit. La génération d'image attend la fin du tour : les deux ne tiennent pas ensemble sur la carte.";
+  }
+  if (rendering) return "Une image est déjà en cours de rendu.";
+  return null;
+}
+
+function imagesButtonLabel(open: boolean, count: number): string {
+  if (open) return "Masquer les images";
+  return count > 0 ? `Images (${count})` : "Images";
+}
+
+const floatingButtonClasses =
+  "rounded-full border border-neutral-700 bg-neutral-900/95 px-3 py-2 text-sm text-neutral-200 shadow-lg backdrop-blur hover:bg-neutral-800";
+
+/** A floating button that jumps to the end of the transcript. Always shown. */
+function ScrollToBottomButton({ targetRef }: { targetRef: React.RefObject<HTMLDivElement | null> }) {
+  return (
+    <button
+      type="button"
+      onClick={() => targetRef.current?.scrollIntoView({ behavior: "smooth" })}
+      aria-label="Aller en bas de la partie"
+      title="Aller en bas"
+      className={`fixed bottom-6 right-6 z-30 ${floatingButtonClasses}`}
+    >
+      ↓
+    </button>
   );
 }
 
@@ -465,11 +554,17 @@ function MessageBubble({
   const text = overrideText ?? message.content;
 
   return (
-    <li
-      className={`rounded-lg border p-4 ${
-        isPlayer ? "border-sky-800 bg-sky-950/40" : "border-neutral-800 bg-neutral-900"
-      }`}
-    >
+    // Laid out like a messaging thread: the player on the right, the narrator
+    // on the left, neither taking the full width — a line that runs the whole
+    // column is hard to come back to after a blink.
+    <li className={`group flex flex-col ${isPlayer ? "items-end" : "items-start"}`}>
+      <div
+        className={`max-w-[85%] rounded-2xl border px-4 py-3 ${
+          isPlayer
+            ? "rounded-br-sm border-sky-800 bg-sky-950/50"
+            : "rounded-bl-sm border-neutral-800 bg-neutral-900"
+        }`}
+      >
       <p className="text-xs font-medium uppercase tracking-wide text-neutral-500">
         {isPlayer ? "Vous" : "Narration"}
       </p>
@@ -532,7 +627,9 @@ function MessageBubble({
               </Button>
             </div>
           ) : null}
-          <div className="mt-2 flex gap-2">
+          {/* Actions on hover: in a transcript read end to end, a row of
+              buttons under every bubble is most of what you see. */}
+          <div className="mt-2 flex gap-2 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
             <Button
               variant="secondary"
               className="text-xs"
@@ -554,15 +651,18 @@ function MessageBubble({
           </div>
         </>
       )}
+      </div>
     </li>
   );
 }
 
 function StreamingBubble({ text }: { text: string }) {
   return (
-    <li className="rounded-lg border border-neutral-800 bg-neutral-900 p-4">
-      <p className="text-xs font-medium uppercase tracking-wide text-neutral-500">Narration</p>
-      <Narration text={text} />
+    <li className="flex flex-col items-start">
+      <div className="max-w-[85%] rounded-2xl rounded-bl-sm border border-neutral-800 bg-neutral-900 px-4 py-3">
+        <p className="text-xs font-medium uppercase tracking-wide text-neutral-500">Narration</p>
+        <Narration text={text} />
+      </div>
     </li>
   );
 }

@@ -74,6 +74,28 @@ def list_models() -> list[str]:
 UNLOAD_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
 
 
+# A status pill must answer while the page renders, not after a model call's
+# read timeout. The probe gets its own short budget for that reason.
+PROBE_TIMEOUT = httpx.Timeout(2.0, connect=2.0)
+
+
+def probe() -> str | None:
+    """None when Ollama answers, else why it did not.
+
+    Cheap on purpose — the model list is the lightest endpoint that proves
+    the server is really there — and short-timed, because this runs on a
+    header refresh and must never make the interface wait.
+    """
+    try:
+        with httpx.Client(base_url=OLLAMA_BASE_URL, timeout=PROBE_TIMEOUT) as client:
+            response = client.get("/api/tags")
+    except httpx.HTTPError as exc:
+        return f"Ollama is unreachable at {OLLAMA_BASE_URL}: {exc}"
+    if response.status_code >= 400:
+        return f"Ollama returned HTTP {response.status_code}"
+    return None
+
+
 def unload(model: str) -> None:
     """Ask Ollama to drop `model` from memory now, instead of at its idle timer.
 
