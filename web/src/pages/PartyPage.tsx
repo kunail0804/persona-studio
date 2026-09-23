@@ -325,17 +325,12 @@ export function PartyPage() {
 
   return (
     <div className="flex flex-col gap-6">
-      <div className="flex items-start justify-between gap-4">
-        <div className="flex flex-col gap-1">
-          <Link to="/parties" className="text-sm text-neutral-500 hover:text-neutral-300">
-            ← Toutes les parties
-          </Link>
-          <h1 className="text-2xl font-semibold">{party.label}</h1>
-          <p className="text-sm text-neutral-500">Scénario&nbsp;: {party.scenarioTitle}</p>
-        </div>
-        <Button variant="secondary" onClick={() => setShowImages((open) => !open)}>
-          {imagesButtonLabel(showImages, images.length)}
-        </Button>
+      <div className="flex flex-col gap-1">
+        <Link to="/parties" className="text-sm text-neutral-500 hover:text-neutral-300">
+          ← Toutes les parties
+        </Link>
+        <h1 className="text-2xl font-semibold">{party.label}</h1>
+        <p className="text-sm text-neutral-500">Scénario&nbsp;: {party.scenarioTitle}</p>
       </div>
       {error ? <p className="text-sm text-red-400">{error}</p> : null}
 
@@ -431,7 +426,12 @@ export function PartyPage() {
         ) : null}
       </div>
 
-      <ScrollToBottomButton targetRef={endRef} />
+      <FloatingActions
+        targetRef={endRef}
+        imagesLabel={imagesButtonLabel(showImages, images.length)}
+        imagesOpen={showImages}
+        onToggleImages={() => setShowImages((open) => !open)}
+      />
 
       <ConfirmDialog
         open={confirmDeleteImageId !== null}
@@ -460,36 +460,61 @@ function imagesButtonLabel(open: boolean, count: number): string {
   return count > 0 ? `Images (${count})` : "Images";
 }
 
+interface FloatingActionsProps {
+  targetRef: React.RefObject<HTMLDivElement | null>;
+  imagesLabel: string;
+  imagesOpen: boolean;
+  onToggleImages: () => void;
+}
+
+const floatingButtonClasses =
+  "rounded-full border border-neutral-700 bg-neutral-900/95 px-3 py-2 text-sm text-neutral-200 shadow-lg backdrop-blur hover:bg-neutral-800";
+
 /**
- * A floating button that jumps to the end of the transcript, shown only when
- * the end is off screen — a button that does nothing when you are already
- * there is noise.
+ * The party's two controls that must stay in reach however far the
+ * transcript is scrolled, stacked in one column at the bottom right.
+ *
+ * The images toggle is always there: it used to sit in the party header, so
+ * opening the gallery meant scrolling back to the top of a long story. The
+ * jump-to-end button appears only while the end is off screen — a button
+ * that does nothing when you are already there is noise.
  */
-function ScrollToBottomButton({ targetRef }: { targetRef: React.RefObject<HTMLDivElement | null> }) {
-  const [visible, setVisible] = useState(false);
+function FloatingActions({ targetRef, imagesLabel, imagesOpen, onToggleImages }: FloatingActionsProps) {
+  const [endOffScreen, setEndOffScreen] = useState(false);
 
   useEffect(() => {
     const target = targetRef.current;
     if (target === null) return;
     const observer = new IntersectionObserver(
-      ([entry]) => setVisible(!entry.isIntersecting),
+      ([entry]) => setEndOffScreen(!entry.isIntersecting),
       { rootMargin: "0px 0px -80px 0px" },
     );
     observer.observe(target);
     return () => observer.disconnect();
   }, [targetRef]);
 
-  if (!visible) return null;
   return (
-    <button
-      type="button"
-      onClick={() => targetRef.current?.scrollIntoView({ behavior: "smooth" })}
-      aria-label="Aller en bas de la partie"
-      title="Aller en bas"
-      className="fixed bottom-6 right-6 z-30 rounded-full border border-neutral-700 bg-neutral-900/95 px-3 py-2 text-neutral-200 shadow-lg backdrop-blur hover:bg-neutral-800"
-    >
-      ↓
-    </button>
+    <div className="fixed bottom-6 right-6 z-30 flex flex-col items-end gap-2">
+      <button
+        type="button"
+        onClick={onToggleImages}
+        aria-pressed={imagesOpen}
+        className={floatingButtonClasses}
+      >
+        {imagesLabel}
+      </button>
+      {endOffScreen ? (
+        <button
+          type="button"
+          onClick={() => targetRef.current?.scrollIntoView({ behavior: "smooth" })}
+          aria-label="Aller en bas de la partie"
+          title="Aller en bas"
+          className={floatingButtonClasses}
+        >
+          ↓
+        </button>
+      ) : null}
+    </div>
   );
 }
 
