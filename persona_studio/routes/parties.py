@@ -239,7 +239,7 @@ def _next_turn_messages(
     prompt the player can read are the same object the turn would send — not
     a second rendering of it that can drift.
     """
-    scenario = narrator.load_scenario(con, row["scenario_id"])
+    scenario = narrator.load_party_scenario(con, row["id"])
     persona = narrator.load_persona(con, row["persona_id"])
     history = narrator.load_history(
         con,
@@ -504,6 +504,7 @@ def create_party(scenario_id: str, body: PartyInput) -> PartySummary:
                     now,
                 ),
             )
+            db.copy_scenario_world(con, scenario_id, party_id)
             stored = con.execute(
                 "SELECT persona_id FROM instance WHERE id = ?", (party_id,)
             ).fetchone()
@@ -849,7 +850,7 @@ def _prepare_turn_locked(
         # After the checks the order tests pin, before the player's text is
         # written: a refused turn must leave nothing behind.
         _refuse_while_rendering(con)
-        scenario = narrator.load_scenario(con, party["scenario_id"])
+        scenario = narrator.load_party_scenario(con, party_id)
         persona = narrator.load_persona(con, party["persona_id"])
         num_ctx = settings.get_num_ctx(con)
         now = time.time()
@@ -982,7 +983,7 @@ def _prepare_regenerate_locked(
                 detail="Only a narrator's text message can be regenerated.",
             )
         _refuse_while_rendering(con)
-        scenario = narrator.load_scenario(con, party["scenario_id"])
+        scenario = narrator.load_party_scenario(con, party_id)
         persona = narrator.load_persona(con, party["persona_id"])
         num_ctx = settings.get_num_ctx(con)
         history = narrator.load_history(

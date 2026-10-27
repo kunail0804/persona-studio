@@ -20,6 +20,7 @@ import { Button } from "../components/Button";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { TextArea } from "../components/TextArea";
 import { ImageGallery } from "../components/ImageGallery";
+import { PartyWorldPanel } from "../components/PartyWorldPanel";
 
 // The bubble re-renders at most this often while fragments arrive. Every
 // fragment is still accumulated; only the re-render is throttled. The
@@ -63,6 +64,7 @@ export function PartyPage() {
   const [streaming, setStreaming] = useState(false);
   const [regeneratingId, setRegeneratingId] = useState<number | null>(null);
   const [showImages, setShowImages] = useState(false);
+  const [showWorld, setShowWorld] = useState(false);
   const [confirmDeleteImageId, setConfirmDeleteImageId] = useState<number | null>(null);
 
   const load = useCallback(async (partyId: string, signal?: AbortSignal): Promise<boolean> => {
@@ -448,17 +450,43 @@ export function PartyPage() {
         </aside>
       ) : null}
 
-      <button
-        type="button"
-        onClick={() => setShowImages((open) => !open)}
-        aria-pressed={showImages}
-        // Fixed just under the sticky site header: the gallery belongs to the
-        // top of the page, but opening it must not require scrolling back up
-        // through a long story.
-        className={`fixed right-6 top-20 z-30 ${floatingButtonClasses}`}
-      >
-        {imagesButtonLabel(showImages, images.length)}
-      </button>
+      {showWorld ? (
+        // Same place and shape as the image panel. The two never show at
+        // once: opening one closes the other, so neither hides the other.
+        <aside className="fixed bottom-20 right-6 top-32 z-20 w-[28rem] overflow-y-auto rounded-lg border border-neutral-800 bg-neutral-950/95 p-4 shadow-2xl backdrop-blur">
+          {/* key: a party change must reload the panel, not show one
+              party's world on another party's page. */}
+          <PartyWorldPanel key={party.id} partyId={party.id} />
+        </aside>
+      ) : null}
+
+      {/* Fixed just under the sticky site header: the panels belong to the
+          top of the page, but opening one must not require scrolling back up
+          through a long story. */}
+      <div className="fixed right-6 top-20 z-30 flex gap-2">
+        <button
+          type="button"
+          onClick={() => {
+            setShowWorld((open) => !open);
+            setShowImages(false);
+          }}
+          aria-pressed={showWorld}
+          className={floatingButtonClasses}
+        >
+          {showWorld ? "Masquer le monde" : "Monde"}
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            setShowImages((open) => !open);
+            setShowWorld(false);
+          }}
+          aria-pressed={showImages}
+          className={floatingButtonClasses}
+        >
+          {imagesButtonLabel(showImages, images.length)}
+        </button>
+      </div>
       <ScrollToBottomButton targetRef={endRef} />
 
       <ConfirmDialog

@@ -410,11 +410,61 @@ def context_usage(messages: Sequence[dict[str, str]], num_ctx: int) -> ContextUs
 
 
 def load_scenario(con: sqlite3.Connection, scenario_id: str) -> PromptScenario:
-    """Read a scenario and its characters, in order, as prompt inputs.
+    """Read a scenario and its own characters, places and lore, as prompt inputs.
+
+    This is the scenario as written in its editor. A party in progress reads
+    its own copy of the world instead — see `load_party_scenario`. The only
+    caller left is a new party's opening, which runs before the party exists.
 
     Raises LookupError when the scenario does not exist; the route that calls
     this is the one that turns that into a 404.
     """
+    return _load_prompt_scenario(
+        con,
+        scenario_id,
+        characters_table="character",
+        places_table="place",
+        lore_table="lore",
+        owner_column="scenario_id",
+        owner_id=scenario_id,
+    )
+
+
+def load_party_scenario(con: sqlite3.Connection, party_id: str) -> PromptScenario:
+    """The scenario as one party plays it.
+
+    Title, synopsis, rules and arcs come from the scenario: they never change
+    during a party. Characters, places and lore come from the party's own copy
+    (schema v5), which the player edits while playing.
+
+    Raises LookupError when the party or its scenario does not exist.
+    """
+    party = con.execute("SELECT scenario_id FROM instance WHERE id = ?", (party_id,)).fetchone()
+    if party is None:
+        raise LookupError(f"Party {party_id!r} not found")
+    return _load_prompt_scenario(
+        con,
+        party["scenario_id"],
+        characters_table="party_character",
+        places_table="party_place",
+        lore_table="party_lore",
+        owner_column="instance_id",
+        owner_id=party_id,
+    )
+
+
+def _load_prompt_scenario(
+    con: sqlite3.Connection,
+    scenario_id: str,
+    *,
+    characters_table: str,
+    places_table: str,
+    lore_table: str,
+    owner_column: str,
+    owner_id: str,
+) -> PromptScenario:
+    # The table and column names are the two callers' constants above, never
+    # request data: they are the only thing interpolated, every value is bound.
     row = con.execute(
         "SELECT title, synopsis, world_rules, arcs FROM scenario WHERE id = ?",
         (scenario_id,),
@@ -432,8 +482,8 @@ def load_scenario(con: sqlite3.Connection, scenario_id: str) -> PromptScenario:
         )
         for character_row in con.execute(
             "SELECT name, appearance, personality, story, relationships, secrets "
-            "FROM character WHERE scenario_id = ? ORDER BY position",
-            (scenario_id,),
+            f"FROM {characters_table} WHERE {owner_column} = ? ORDER BY position",
+            (owner_id,),
         ).fetchall()
     )
     places = tuple(
@@ -443,16 +493,16 @@ def load_scenario(con: sqlite3.Connection, scenario_id: str) -> PromptScenario:
             atmosphere=place_row["atmosphere"],
         )
         for place_row in con.execute(
-            "SELECT name, description, atmosphere FROM place "
-            "WHERE scenario_id = ? ORDER BY position",
-            (scenario_id,),
+            f"SELECT name, description, atmosphere FROM {places_table} "
+            f"WHERE {owner_column} = ? ORDER BY position",
+            (owner_id,),
         ).fetchall()
     )
     lore = tuple(
         PromptLore(keywords=parse_keywords(lore_row["keywords"]), text=lore_row["text"])
         for lore_row in con.execute(
-            "SELECT keywords, text FROM lore WHERE scenario_id = ? ORDER BY position",
-            (scenario_id,),
+            f"SELECT keywords, text FROM {lore_table} WHERE {owner_column} = ? ORDER BY position",
+            (owner_id,),
         ).fetchall()
     )
     return PromptScenario(

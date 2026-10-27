@@ -25,7 +25,7 @@ DATA_DIR = Path(os.environ.get("PS_DATA", Path(__file__).resolve().parent.parent
 DB_PATH = DATA_DIR / "studio.db"
 IMAGES_DIR = DATA_DIR / "images"
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def _configure(con: sqlite3.Connection) -> None:
@@ -312,7 +312,93 @@ MIGRATIONS: list[str] = [
         )
     );
     """,
+    # --- v5 : le monde d'une partie lui appartient --------------------------
+    #
+    # Personnages, lieux et lore étaient lus dans le scénario à chaque tour :
+    # toutes les parties d'un scénario partageaient les mêmes fiches. Le
+    # joueur veut créer ou changer un personnage en cours de partie sans
+    # toucher au scénario ni aux autres parties. Chaque partie reçoit donc sa
+    # propre copie, prise à sa création ; le scénario reste le modèle.
+    # Titre, synopsis, règles et arcs restent lus dans le scénario.
+    #
+    # Les parties existantes reçoivent une copie de l'état actuel de leur
+    # scénario : c'est exactement ce qu'elles lisaient jusqu'ici, donc rien
+    # ne change pour elles au premier tour après la migration.
+    #
+    # Pas de `portrait_id` : aucun écran de partie n'affiche de portrait.
+    """
+    CREATE TABLE party_character (
+        id            INTEGER PRIMARY KEY,
+        instance_id   TEXT NOT NULL REFERENCES instance(id) ON DELETE CASCADE,
+        position      INTEGER NOT NULL,
+        name          TEXT NOT NULL DEFAULT '',
+        appearance    TEXT NOT NULL DEFAULT '',
+        personality   TEXT NOT NULL DEFAULT '',
+        story         TEXT NOT NULL DEFAULT '',
+        relationships TEXT NOT NULL DEFAULT '',
+        secrets       TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX party_character_by_instance ON party_character(instance_id, position);
+
+    CREATE TABLE party_place (
+        id          INTEGER PRIMARY KEY,
+        instance_id TEXT NOT NULL REFERENCES instance(id) ON DELETE CASCADE,
+        position    INTEGER NOT NULL,
+        name        TEXT NOT NULL DEFAULT '',
+        description TEXT NOT NULL DEFAULT '',
+        atmosphere  TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX party_place_by_instance ON party_place(instance_id, position);
+
+    CREATE TABLE party_lore (
+        id          INTEGER PRIMARY KEY,
+        instance_id TEXT NOT NULL REFERENCES instance(id) ON DELETE CASCADE,
+        position    INTEGER NOT NULL,
+        keywords    TEXT NOT NULL DEFAULT '[]',
+        text        TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX party_lore_by_instance ON party_lore(instance_id, position);
+
+    INSERT INTO party_character
+        (instance_id, position, name, appearance, personality, story, relationships, secrets)
+    SELECT instance.id, character.position, character.name, character.appearance,
+           character.personality, character.story, character.relationships, character.secrets
+    FROM instance JOIN character ON character.scenario_id = instance.scenario_id;
+
+    INSERT INTO party_place (instance_id, position, name, description, atmosphere)
+    SELECT instance.id, place.position, place.name, place.description, place.atmosphere
+    FROM instance JOIN place ON place.scenario_id = instance.scenario_id;
+
+    INSERT INTO party_lore (instance_id, position, keywords, text)
+    SELECT instance.id, lore.position, lore.keywords, lore.text
+    FROM instance JOIN lore ON lore.scenario_id = instance.scenario_id;
+    """,
 ]
+
+
+def copy_scenario_world(con: sqlite3.Connection, scenario_id: str, party_id: str) -> None:
+    """Give a new party its own copy of the scenario's characters, places and lore.
+
+    Called in the transaction that inserts the party, so a party never exists
+    without its world. The same three statements as migration v5, for one party.
+    """
+    con.execute(
+        "INSERT INTO party_character "
+        "(instance_id, position, name, appearance, personality, story, relationships, secrets) "
+        "SELECT ?, position, name, appearance, personality, story, relationships, secrets "
+        "FROM character WHERE scenario_id = ?",
+        (party_id, scenario_id),
+    )
+    con.execute(
+        "INSERT INTO party_place (instance_id, position, name, description, atmosphere) "
+        "SELECT ?, position, name, description, atmosphere FROM place WHERE scenario_id = ?",
+        (party_id, scenario_id),
+    )
+    con.execute(
+        "INSERT INTO party_lore (instance_id, position, keywords, text) "
+        "SELECT ?, position, keywords, text FROM lore WHERE scenario_id = ?",
+        (party_id, scenario_id),
+    )
 
 
 def migrate() -> int:

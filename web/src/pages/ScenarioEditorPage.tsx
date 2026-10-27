@@ -267,14 +267,14 @@ export function ScenarioEditorPage() {
       </section>
 
       <PlacesSection
-        scenarioId={scenarioId}
+        owner={{ kind: "scenario", id: scenarioId }}
         places={places}
         onChanged={() => load(scenarioId)}
         onError={setError}
       />
 
       <LoreSection
-        scenarioId={scenarioId}
+        owner={{ kind: "scenario", id: scenarioId }}
         entries={lore}
         onChanged={() => load(scenarioId)}
         onError={setError}
