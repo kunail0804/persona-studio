@@ -14,6 +14,7 @@ from .routes import (
     images,
     lore,
     parties,
+    party_world,
     personas,
     places,
     scenarios,
@@ -49,6 +50,7 @@ app.include_router(places.router, prefix="/api")
 app.include_router(lore.router, prefix="/api")
 app.include_router(personas.router, prefix="/api")
 app.include_router(parties.router, prefix="/api")
+app.include_router(party_world.router, prefix="/api")
 app.include_router(images.router, prefix="/api")
 app.include_router(image_presets.router, prefix="/api")
 app.include_router(settings.router, prefix="/api")

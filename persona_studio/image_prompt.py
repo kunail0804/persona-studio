@@ -361,15 +361,15 @@ def load_inputs(con: sqlite3.Connection, party_id: str) -> ImagePromptInputs:
     characters = tuple(
         Appearance(name=row["name"], appearance=row["appearance"])
         for row in con.execute(
-            "SELECT name, appearance FROM character WHERE scenario_id = ? ORDER BY position",
-            (party["scenario_id"],),
+            "SELECT name, appearance FROM party_character WHERE instance_id = ? ORDER BY position",
+            (party_id,),
         ).fetchall()
     )
     places = tuple(
         Appearance(name=row["name"], appearance=row["description"])
         for row in con.execute(
-            "SELECT name, description FROM place WHERE scenario_id = ? ORDER BY position",
-            (party["scenario_id"],),
+            "SELECT name, description FROM party_place WHERE instance_id = ? ORDER BY position",
+            (party_id,),
         ).fetchall()
     )
     return ImagePromptInputs(

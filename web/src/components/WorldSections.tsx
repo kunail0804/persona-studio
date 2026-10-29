@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { ApiError } from "../api/client";
-import type { LoreEntry, Place } from "../api/world";
+import type { LoreEntry, Place, WorldOwner } from "../api/world";
 import {
   createLore,
   createPlace,
@@ -18,7 +18,7 @@ function messageFor(error: unknown, fallback: string): string {
 }
 
 interface PlacesSectionProps {
-  scenarioId: string;
+  owner: WorldOwner;
   places: Place[];
   onChanged: () => Promise<void>;
   onError: (message: string) => void;
@@ -28,17 +28,17 @@ interface PlacesSectionProps {
  * The scenario's places. Every place rides in every narrator prompt, like a
  * character: the narrator has to know a place exists to take the story there.
  */
-export function PlacesSection({ scenarioId, places, onChanged, onError }: PlacesSectionProps) {
+export function PlacesSection({ owner, places, onChanged, onError }: PlacesSectionProps) {
   const [adding, setAdding] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
 
   const save = async (id: number | null, input: { name: string; description: string; atmosphere: string }) => {
     try {
       if (id === null) {
-        await createPlace(scenarioId, input);
+        await createPlace(owner, input);
         setAdding(false);
       } else {
-        await updatePlace(scenarioId, id, input);
+        await updatePlace(owner, id, input);
         setEditingId(null);
       }
       await onChanged();
@@ -49,7 +49,7 @@ export function PlacesSection({ scenarioId, places, onChanged, onError }: Places
 
   const remove = async (id: number) => {
     try {
-      await deletePlace(scenarioId, id);
+      await deletePlace(owner, id);
       await onChanged();
     } catch (err) {
       onError(messageFor(err, "Impossible de supprimer le lieu."));
@@ -143,7 +143,7 @@ function PlaceForm({ initial, onSubmit, onCancel }: PlaceFormProps) {
 }
 
 interface LoreSectionProps {
-  scenarioId: string;
+  owner: WorldOwner;
   entries: LoreEntry[];
   onChanged: () => Promise<void>;
   onError: (message: string) => void;
@@ -154,17 +154,17 @@ interface LoreSectionProps {
  * messages use one of its keywords — which is what lets a world hold many
  * facts without every prompt carrying all of them.
  */
-export function LoreSection({ scenarioId, entries, onChanged, onError }: LoreSectionProps) {
+export function LoreSection({ owner, entries, onChanged, onError }: LoreSectionProps) {
   const [adding, setAdding] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
 
   const save = async (id: number | null, input: { keywords: string[]; text: string }) => {
     try {
       if (id === null) {
-        await createLore(scenarioId, input);
+        await createLore(owner, input);
         setAdding(false);
       } else {
-        await updateLore(scenarioId, id, input);
+        await updateLore(owner, id, input);
         setEditingId(null);
       }
       await onChanged();
@@ -175,7 +175,7 @@ export function LoreSection({ scenarioId, entries, onChanged, onError }: LoreSec
 
   const remove = async (id: number) => {
     try {
-      await deleteLore(scenarioId, id);
+      await deleteLore(owner, id);
       await onChanged();
     } catch (err) {
       onError(messageFor(err, "Impossible de supprimer l'entrée."));

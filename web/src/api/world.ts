@@ -2,6 +2,27 @@ import { request, requestVoid } from "./client";
 import { expectArray, expectInteger, expectString, isRecord } from "./validate";
 
 /**
+ * Who owns a list of places and lore entries. A scenario owns the model its
+ * editor writes; a party owns its own copy, edited while playing, which the
+ * scenario and the other parties never see. The routes have the same shape
+ * under both prefixes.
+ */
+export type WorldOwner = { kind: "scenario"; id: string } | { kind: "party"; id: string };
+
+function ownerPath(owner: WorldOwner): string {
+  switch (owner.kind) {
+    case "scenario":
+      return `/scenarios/${owner.id}`;
+    case "party":
+      return `/parties/${owner.id}`;
+    default: {
+      const _exhaustive: never = owner;
+      return _exhaustive;
+    }
+  }
+}
+
+/**
  * A place of the scenario. The description is visual — it is what an image
  * prompt receives in place of the name. The atmosphere is for the narrator.
  */
@@ -33,7 +54,7 @@ export interface LoreInput {
   text: string;
 }
 
-function parsePlace(data: unknown): Place {
+export function parsePlace(data: unknown): Place {
   if (!isRecord(data)) throw new Error("Expected a place object");
   return {
     id: expectInteger(data.id, "id"),
@@ -43,7 +64,7 @@ function parsePlace(data: unknown): Place {
   };
 }
 
-function parseLoreEntry(data: unknown): LoreEntry {
+export function parseLoreEntry(data: unknown): LoreEntry {
   if (!isRecord(data)) throw new Error("Expected a lore entry object");
   return {
     id: expectInteger(data.id, "id"),
@@ -60,22 +81,22 @@ export function listPlaces(scenarioId: string, signal?: AbortSignal): Promise<Pl
   );
 }
 
-export function createPlace(scenarioId: string, input: PlaceInput): Promise<Place> {
-  return request(`/scenarios/${scenarioId}/places`, parsePlace, {
+export function createPlace(owner: WorldOwner, input: PlaceInput): Promise<Place> {
+  return request(`${ownerPath(owner)}/places`, parsePlace, {
     method: "POST",
     body: JSON.stringify(input),
   });
 }
 
-export function updatePlace(scenarioId: string, placeId: number, input: PlaceInput): Promise<Place> {
-  return request(`/scenarios/${scenarioId}/places/${placeId}`, parsePlace, {
+export function updatePlace(owner: WorldOwner, placeId: number, input: PlaceInput): Promise<Place> {
+  return request(`${ownerPath(owner)}/places/${placeId}`, parsePlace, {
     method: "PATCH",
     body: JSON.stringify(input),
   });
 }
 
-export function deletePlace(scenarioId: string, placeId: number): Promise<void> {
-  return requestVoid(`/scenarios/${scenarioId}/places/${placeId}`, { method: "DELETE" });
+export function deletePlace(owner: WorldOwner, placeId: number): Promise<void> {
+  return requestVoid(`${ownerPath(owner)}/places/${placeId}`, { method: "DELETE" });
 }
 
 export function listLore(scenarioId: string, signal?: AbortSignal): Promise<LoreEntry[]> {
@@ -86,20 +107,20 @@ export function listLore(scenarioId: string, signal?: AbortSignal): Promise<Lore
   );
 }
 
-export function createLore(scenarioId: string, input: LoreInput): Promise<LoreEntry> {
-  return request(`/scenarios/${scenarioId}/lore`, parseLoreEntry, {
+export function createLore(owner: WorldOwner, input: LoreInput): Promise<LoreEntry> {
+  return request(`${ownerPath(owner)}/lore`, parseLoreEntry, {
     method: "POST",
     body: JSON.stringify(input),
   });
 }
 
-export function updateLore(scenarioId: string, entryId: number, input: LoreInput): Promise<LoreEntry> {
-  return request(`/scenarios/${scenarioId}/lore/${entryId}`, parseLoreEntry, {
+export function updateLore(owner: WorldOwner, entryId: number, input: LoreInput): Promise<LoreEntry> {
+  return request(`${ownerPath(owner)}/lore/${entryId}`, parseLoreEntry, {
     method: "PATCH",
     body: JSON.stringify(input),
   });
 }
 
-export function deleteLore(scenarioId: string, entryId: number): Promise<void> {
-  return requestVoid(`/scenarios/${scenarioId}/lore/${entryId}`, { method: "DELETE" });
+export function deleteLore(owner: WorldOwner, entryId: number): Promise<void> {
+  return requestVoid(`${ownerPath(owner)}/lore/${entryId}`, { method: "DELETE" });
 }

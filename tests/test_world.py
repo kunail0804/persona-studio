@@ -412,7 +412,7 @@ def test_v4_gives_existing_parties_the_persona_they_were_already_played_as(
     )
     v3_database.commit()
 
-    assert db.migrate() == 4
+    assert db.migrate() == db.SCHEMA_VERSION
 
     row = v3_database.execute("SELECT persona_id FROM instance WHERE id = 'p'").fetchone()
     assert row["persona_id"] == "ash"
@@ -429,7 +429,7 @@ def test_v4_leaves_a_party_without_persona_when_the_setting_dangles(
     )
     v3_database.commit()
 
-    assert db.migrate() == 4
+    assert db.migrate() == db.SCHEMA_VERSION
 
     row = v3_database.execute("SELECT persona_id FROM instance WHERE id = 'p'").fetchone()
     assert row["persona_id"] is None

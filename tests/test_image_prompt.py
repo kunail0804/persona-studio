@@ -387,6 +387,9 @@ def _seed_party(
             "INSERT INTO character (scenario_id, position, name, appearance) VALUES (?, 1, ?, ?)",
             (scenario_id, "Marco", MARCO.appearance),
         )
+        # What `create_party` does: the party reads its own copy of the world
+        # since schema v5, not the scenario's.
+        db.copy_scenario_world(con, scenario_id, party_id)
         con.execute(
             "INSERT INTO message (instance_id, role, kind, content, ts) "
             "VALUES (?, 'assistant', 'text', ?, ?)",
