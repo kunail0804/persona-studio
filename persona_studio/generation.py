@@ -2,18 +2,25 @@
 
 An image takes minutes on this machine, so the whole job runs off the request
 path, on the shape `summarizer.py` established: the route does the reads and
-the first write, returns, and a daemon thread polls ComfyUI until the render
-lands, fails, or passes its deadline.
+the first write, returns, and a daemon thread polls comfy-gateway until the
+render lands, fails, or passes its deadline.
+
+The image is made by comfy-gateway, never by this application: it names the
+template chosen in the settings (and its preset), sends the prompt as the
+template's `prompt` role, and fetches the image the job returns. See
+`gateway.py`.
 
 The order of operations is issue #17's first criterion and is not negotiable:
 
-1. **Prepare the graph first.** A workflow that cannot generate is refused
-   before anything is written.
+1. **Check the setup first.** With no template chosen, the request is refused
+   before anything is written. Whether the gateway accepts the template is
+   only known when it answers the submission, and a refusal there deletes
+   the pending row again (step 3).
 2. **Persist the pending message before submitting.** The row carries
    `started_at` (the real age of the job, across reloads) and its `image_id`,
-   and it is committed before ComfyUI ever hears about the job. A navigation
+   and it is committed before the gateway ever hears about the job. A navigation
    or a reload finds it, whatever happens next.
-3. **Submit, then record the prompt id** as the row's `gen_id`. Between the
+3. **Submit, then record the gateway's job id** as the row's `gen_id`. Between the
    two sits a window where a pending row has no `gen_id`: if the process
    dies exactly there, the reader must not wait forever on an image that can
    never arrive — `recover_pending` marks those rows failed at startup.
@@ -25,13 +32,10 @@ transaction and writes only if the message is **still pending** and still
 carries **the same `gen_id` it was started with**. A completion arriving
 after a cancellation is discarded whole — status, row and PNG file.
 
-Cancelling is guarded the same way at the ComfyUI end. `POST /interrupt`
-stops whatever is executing *now*, not a job of our choosing, so the queue is
-read first: our prompt id running → interrupt; waiting → remove the queue
-entry, never interrupt (an unrelated render is on the GPU); in neither →
-finished or never queued, ComfyUI is not touched at all. The local cancel is
-written before any of that, so an unreachable ComfyUI still leaves the player
-with a cancelled image rather than a spinner.
+Cancelling asks the gateway to cancel that job id, and the gateway stops that
+prompt in ComfyUI and nothing else, whether it is queued or rendering. The
+local cancel is written first, so an unreachable gateway still leaves the
+player with a cancelled image rather than a spinner.
 
 That cancel cannot reach into the persist-to-submit window: there, a cancel
 lands on a row whose `gen_id` does not exist yet, so the stop path has
@@ -50,8 +54,7 @@ import time
 import uuid
 from dataclasses import dataclass
 
-from . import comfyui, db, ollama, settings, workflows
-from .workflows import WorkflowNotReady
+from . import db, gateway, gpu, settings
 
 # A render takes minutes: a poll every couple of seconds is a human cadence,
 # not a hot loop. Both are read from the module globals on every pass so a
@@ -60,6 +63,15 @@ POLL_INTERVAL_SECONDS = 2.0
 DEADLINE_SECONDS = 3600.0
 
 CANCEL_MESSAGE = "Generation cancelled."
+
+
+class ImageSetupNotReady(Exception):
+    """Images cannot be made yet: the message says what to set up."""
+
+
+NO_TEMPLATE_MESSAGE = (
+    "No image template is chosen: choose a comfy-gateway template in the settings."
+)
 
 # Every failure the module records — watcher errors, cancellations, the two
 # startup recoveries — marks its message row with the same statement.
@@ -71,7 +83,7 @@ class _Plan:
     """Everything the watcher needs, read before the thread starts.
 
     The route thread does the reads and returns; the thread only talks to
-    ComfyUI and writes, so no SQLite connection is ever shared across threads
+    the gateway and writes, so no SQLite connection is ever shared across threads
     or held across an HTTP call.
     """
 
@@ -103,9 +115,9 @@ def render_in_progress(con: sqlite3.Connection) -> bool:
 
     Global on purpose: the GPU is one card, not one per party, so a render in
     one party and a narrator call in another are the same out-of-memory as
-    both in the same party. The narrator is evicted before a render starts
-    (`_evict_narrator`); this is the other half — nothing loads it back while
-    the render runs.
+    both in the same party. Ollama is emptied before a render starts
+    (`gpu.make_room_for_render`); this is the other half — nothing loads the
+    narrator back while the render runs.
 
     A `pending` row whose watcher died with the process is marked failed at
     startup by `recover_pending`, so a crash cannot leave this true forever.
@@ -118,61 +130,24 @@ def render_in_progress(con: sqlite3.Connection) -> bool:
     )
 
 
-def _evict_narrator(model: str | None) -> None:
-    """Free the narration model's VRAM before a render takes the GPU.
-
-    Narration and image generation share one card. Measured on this machine:
-    a chat model still resident when a diffusion pipeline loads is an
-    out-of-memory error, not a slowdown — so the narrator is evicted before
-    the render starts rather than after it has already failed. The reverse
-    direction needs nothing here: the workflows in use carry their own VRAM
-    and RAM management nodes, so narration reloads normally once a render is
-    done.
-
-    Best effort, and deliberately so. This runs after the pending message is
-    committed and before the submission, so the player has already asked for
-    a render: an unreachable or unhappy Ollama must not turn that into an
-    error, and it is holding no VRAM anyway. The cost of a failed eviction is
-    one render that may not fit — which is the situation this call was trying
-    to improve, never one it makes worse.
-
-    Where this sits lengthens the persist-to-submit window by one HTTP call.
-    That window is already handled: a cancel landing in it is recorded, and
-    the submission that returns afterwards respects the cancellation instead
-    of stamping a live job id over it.
-    """
-    if model is None:
-        return
-    try:
-        ollama.unload(model)
-    except ollama.OllamaError:
-        return
-
-
 def start(party_id: str, prompt: str, instruction: str) -> StartResult:
     """Start one generation: persist pending, submit, watch in the background.
 
-    Raises `LookupError` for an unknown party and `WorkflowNotReady` (with
-    the message `workflows.problem()` returns) when the active workflow
-    cannot generate — both before a single row is written. A ComfyUI that
-    refuses the submission deletes the pending row it created — unless a
-    cancel landed during the round trip and already recorded its
-    cancellation, which stands.
+    Raises `LookupError` for an unknown party and `ImageSetupNotReady` when
+    no template is chosen, both before a single row is written. A gateway
+    that refuses or misses the submission deletes the pending row it created,
+    unless a cancel landed during the round trip and already recorded its
+    cancellation, which stands. The `gateway` error is raised again for the
+    route to answer.
     """
     with db.connect() as con:
         party = con.execute("SELECT id FROM instance WHERE id = ?", (party_id,)).fetchone()
         if party is None:
             raise LookupError(f"Party {party_id!r} not found")
-        row = workflows.resolve_active(con)
-        if row is None:
-            raise WorkflowNotReady(
-                "No workflow is imported: import one in the settings and map its prompt field."
-            )
-        # Read here, used after this connection closes: the eviction below is
-        # an HTTP call, and nothing in this project holds a SQLite connection
-        # across one.
-        narration_model = settings.get_llm_model(con)
-        graph = workflows.prepare_graph(row, prompt)
+        template = settings.get_image_template(con)
+        if template is None:
+            raise ImageSetupNotReady(NO_TEMPLATE_MESSAGE)
+        preset = settings.get_image_gateway_preset(con)
         now = time.time()
         # The image's id is drawn here because the PNG will carry it, but the
         # `image` row itself is only inserted at completion: `message.image_id`
@@ -189,11 +164,15 @@ def start(party_id: str, prompt: str, instruction: str) -> StartResult:
         if message_id is None:
             raise RuntimeError("The pending INSERT succeeded but returned no rowid")
 
-    _evict_narrator(narration_model)
+    # Every Ollama model, not only the narrator's, and waited for: see `gpu`.
+    # This lengthens the persist-to-submit window, which is already handled:
+    # a cancel landing in it is recorded, and the submission that returns
+    # afterwards respects it instead of stamping a live job id over it.
+    gpu.make_room_for_render()
 
     try:
-        gen_id = comfyui.submit(graph)
-    except comfyui.ComfyUIError:
+        gen_id = gateway.submit(template, preset, prompt)
+    except gateway.GatewayError:
         # Only a still-pending row is ours to clean up: a cancel that landed
         # during the round trip already turned it into a recorded
         # cancellation, and deleting that would erase the player's message.
@@ -220,7 +199,7 @@ def start(party_id: str, prompt: str, instruction: str) -> StartResult:
             cancelled = True
 
     if cancelled:
-        _stop_on_comfy(gen_id)
+        _stop_job(gen_id)
         return StartResult(message_id=message_id, started_at=now)
 
     plan = _Plan(
@@ -238,40 +217,46 @@ def start(party_id: str, prompt: str, instruction: str) -> StartResult:
 
 
 def _watch(plan: _Plan) -> None:
-    """Poll the job's history until it completes, fails, or passes its deadline.
+    """Poll the job until it is done, fails, or passes its deadline.
 
-    The first poll answers None — the job just queued — and every poll until
-    ComfyUI has an entry. An unusable answer at any point fails the job with
-    its real reason; nothing is retried and nothing is guessed.
+    An unusable answer at any point fails the job with its real reason;
+    nothing is retried and nothing is guessed.
     """
     started = time.time()
     while True:
         if time.time() > started + DEADLINE_SECONDS:
-            _finish(plan, done=False, error=_deadline_message())
+            # Abandoned here, the job must not go on rendering: the narrator
+            # is unblocked as soon as the row stops being pending.
+            if _finish(plan, done=False, error=_deadline_message()):
+                _stop_job(plan.gen_id)
             return
         try:
-            entry = comfyui.history(plan.gen_id)
-        except comfyui.ComfyUIError as exc:
+            state = gateway.job(plan.gen_id)
+        except gateway.GatewayError as exc:
             _finish(plan, done=False, error=str(exc))
             return
-        # The order is the real API's shape: a failed execution carries
-        # `status.completed: false` — the error must be read before the
-        # completion flag, or the watcher would keep polling a failed job.
-        if entry is None:
+        if state.status not in gateway.FINISHED:
             time.sleep(POLL_INTERVAL_SECONDS)
             continue
-        if entry.error is not None:
-            _finish(plan, done=False, error=f"ComfyUI failed: {entry.error}")
+        if state.status == "cancelled":
+            # Cancelled here, the row is no longer pending and nothing is
+            # written. Cancelled from the gateway's own interface, it is.
+            _finish(plan, done=False, error="The job was cancelled in comfy-gateway.")
             return
-        if not entry.completed:
-            time.sleep(POLL_INTERVAL_SECONDS)
-            continue
+        if state.status == "error":
+            reason = state.error or "no reason given"
+            _finish(plan, done=False, error=f"comfy-gateway failed: {reason}")
+            return
         try:
-            if not entry.images:
-                _finish(plan, done=False, error="ComfyUI reported success but produced no image.")
+            if not state.images:
+                _finish(
+                    plan, done=False, error="comfy-gateway reported success but returned no image."
+                )
                 return
-            png = comfyui.image_bytes(entry.images[0])
-        except comfyui.ComfyUIError as exc:
+            # The first image is the one a workflow saves first; a comparison
+            # or a test grid saved by the same workflow comes after it.
+            png = gateway.image_bytes(state.images[0])
+        except gateway.GatewayError as exc:
             _finish(plan, done=False, error=str(exc))
             return
         _finish(plan, done=True, png=png)
@@ -281,8 +266,9 @@ def _watch(plan: _Plan) -> None:
 def _deadline_message() -> str:
     minutes = max(1, round(DEADLINE_SECONDS / 60))
     return (
-        f"The render did not finish within {minutes} minutes and was abandoned. "
-        "ComfyUI reported neither success nor failure."
+        f"The render did not finish within {minutes} minutes and was abandoned: "
+        "comfy-gateway reported neither success nor failure, and the job was "
+        "cancelled there so it stops holding the graphics card."
     )
 
 
@@ -336,12 +322,10 @@ def _finish(plan: _Plan, *, done: bool, error: str | None = None, png: bytes | N
 
 
 def cancel(party_id: str, message_id: int) -> sqlite3.Row:
-    """Cancel a pending generation and stop it on ComfyUI as far as it is safe.
+    """Cancel a pending generation and stop its job on the gateway.
 
-    The message is marked cancelled before ComfyUI is touched, so a cancelled
-    image stays cancelled whatever the queue says or whether ComfyUI answers
-    at all. See the module docstring for why the queue decides between
-    interrupt, queue removal, and doing nothing.
+    The message is marked cancelled before the gateway is touched, so a
+    cancelled image stays cancelled whether the gateway answers or not.
 
     Raises `LookupError` for an unknown message and `ValueError` when the
     message is not a pending image generation.
@@ -360,34 +344,24 @@ def cancel(party_id: str, message_id: int) -> sqlite3.Row:
             (CANCEL_MESSAGE, message_id),
         )
         gen_id = row["gen_id"]
-    _stop_on_comfy(gen_id)
+    _stop_job(gen_id)
     with db.connect() as con:
         return con.execute("SELECT * FROM message WHERE id = ?", (message_id,)).fetchone()
 
 
-def _stop_on_comfy(gen_id: str | None) -> None:
-    """Act on ComfyUI only in the way the queue makes safe.
+def _stop_job(gen_id: str | None) -> None:
+    """Cancel the gateway job, if there is one.
 
-    Interrupting while someone else's job is rendering would kill it, so the
-    queue is read first and the action follows what it says. An unreachable
-    ComfyUI changes nothing here: the cancellation is already recorded, and a
-    late completion will be discarded against it.
+    The gateway cancels that job's prompt in ComfyUI by id, so another render
+    on the card is never touched. An unreachable gateway changes nothing
+    here: the cancellation is already recorded, and a late completion is
+    discarded against it.
     """
     if gen_id is None:
         return
     try:
-        # Residual the queue check cannot close: between this read and the
-        # action below, the running job can finish and the next one start, so
-        # an interrupt can still land on a render that is not ours. ComfyUI's
-        # interrupt carries no target, so read-then-act is the best its API
-        # allows; the half that matters most — never interrupting a merely
-        # queued job — is airtight.
-        state = comfyui.queue()
-        if gen_id in state.running:
-            comfyui.interrupt()
-        elif gen_id in state.pending:
-            comfyui.delete_queued(gen_id)
-    except comfyui.ComfyUIError:
+        gateway.cancel(gen_id)
+    except gateway.GatewayError:
         pass
 
 
@@ -399,15 +373,15 @@ def recover_pending() -> None:
 
     - no `gen_id`: the process died inside the persist-to-submit window, so
       the job was never queued (or its id was never recorded);
-    - a `gen_id`: the job may still be queued or rendering on ComfyUI, and
-      while the prompt and instruction the completion needs were held only
-      in memory no result could be recorded honestly — but the job can be
-      stopped. Before the rows are marked, each one carrying a `gen_id` goes
-      through the same queue-checked stop the cancel uses. Stopping happens
-      first, outside the write transaction: a process dying again mid-way
-      leaves the rows pending and lets the next startup try once more, and
-      an unreachable ComfyUI (whose errors the stop swallows) cannot prevent
-      the recovery from completing.
+    - a `gen_id`: the job may still be queued or rendering on the gateway,
+      and while the prompt and instruction the completion needs were held
+      only in memory no result could be recorded honestly, but the job can
+      be stopped. Before the rows are marked, each one carrying a `gen_id`
+      is cancelled the way the cancel does it. Stopping happens first,
+      outside the write transaction: a process dying again mid-way leaves
+      the rows pending and lets the next startup try once more, and an
+      unreachable gateway (whose errors the stop swallows) cannot prevent the
+      recovery from completing.
 
     Running at startup means a reader never sees one of these claim to be
     working: the application is down while it is dead, and the first startup
@@ -420,7 +394,7 @@ def recover_pending() -> None:
     if not rows:
         return
     for row in rows:
-        _stop_on_comfy(row["gen_id"])
+        _stop_job(row["gen_id"])
     with db.connect(immediate=True) as con:
         for row in rows:
             message = (

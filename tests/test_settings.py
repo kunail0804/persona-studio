@@ -337,11 +337,12 @@ def test_settings_round_trip_through_json_storage(client: TestClient) -> None:
     with db.connect() as con:
         settings.set_num_ctx(con, 2048)
         settings.set_active_persona_id(con, "abc123")
-        settings.set_active_workflow_id(con, "wf456")
+        settings.set_image_generation(con, "Krea2/full", "fast")
         raw = {row["key"]: row["value"] for row in con.execute("SELECT key, value FROM setting")}
     assert json.loads(raw[settings.NUM_CTX_KEY]) == 2048
     assert json.loads(raw[settings.ACTIVE_PERSONA_KEY]) == "abc123"
-    assert json.loads(raw[settings.WORKFLOW_ACTIVE_KEY]) == "wf456"
+    assert json.loads(raw[settings.IMAGE_TEMPLATE_KEY]) == "Krea2/full"
+    assert json.loads(raw[settings.IMAGE_GATEWAY_PRESET_KEY]) == "fast"
 
 
 # --- Service status (V1.2) -------------------------------------------------------
@@ -354,13 +355,13 @@ def test_status_reports_both_services_reachable(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(settings_routes.ollama, "probe", lambda: None)
-    monkeypatch.setattr(settings_routes.comfyui, "probe", lambda: None)
+    monkeypatch.setattr(settings_routes.gateway, "probe", lambda: None)
 
     body = client.get("/api/status").json()
 
     assert body == {
         "ollama": {"reachable": True, "detail": None},
-        "comfyui": {"reachable": True, "detail": None},
+        "gateway": {"reachable": True, "detail": None},
     }
 
 
@@ -370,12 +371,12 @@ def test_status_carries_the_real_reason_for_each_failure(
     """The detail is what the pill's tooltip shows: "unreachable" alone sends
     the reader to a terminal, which is the state this replaces."""
     monkeypatch.setattr(settings_routes.ollama, "probe", lambda: "connection refused")
-    monkeypatch.setattr(settings_routes.comfyui, "probe", lambda: None)
+    monkeypatch.setattr(settings_routes.gateway, "probe", lambda: None)
 
     body = client.get("/api/status").json()
 
     assert body["ollama"] == {"reachable": False, "detail": "connection refused"}
-    assert body["comfyui"]["reachable"] is True
+    assert body["gateway"]["reachable"] is True
 
 
 def test_one_service_being_down_does_not_hide_the_other(
@@ -384,12 +385,12 @@ def test_one_service_being_down_does_not_hide_the_other(
     """The two probes run concurrently and are independent: a failing one must
     not take the other's answer with it."""
     monkeypatch.setattr(settings_routes.ollama, "probe", lambda: "ollama est parti")
-    monkeypatch.setattr(settings_routes.comfyui, "probe", lambda: "comfyui aussi")
+    monkeypatch.setattr(settings_routes.gateway, "probe", lambda: "la gateway aussi")
 
     body = client.get("/api/status").json()
 
     assert body["ollama"]["detail"] == "ollama est parti"
-    assert body["comfyui"]["detail"] == "comfyui aussi"
+    assert body["gateway"]["detail"] == "la gateway aussi"
 
 
 def test_the_probes_run_at_the_same_time_not_one_after_the_other(
@@ -408,7 +409,7 @@ def test_the_probes_run_at_the_same_time_not_one_after_the_other(
         return None
 
     monkeypatch.setattr(settings_routes.ollama, "probe", blocking)
-    monkeypatch.setattr(settings_routes.comfyui, "probe", blocking)
+    monkeypatch.setattr(settings_routes.gateway, "probe", blocking)
 
     # Deadlocks if they are sequential: the first would wait for a second
     # arrival that only comes after it returns.

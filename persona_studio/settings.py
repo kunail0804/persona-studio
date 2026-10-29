@@ -29,7 +29,12 @@ LLM_MODEL_KEY = "llm.model"
 NUM_CTX_KEY = "llm.num_ctx"
 HISTORY_WINDOW_KEY = "narrator.history_window"
 ACTIVE_PERSONA_KEY = "persona.active_id"
-WORKFLOW_ACTIVE_KEY = "workflow.active_id"
+# The comfy-gateway template images are made with, by name, and the gateway
+# preset applied on top of it. `workflow.active_id`, the key of the workflows
+# this application used to store itself, is no longer read; its rows stay in
+# the database, untouched.
+IMAGE_TEMPLATE_KEY = "image.gateway_template"
+IMAGE_GATEWAY_PRESET_KEY = "image.gateway_preset"
 IMAGE_PRESET_ACTIVE_KEY = "image_prompt.active_preset_id"
 
 
@@ -109,16 +114,29 @@ def set_active_persona_id(con: sqlite3.Connection, persona_id: str | None) -> No
         _write(con, ACTIVE_PERSONA_KEY, persona_id)
 
 
-def get_active_workflow_id(con: sqlite3.Connection) -> str | None:
-    value = _read(con, WORKFLOW_ACTIVE_KEY)
+def get_image_template(con: sqlite3.Connection) -> str | None:
+    """The comfy-gateway template name images are made with, or None."""
+    value = _read(con, IMAGE_TEMPLATE_KEY)
     return value if isinstance(value, str) and value else None
 
 
-def set_active_workflow_id(con: sqlite3.Connection, workflow_id: str | None) -> None:
-    if workflow_id is None:
-        _clear(con, WORKFLOW_ACTIVE_KEY)
+def get_image_gateway_preset(con: sqlite3.Connection) -> str | None:
+    """The comfy-gateway preset applied to the template, or None for its own values."""
+    value = _read(con, IMAGE_GATEWAY_PRESET_KEY)
+    return value if isinstance(value, str) and value else None
+
+
+def set_image_generation(con: sqlite3.Connection, template: str | None, preset: str | None) -> None:
+    """Both at once: a preset belongs to one template's name, so it never
+    outlives a change of template."""
+    if template is None:
+        _clear(con, IMAGE_TEMPLATE_KEY)
     else:
-        _write(con, WORKFLOW_ACTIVE_KEY, workflow_id)
+        _write(con, IMAGE_TEMPLATE_KEY, template)
+    if template is None or preset is None:
+        _clear(con, IMAGE_GATEWAY_PRESET_KEY)
+    else:
+        _write(con, IMAGE_GATEWAY_PRESET_KEY, preset)
 
 
 def get_active_image_preset_id(con: sqlite3.Connection) -> str | None:

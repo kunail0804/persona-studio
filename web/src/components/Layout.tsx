@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Link, Outlet } from "react-router-dom";
 import type { ServiceStatus } from "../api/status";
 import { getServiceStatus } from "../api/status";
+import { ServiceMenu } from "./ServiceMenu";
 
 // Slow enough not to matter, often enough that a service coming back is
 // noticed before the next turn is typed.
@@ -34,9 +35,10 @@ export function Layout() {
 }
 
 /**
- * Two pills saying whether Ollama and ComfyUI are answering. Until these
- * existed you learned Ollama was down when a turn failed, halfway through
- * writing one.
+ * Two pills saying whether Ollama and comfy-gateway (with its ComfyUI) are
+ * answering. Until these existed you learned Ollama was down when a turn
+ * failed, halfway through writing one. Each opens a menu with its memory and
+ * the buttons that free it (`ServiceMenu`).
  *
  * A failed poll is shown as "unknown" rather than as "down": the server not
  * answering says nothing about the services it would have probed, and a pill
@@ -67,41 +69,18 @@ function ServicePills() {
 
   return (
     <div className="flex items-center gap-3">
-      <ServicePill label="Ollama" state={status?.ollama ?? null} onClick={() => void refresh()} />
-      <ServicePill label="ComfyUI" state={status?.comfyui ?? null} onClick={() => void refresh()} />
+      <ServiceMenu
+        kind="ollama"
+        label="Ollama"
+        state={status?.ollama ?? null}
+        onChanged={() => void refresh()}
+      />
+      <ServiceMenu
+        kind="gateway"
+        label="Gateway"
+        state={status?.gateway ?? null}
+        onChanged={() => void refresh()}
+      />
     </div>
-  );
-}
-
-interface ServicePillProps {
-  label: string;
-  state: { reachable: boolean; detail: string | null } | null;
-  onClick: () => void;
-}
-
-function pillColour(state: ServicePillProps["state"]): string {
-  if (state === null) return "bg-neutral-600";
-  return state.reachable ? "bg-emerald-500" : "bg-red-500";
-}
-
-function pillTitle(label: string, state: ServicePillProps["state"]): string {
-  if (state === null) return `${label} : état inconnu`;
-  if (state.reachable) return `${label} : joignable`;
-  return state.detail ?? `${label} : injoignable`;
-}
-
-function ServicePill({ label, state, onClick }: ServicePillProps) {
-  const colour = pillColour(state);
-  const title = pillTitle(label, state);
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      title={title}
-      className="flex items-center gap-1.5 text-xs text-neutral-400 hover:text-neutral-100"
-    >
-      <span className={`h-2 w-2 rounded-full ${colour}`} />
-      {label}
-    </button>
   );
 }

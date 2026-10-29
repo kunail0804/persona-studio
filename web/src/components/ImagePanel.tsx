@@ -20,7 +20,7 @@ interface ImagePanelProps {
  * The image panel: the player says what they want to see, the server turns
  * that plus the current scene into English keywords, and the result lands in
  * an editable field. Sending it starts the generation — the text goes to
- * ComfyUI exactly as it is on screen, and the render continues in the
+ * comfy-gateway exactly as it is on screen, and the render continues in the
  * background while the player keeps playing.
  */
 export function ImagePanel({

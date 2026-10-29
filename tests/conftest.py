@@ -20,7 +20,25 @@ from fastapi.testclient import TestClient
 
 os.environ["PS_DATA"] = tempfile.mkdtemp(prefix="persona-studio-tests-")
 
+from persona_studio import gateway, ollama  # noqa: E402 -- must follow the PS_DATA redirect above
 from persona_studio.main import app  # noqa: E402 -- must follow the PS_DATA redirect above
+
+# A port nothing listens on: a refused connection, at once.
+_NOWHERE = "http://127.0.0.1:1"
+
+
+@pytest.fixture(autouse=True)
+def _no_real_services(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test reaches the Ollama or the comfy-gateway running on this machine.
+
+    Every model call now empties ComfyUI through the gateway first, and every
+    render unloads Ollama: a test that forgot to stub one of them would free
+    the developer's real memory, or stop a real render. Pointed at a closed
+    port, those calls fail fast and are treated as "nothing to free". A test
+    that needs a service points the URL at its own fake, after this runs.
+    """
+    monkeypatch.setattr(gateway, "GATEWAY_BASE_URL", _NOWHERE)
+    monkeypatch.setattr(ollama, "OLLAMA_BASE_URL", _NOWHERE)
 
 
 @pytest.fixture

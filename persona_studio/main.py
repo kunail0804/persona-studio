@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from . import db, generation
 from .routes import (
     characters,
+    image_generation,
     image_presets,
     images,
     lore,
@@ -18,8 +19,8 @@ from .routes import (
     personas,
     places,
     scenarios,
+    services,
     settings,
-    workflows,
 )
 
 WEB_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
@@ -32,8 +33,8 @@ async def lifespan(app: FastAPI):
     db.migrate()
     # Image messages still `pending` can never complete: their watcher died
     # with the process. The first startup marks them failed, so none of them
-    # claims to be working forever — and asks ComfyUI to stop whatever the
-    # dead watcher left queued or rendering.
+    # claims to be working forever — and asks comfy-gateway to stop whatever
+    # the dead watcher left queued or rendering.
     generation.recover_pending()
     # A `done` image whose PNG is missing — a death between the commit and
     # the file write — is the one inconsistent state the pending recovery
@@ -54,7 +55,8 @@ app.include_router(party_world.router, prefix="/api")
 app.include_router(images.router, prefix="/api")
 app.include_router(image_presets.router, prefix="/api")
 app.include_router(settings.router, prefix="/api")
-app.include_router(workflows.router, prefix="/api")
+app.include_router(image_generation.router, prefix="/api")
+app.include_router(services.router, prefix="/api")
 
 
 @app.get("/api/health")

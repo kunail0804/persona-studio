@@ -39,17 +39,26 @@ export function listPersonas(signal?: AbortSignal): Promise<Persona[]> {
   return request("/personas", parsePersonaList, { signal });
 }
 
+/**
+ * The body the server accepts, and nothing else. The server refuses unknown
+ * fields, and an edit form is seeded with a whole `Persona` (id, createdAt,
+ * isActive), which TypeScript lets through as a `PersonaInput`.
+ */
+function personaBody({ name, description, appearance, traits }: PersonaInput): string {
+  return JSON.stringify({ name, description, appearance, traits });
+}
+
 export function createPersona(input: PersonaInput): Promise<Persona> {
   return request("/personas", parsePersona, {
     method: "POST",
-    body: JSON.stringify(input),
+    body: personaBody(input),
   });
 }
 
 export function updatePersona(id: string, input: PersonaInput): Promise<Persona> {
   return request(`/personas/${id}`, parsePersona, {
     method: "PATCH",
-    body: JSON.stringify(input),
+    body: personaBody(input),
   });
 }
 

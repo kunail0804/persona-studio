@@ -15,7 +15,7 @@ import anyio.to_thread
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
-from .. import comfyui, db, ollama, settings
+from .. import db, gateway, ollama, settings
 
 router = APIRouter(tags=["settings"])
 
@@ -29,12 +29,12 @@ class ServiceState(BaseModel):
 
 class ServiceStatus(BaseModel):
     ollama: ServiceState
-    comfyui: ServiceState
+    gateway: ServiceState
 
 
 @router.get("/status", response_model=ServiceStatus)
 async def get_service_status() -> ServiceStatus:
-    """Whether Ollama and ComfyUI are answering right now.
+    """Whether Ollama and comfy-gateway (with its ComfyUI) are answering right now.
 
     The interface polls this to light two pills in the header. Until it
     existed you learned Ollama was down when a turn failed — halfway through
@@ -42,7 +42,7 @@ async def get_service_status() -> ServiceStatus:
 
     Async, and the two probes run at once: they are independent, each has a
     two-second budget, and running them in sequence would double the worst
-    case for no reason. Nothing here writes, and the ComfyUI probe is
+    case for no reason. Nothing here writes, and the gateway probe is
     read-only on purpose — this runs on a timer and must never disturb a
     render.
     """
@@ -53,11 +53,11 @@ async def get_service_status() -> ServiceStatus:
 
     async with anyio.create_task_group() as group:
         group.start_soon(run, "ollama", ollama.probe)
-        group.start_soon(run, "comfyui", comfyui.probe)
+        group.start_soon(run, "gateway", gateway.probe)
 
     return ServiceStatus(
         ollama=ServiceState(reachable=results["ollama"] is None, detail=results["ollama"]),
-        comfyui=ServiceState(reachable=results["comfyui"] is None, detail=results["comfyui"]),
+        gateway=ServiceState(reachable=results["gateway"] is None, detail=results["gateway"]),
     )
 
 

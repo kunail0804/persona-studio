@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { ApiError } from "../api/client";
 import type { ImagePreset } from "../api/imagePresets";
 import {
@@ -13,14 +13,13 @@ import type { Persona, PersonaInput } from "../api/personas";
 import { createPersona, deletePersona, listPersonas, setActivePersona, updatePersona } from "../api/personas";
 import type { LlmSettings } from "../api/settings";
 import { getLlmSettings, updateLlmSettings } from "../api/settings";
-import type { Workflow } from "../api/workflows";
-import { deleteWorkflow, importWorkflow, listWorkflows, setActiveWorkflow, updateWorkflow } from "../api/workflows";
+import type { ImageGeneration } from "../api/imageGeneration";
+import { getImageGeneration, setImageGeneration } from "../api/imageGeneration";
 import { Button } from "../components/Button";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { PersonaForm } from "../components/PersonaForm";
 import { TextArea } from "../components/TextArea";
 import { TextField } from "../components/TextField";
-import { isRecord } from "../api/validate";
 
 function messageFor(error: unknown, fallback: string): string {
   return error instanceof ApiError ? error.detail : fallback;
@@ -31,25 +30,18 @@ function parseBoundedInt(value: string, min: number, max: number): number | null
   return Number.isInteger(parsed) && parsed >= min && parsed <= max ? parsed : null;
 }
 
-function optionValue(node: string, field: string): string {
-  return `${node}::${field}`;
-}
-
 export function SettingsPage() {
   const [personas, setPersonas] = useState<Persona[]>([]);
   const [presets, setPresets] = useState<ImagePreset[]>([]);
   const [defaultInstruction, setDefaultInstruction] = useState("");
   const [editingPresetId, setEditingPresetId] = useState<string | null>(null);
   const [confirmDeletePresetId, setConfirmDeletePresetId] = useState<string | null>(null);
-  const [workflows, setWorkflows] = useState<Workflow[]>([]);
+  const [imageGeneration, setImageGenerationState] = useState<ImageGeneration | null>(null);
   const [llm, setLlm] = useState<LlmSettings | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [addingPersona, setAddingPersona] = useState(false);
   const [editingPersonaId, setEditingPersonaId] = useState<string | null>(null);
   const [confirmDeletePersonaId, setConfirmDeletePersonaId] = useState<string | null>(null);
-  const [confirmDeleteWorkflowId, setConfirmDeleteWorkflowId] = useState<string | null>(null);
-  const [importingWorkflow, setImportingWorkflow] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [model, setModel] = useState<string | null>(null);
   const [numCtx, setNumCtx] = useState("");
@@ -58,15 +50,15 @@ export function SettingsPage() {
 
   const load = useCallback(async (signal?: AbortSignal) => {
     try {
-      const [personaData, llmData, workflowData, presetData, defaultText] = await Promise.all([
+      const [personaData, llmData, imageGenerationData, presetData, defaultText] = await Promise.all([
         listPersonas(signal),
         getLlmSettings(signal),
-        listWorkflows(signal),
+        getImageGeneration(signal),
         listImagePresets(signal),
         getDefaultInstruction(signal),
       ]);
       setPersonas(personaData);
-      setWorkflows(workflowData);
+      setImageGenerationState(imageGenerationData);
       setPresets(presetData);
       setDefaultInstruction(defaultText);
       setLlm(llmData);
@@ -177,72 +169,12 @@ export function SettingsPage() {
     }
   }
 
-  async function handleImportWorkflow(file: File) {
-    // Reset the input on every exit path, including the client-side rejects
-    // below: browsers do not re-fire `change` when the same file is picked
-    // again, so a rejected file would otherwise be stuck.
+  async function handleChooseImageGeneration(template: string | null, preset: string | null) {
     try {
-      const name = file.name.replace(/\.json$/i, "") || "Workflow";
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(await file.text());
-      } catch {
-        setError(`« ${file.name} » n'est pas un fichier JSON valide.`);
-        return;
-      }
-      if (!isRecord(parsed) || Array.isArray(parsed)) {
-        setError(
-          `« ${file.name} » n'est pas un export de workflow : il faut un objet JSON, l'export « Export (API) » de ComfyUI.`,
-        );
-        return;
-      }
-      setImportingWorkflow(true);
-      try {
-        await importWorkflow({ name, graph: parsed });
-        await reload();
-        setError(null);
-      } catch (err) {
-        setError(messageFor(err, `Impossible d'importer « ${file.name} ».`));
-      } finally {
-        setImportingWorkflow(false);
-      }
-    } finally {
-      if (fileInputRef.current) fileInputRef.current.value = "";
-    }
-  }
-
-  async function handleUpdateWorkflow(workflowId: string, patch: {
-    name: string;
-    promptNode: string;
-    promptField: string;
-  }) {
-    try {
-      await updateWorkflow(workflowId, patch);
-      await reload();
+      setImageGenerationState(await setImageGeneration({ template, preset }));
       setError(null);
     } catch (err) {
-      setError(messageFor(err, "Impossible d'enregistrer la configuration du workflow."));
-    }
-  }
-
-  async function handleDeleteWorkflow(workflowId: string) {
-    try {
-      await deleteWorkflow(workflowId);
-      await reload();
-    } catch (err) {
-      setError(messageFor(err, "Impossible de supprimer le workflow."));
-    } finally {
-      setConfirmDeleteWorkflowId(null);
-    }
-  }
-
-  async function handleActivateWorkflow(workflowId: string) {
-    try {
-      await setActiveWorkflow(workflowId);
-      await reload();
-      setError(null);
-    } catch (err) {
-      setError(messageFor(err, "Impossible de définir le workflow actif."));
+      setError(messageFor(err, "Impossible d'enregistrer le template d'images."));
     }
   }
 
@@ -333,44 +265,29 @@ export function SettingsPage() {
 
       <section className="flex flex-col gap-4">
         <div className="flex items-center justify-between">
-          <h2 className="text-xl font-semibold">Workflow ComfyUI</h2>
-          <label className="inline-flex cursor-pointer items-center rounded bg-sky-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-sky-500">
-            {importingWorkflow ? "Import…" : "Importer un workflow"}
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".json"
-              className="hidden"
-              disabled={importingWorkflow}
-              onChange={(event) => {
-                const file = event.target.files?.[0];
-                if (file) void handleImportWorkflow(file);
-              }}
-            />
-          </label>
+          <h2 className="text-xl font-semibold">Génération d'images</h2>
+          {imageGeneration ? (
+            <a
+              href={imageGeneration.gatewayUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="text-sm text-sky-400 hover:text-sky-300"
+            >
+              Ouvrir comfy-gateway
+            </a>
+          ) : null}
         </div>
         <p className="text-sm text-neutral-500">
-          Importez l'export <span className="font-medium">Export (API)</span> de ComfyUI, puis
-          choisissez dans quel nœud et quel champ le prompt est injecté.
+          Les images sont faites par comfy-gateway. Choisissez le template (un workflow envoyé
+          depuis ComfyUI avec « Send to comfy-gateway ») et, si vous voulez, un de ses presets. Les
+          réglages du workflow se modifient dans comfy-gateway.
         </p>
-
-        {workflows.length === 0 ? (
-          <p className="text-neutral-500">
-            Aucun workflow : importez-en un pour que la génération d'images puisse fonctionner.
-          </p>
-        ) : (
-          <ul className="flex flex-col gap-3">
-            {workflows.map((workflow) => (
-              <WorkflowListItem
-                key={workflow.id}
-                workflow={workflow}
-                onSelect={() => void handleActivateWorkflow(workflow.id)}
-                onPatch={(patch) => void handleUpdateWorkflow(workflow.id, patch)}
-                onDelete={() => setConfirmDeleteWorkflowId(workflow.id)}
-              />
-            ))}
-          </ul>
-        )}
+        {imageGeneration ? (
+          <ImageGenerationForm
+            settings={imageGeneration}
+            onChange={(template, preset) => void handleChooseImageGeneration(template, preset)}
+          />
+        ) : null}
       </section>
 
       <section className="flex flex-col gap-4">
@@ -497,87 +414,71 @@ export function SettingsPage() {
         onCancel={() => setConfirmDeletePersonaId(null)}
       />
 
-      <ConfirmDialog
-        open={confirmDeleteWorkflowId !== null}
-        title="Supprimer ce workflow ?"
-        description="Cette action est définitive. S'il était actif, un autre workflow valide devient actif."
-        onConfirm={() => {
-          if (confirmDeleteWorkflowId !== null) void handleDeleteWorkflow(confirmDeleteWorkflowId);
-        }}
-        onCancel={() => setConfirmDeleteWorkflowId(null)}
-      />
     </div>
   );
 }
 
-interface WorkflowListItemProps {
-  workflow: Workflow;
-  onSelect: () => void;
-  onPatch: (patch: { name: string; promptNode: string; promptField: string }) => void;
-  onDelete: () => void;
+interface ImageGenerationFormProps {
+  settings: ImageGeneration;
+  onChange: (template: string | null, preset: string | null) => void;
 }
 
 const selectClasses =
-  "rounded border border-neutral-700 bg-neutral-900 px-3 py-2 text-neutral-100 focus:border-sky-500 focus:outline-none";
+  "rounded border border-neutral-700 bg-neutral-900 px-3 py-2 text-neutral-100 focus:border-sky-500 focus:outline-none disabled:opacity-50";
 
-function WorkflowListItem({ workflow, onSelect, onPatch, onDelete }: WorkflowListItemProps) {
-  const promptValue =
-    workflow.promptNode && workflow.promptField
-      ? optionValue(workflow.promptNode, workflow.promptField)
-      : "";
-  const patch = (promptNode: string, promptField: string) =>
-    onPatch({ name: workflow.name, promptNode, promptField });
+function ImageGenerationForm({ settings, onChange }: ImageGenerationFormProps) {
+  // A stored template the gateway no longer lists stays selectable as it is,
+  // so the page shows what is chosen rather than silently showing "none".
+  const templates =
+    settings.template !== null && !settings.templates.includes(settings.template)
+      ? [...settings.templates, settings.template]
+      : settings.templates;
+  const presets =
+    settings.preset !== null && !settings.presets.includes(settings.preset)
+      ? [...settings.presets, settings.preset]
+      : settings.presets;
 
   return (
-    <li className="rounded-lg border border-neutral-800 bg-neutral-900 p-4">
-      <div className="flex items-start justify-between gap-4">
-        <div className="flex items-center gap-2">
-          <h3 className="font-medium">{workflow.name || "Sans nom"}</h3>
-          {workflow.isActive ? (
-            <span className="rounded bg-sky-900 px-2 py-0.5 text-xs text-sky-300">Actif</span>
-          ) : null}
-        </div>
-        <div className="flex shrink-0 items-center gap-1">
-          {!workflow.isActive ? (
-            <Button variant="secondary" onClick={onSelect}>
-              Activer
-            </Button>
-          ) : null}
-          <Button variant="danger" onClick={onDelete}>
-            Supprimer
-          </Button>
-        </div>
-      </div>
-
-      {workflow.problem ? <p className="mt-2 text-sm text-amber-400">{workflow.problem}</p> : null}
-
-      <div className="mt-3">
+    <div className="flex flex-col gap-3 rounded-lg border border-neutral-800 bg-neutral-900 p-4">
+      <div className="grid gap-3 sm:grid-cols-2">
         <label className="flex flex-col gap-1 text-sm text-neutral-300">
-          <span className="font-medium">Champ du prompt</span>
+          <span className="font-medium">Template</span>
           <select
             className={selectClasses}
-            value={promptValue}
-            onChange={(event) => {
-              if (event.target.value === "") {
-                patch("", "");
-                return;
-              }
-              const option = workflow.promptOptions.find(
-                (o) => optionValue(o.node, o.field) === event.target.value,
-              );
-              if (option) patch(option.node, option.field);
-            }}
+            value={settings.template ?? ""}
+            onChange={(event) => onChange(event.target.value || null, null)}
           >
-            <option value="">Non configuré</option>
-            {workflow.promptOptions.map((o) => (
-              <option key={optionValue(o.node, o.field)} value={optionValue(o.node, o.field)}>
-                {o.label}
+            <option value="">Aucun</option>
+            {templates.map((name) => (
+              <option key={name} value={name}>
+                {name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="flex flex-col gap-1 text-sm text-neutral-300">
+          <span className="font-medium">Preset</span>
+          <select
+            className={selectClasses}
+            value={settings.preset ?? ""}
+            disabled={settings.template === null}
+            onChange={(event) => onChange(settings.template, event.target.value || null)}
+          >
+            <option value="">Réglages du template</option>
+            {presets.map((name) => (
+              <option key={name} value={name}>
+                {name}
               </option>
             ))}
           </select>
         </label>
       </div>
-    </li>
+      {settings.problem ? (
+        <p className="text-sm text-amber-400">{settings.problem}</p>
+      ) : (
+        <p className="text-sm text-emerald-400">Prêt : les images partent vers ce template.</p>
+      )}
+    </div>
   );
 }
 

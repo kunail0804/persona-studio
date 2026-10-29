@@ -29,10 +29,11 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 
-from . import db, narrator, ollama, settings
+from . import db, generation, gpu, narrator, ollama, settings
 
 # Continuity, not literature: the summary carries who the protagonist is,
 # where they are, who is present, what is established, what is unresolved.
@@ -269,8 +270,40 @@ def _run(plan: _SummaryPlan, lock: threading.Lock) -> None:
         _sweep_locks()
 
 
+# A background job never refuses: it waits for the card. A render takes
+# minutes, so the poll is slow, and the wait ends with the generation deadline.
+GPU_WAIT_POLL_SECONDS = 5.0
+GPU_WAIT_SECONDS = 3600.0
+
+
+def _wait_for_the_card() -> bool:
+    """Wait until no image renders, here or in comfy-gateway, then empty
+    ComfyUI. False when the wait ran out: the caller gives up, as it does on
+    any Ollama error.
+
+    A summary or a revision loading the narrator under a render is the same
+    out-of-memory the narrator routes refuse with a 409. The thread holds the
+    party's summary lock while it waits, so a second one is not started.
+    """
+    deadline = time.monotonic() + GPU_WAIT_SECONDS
+    while True:
+        with db.connect() as con:
+            rendering = generation.render_in_progress(con)
+        if not rendering:
+            try:
+                gpu.make_room_for_llm()
+                return True
+            except gpu.GpuBusy:
+                pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(GPU_WAIT_POLL_SECONDS)
+
+
 def _summarize(plan: _SummaryPlan) -> None:
     messages = _summary_messages(plan)
+    if not _wait_for_the_card():
+        return
     try:
         raw = ollama.chat(plan.model, messages, num_ctx=plan.num_ctx, format="json")
     except ollama.OllamaError:
@@ -439,6 +472,8 @@ def _run_revision(plan: _RevisionPlan, lock: threading.Lock) -> None:
 
 def _revise(plan: _RevisionPlan) -> None:
     messages = _revision_messages(plan)
+    if not _wait_for_the_card():
+        return
     try:
         raw = ollama.chat(plan.model, messages, num_ctx=plan.num_ctx, format="json")
     except ollama.OllamaError:

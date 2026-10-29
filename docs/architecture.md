@@ -15,7 +15,8 @@ image pipeline draws the scenes on demand. Nothing leaves the machine.
 browser  ──HTTP──▶  FastAPI  ──▶  SQLite  (data/studio.db)
                        │     ──▶  PNG files (data/images/)
                        ├──HTTP──▶ Ollama    :11434   narration, summaries, prompts
-                       └──HTTP──▶ ComfyUI   :8188    image generation
+                       └──HTTP──▶ comfy-gateway :8190 ──▶ ComfyUI :8188
+                                                     image generation
 ```
 
 In development Vite serves the front on `:5173` and proxies `/api`. In use,
@@ -72,6 +73,54 @@ version. As blobs they would make every backup all-or-nothing, take back their
 space only under `VACUUM`, and be served through memory instead of straight from
 the filesystem. The `image` table carries the metadata; the file is
 `data/images/<id>.png`.
+
+### Images go through comfy-gateway
+
+This application used to keep its own copies of ComfyUI workflows: an
+"Export (API)" file, a dropdown to pick the node and field the prompt went
+into, and a client that submitted the graph, polled `/history` and cancelled
+through ComfyUI's queue. CharCreator needed the same thing, and each app
+grew its own version of it.
+
+comfy-gateway is the one place that does it now. It takes a workflow straight
+from the ComfyUI editor, exposes its settings and presets, finds the prompt
+field by role, queues one job at a time, and cancels a job by id without
+touching another render. This application names a template and a preset and
+sends the prompt as the `prompt` role; it never builds or reads a graph.
+
+What it costs: one more service to run for images. The chat does not need it,
+the header pill says when it is down or when ComfyUI behind it is, and the
+settings page says why a template cannot be used.
+
+The `workflow` table of the old system is still in the schema and is no longer
+read. It was left in place rather than dropped, so nothing the user imported
+is deleted by an upgrade.
+
+### The narrator and a render take turns on the graphics card
+
+On 12 GB of VRAM the narration model and an image pipeline do not fit
+together. Ollama's logs showed what happens when nobody lets go: the
+narrator loaded with 0 of 49 layers on the GPU, RAM full, swap in use, until
+a process was killed by hand. `gpu.py` decides who gets the card:
+
+- before a render, every model Ollama holds is unloaded, and the code waits
+  until `/api/ps` is empty;
+- every job is sent with `free_after: "all"`, so the gateway empties
+  ComfyUI (VRAM and RAM) once it is over;
+- before every model call (turn, regeneration, opening, image prompt,
+  summary), ComfyUI is emptied through the gateway, and the call is refused
+  with a 409 while the gateway renders for any application. Background
+  summaries wait instead of refusing.
+
+The header pills open a menu with each service's memory and the buttons that
+replace the commands: unload Ollama's models, empty ComfyUI, stop or restart
+the gateway (in the alacritty window its shortcut opens). Ollama runs as a
+system service this application has no right to stop, so it is unloaded,
+not killed.
+
+What it costs: the models reload after each switch, about 20 s for the
+narrator on this machine, and about one second more per turn for the
+gateway call.
 
 ### Migrations are explicit
 
