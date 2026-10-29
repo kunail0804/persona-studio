@@ -48,7 +48,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
-from .. import db, generation, narrator, ollama, settings, summarizer
+from .. import db, generation, gpu, narrator, ollama, settings, summarizer
 
 router = APIRouter(tags=["parties"])
 
@@ -276,11 +276,22 @@ def _refuse_while_rendering(con: sqlite3.Connection) -> None:
     """409 when an image is rendering: the narrator would reload on the GPU.
 
     Every route that calls the narrator goes through here — a played turn, a
-    regeneration, a party's opening. The eviction before a render frees the
-    card; this keeps it free until the render is done.
+    regeneration, a party's opening. Unloading Ollama before a render frees
+    the card; this keeps it free until the render is done. Renders asked by
+    other applications are refused by `_make_room_for_narrator`, which asks
+    the gateway itself.
     """
     if generation.render_in_progress(con):
         raise HTTPException(status_code=409, detail=generation.RENDER_IN_PROGRESS_DETAIL)
+
+
+def _make_room_for_narrator() -> None:
+    """Empty ComfyUI before the narrator loads, or 409 while comfy-gateway
+    renders for any application. An HTTP call: never under a connection."""
+    try:
+        gpu.make_room_for_llm()
+    except gpu.GpuBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 def _party_label(raw: str, scenario_title: str) -> str:
@@ -482,6 +493,7 @@ def create_party(scenario_id: str, body: PartyInput) -> PartySummary:
 
     # Nothing above wrote a row: a failure past this point — including the
     # whole model call — leaves the database untouched.
+    _make_room_for_narrator()
     opening = _generate_opening(model, scenario, persona, num_ctx)
 
     now = time.time()
@@ -842,14 +854,20 @@ def _prepare_turn_locked(
     party_id: str, body: TurnInput, release: Callable[[], None]
 ) -> _TurnContext:
     with db.connect() as con:
-        party = _get_party_row(con, party_id)
-        model = _require_model(con)
+        _get_party_row(con, party_id)
+        _require_model(con)
         content = body.content.strip()
         if not content:
             raise HTTPException(status_code=400, detail="A turn cannot be empty.")
         # After the checks the order tests pin, before the player's text is
         # written: a refused turn must leave nothing behind.
         _refuse_while_rendering(con)
+    # Between the checks and the writes, on no connection: the gateway call
+    # can refuse the turn, and a refused turn writes nothing.
+    _make_room_for_narrator()
+    with db.connect() as con:
+        party = _get_party_row(con, party_id)
+        model = _require_model(con)
         scenario = narrator.load_party_scenario(con, party_id)
         persona = narrator.load_persona(con, party["persona_id"])
         num_ctx = settings.get_num_ctx(con)
@@ -1004,6 +1022,8 @@ def _prepare_regenerate_locked(
             ).fetchone()
             is None
         )
+    # Nothing was written above, so the gateway refusing here costs nothing.
+    _make_room_for_narrator()
     return _TurnContext(
         party_id=party_id,
         model=model,

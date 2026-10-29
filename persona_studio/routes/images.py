@@ -8,7 +8,7 @@ The composer turns a request into an editable prompt and writes nothing. Its
 text travels exactly as the player sees it on screen: the generation endpoint
 below takes it back as-is, alongside the instruction that produced it, and
 `generation.start` does the rest — persist the pending message, submit to
-ComfyUI, watch on a background thread. The player keeps playing while it
+comfy-gateway, watch on a background thread. The player keeps playing while it
 renders.
 
 Cancelling is a separate endpoint on the message, and the file itself is
@@ -33,7 +33,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from .. import comfyui, db, generation, image_prompt, ollama, settings, workflows
+from .. import db, gateway, generation, gpu, image_prompt, ollama, settings
 from ..images import delete_orphan_images, unlink_images
 from .parties import PartyMessage, _message_response, _require_model
 
@@ -80,6 +80,10 @@ def compose_image_prompt(party_id: str, body: ImagePromptInput) -> ImagePromptOu
     inputs = replace(inputs, instruction=instruction)
     messages = image_prompt.build_messages(inputs, master_prompt)
     try:
+        gpu.make_room_for_llm()
+    except gpu.GpuBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    try:
         raw = ollama.chat(model, messages, num_ctx=num_ctx)
     except ollama.OllamaUnreachable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -112,10 +116,10 @@ class ImageStartOutput(BaseModel):
 
 @router.post("/parties/{party_id}/images", response_model=ImageStartOutput, status_code=201)
 def start_image_generation(party_id: str, body: ImageGenerationInput) -> ImageStartOutput:
-    """Send the player's final prompt to ComfyUI and return at once.
+    """Send the player's final prompt to comfy-gateway and return at once.
 
     The prompt is sent as-is: this is the text the player has on screen, and
-    nothing may rewrite it between here and ComfyUI. The response carries the
+    nothing may rewrite it between here and the gateway. The response carries the
     message id whose row now shows the pending image, so the player can
     cancel it while it renders.
     """
@@ -126,11 +130,17 @@ def start_image_generation(party_id: str, body: ImageGenerationInput) -> ImageSt
         result = generation.start(party_id, prompt, body.instruction.strip())
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except workflows.WorkflowNotReady as exc:
+    except generation.ImageSetupNotReady as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except comfyui.ComfyUIUnreachable as exc:
+    except gateway.GatewayRefused as exc:
+        # The gateway's reason is a setup problem the player can fix: an
+        # unknown template, a preset gone, a template without a prompt role.
+        raise HTTPException(
+            status_code=400, detail=f"comfy-gateway refused the image: {exc}"
+        ) from exc
+    except gateway.GatewayUnreachable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except comfyui.ComfyUIError as exc:
+    except gateway.GatewayError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return ImageStartOutput(message_id=result.message_id, started_at=result.started_at)
 
@@ -140,8 +150,8 @@ def start_image_generation(party_id: str, body: ImageGenerationInput) -> ImageSt
     response_model=PartyMessage,
 )
 def cancel_image_generation(party_id: str, message_id: int) -> PartyMessage:
-    """Cancel a pending image generation, interrupting ComfyUI only if our own
-    job is the one running — see `generation.cancel`."""
+    """Cancel a pending image generation and its job on comfy-gateway — see
+    `generation.cancel`."""
     try:
         row = generation.cancel(party_id, message_id)
     except LookupError as exc:
@@ -160,7 +170,7 @@ def delete_image_message(party_id: str, message_id: int) -> None:
     watcher: the thread is about to write to that very row, and a completion
     landing on a deleted message is a state nothing else in this module has
     to handle. Cancel first, then delete — the cancel endpoint exists and
-    already stops ComfyUI when our job is the one on the GPU.
+    already stops the job on the gateway.
 
     The PNG is unlinked only after the transaction commits, the same
     discipline `delete_scenario` follows: a rolled-back delete must never

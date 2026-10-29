@@ -41,7 +41,7 @@ export function composeImagePrompt(partyId: string, instruction: string): Promis
 
 /**
  * Sends the final prompt — exactly the text the player has on screen — to
- * ComfyUI and returns at once: the render runs in the background and lands
+ * comfy-gateway and returns at once: the render runs in the background and lands
  * in the story as an image message the player can cancel.
  */
 export function startImageGeneration(
@@ -55,7 +55,7 @@ export function startImageGeneration(
   });
 }
 
-/** Cancels a pending generation, interrupting ComfyUI only if it is rendering. */
+/** Cancels a pending generation and its job on comfy-gateway. */
 export function cancelImageGeneration(partyId: string, messageId: number): Promise<PartyMessage> {
   return request(`/parties/${partyId}/images/${messageId}/cancel`, parsePartyMessage, {
     method: "POST",

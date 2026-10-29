@@ -8,7 +8,7 @@ it — does not require reading the source first.
 
 - Python 3.14, installed and pinned by [uv](https://docs.astral.sh/uv/)
 - Node 24 with [pnpm](https://pnpm.io/)
-- [Ollama](https://ollama.com/) for chat, [ComfyUI](https://github.com/comfyanonymous/ComfyUI) for images
+- [Ollama](https://ollama.com/) for chat, comfy-gateway on port 8190 (with [ComfyUI](https://github.com/comfyanonymous/ComfyUI) behind it) for images
 
 ## Setup
 

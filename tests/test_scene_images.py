@@ -1,14 +1,14 @@
-"""Tests for background scene-image generation (issue #17).
+"""Tests for background scene-image generation (issue #17), through comfy-gateway.
 
-The centrepiece is a **fake ComfyUI**: a real HTTP server on an ephemeral
-port, shaped like the real API, whose responses each test controls — a test
-can hold a submission, keep a job "running", make one fail with a specific
-error, or stage a completion at a chosen moment. Nothing here ever touches
-the ComfyUI on `127.0.0.1:8188`: the client's base URL is monkeypatched to
-the fake server for the duration of every test, and the only requests it can
-see are the ones this suite makes.
+The centrepiece is a **fake comfy-gateway**: a real HTTP server on an
+ephemeral port, shaped like the real gateway's API, whose answers each test
+controls — a test can hold a submission, keep a job "running", make one fail
+with a specific error, or stage a completion at a chosen moment. Nothing here
+ever touches the gateway on `127.0.0.1:8190`: the client's base URL is
+monkeypatched to the fake server for the duration of every test, and the only
+requests it can see are the ones this suite makes.
 
-The `comfy` fixture also tightens `generation`'s poll cadence: a render takes
+The `gw` fixture also tightens `generation`'s poll cadence: a render takes
 minutes in production, and a two-second poll would make the tests crawl.
 """
 
@@ -27,7 +27,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from persona_studio import comfyui, db, generation, settings
+from persona_studio import db, gateway, generation, settings
 from persona_studio.main import app
 from persona_studio.routes import parties as parties_routes
 
@@ -35,13 +35,14 @@ WAIT = 5.0
 OPENING = "Le port s'ouvre."
 PROMPT = "ruined castle at dusk, blue lantern"
 INSTRUCTION = "Le château en ruine au crépuscule."
+TEMPLATE = "Krea"
 
 
-# --- The fake ComfyUI -----------------------------------------------------------
+# --- The fake comfy-gateway -------------------------------------------------------
 
 
 class _FakeHandler(http.server.BaseHTTPRequestHandler):
-    """Answers the five endpoints the client uses, as the test configured them."""
+    """Answers the gateway endpoints the client uses, as the test configured them."""
 
     def log_message(self, *args: Any) -> None:  # noqa: N802 - stdlib signature
         pass
@@ -59,57 +60,72 @@ class _FakeHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _empty_ok(self) -> None:
-        self.send_response(200)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
-    def _raw(self, body: bytes) -> None:
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html")
+    def _raw(self, body: bytes, status: int = 200, content_type: str = "text/html") -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib signature
-        fake: FakeComfyUI = self.server.fake  # type: ignore[attr-defined]
-        path = self.path.split("?")[0]
-        if path.startswith("/history/"):
-            prompt_id = path.removeprefix("/history/")
-            fake.log(method="GET", path="/history", prompt_id=prompt_id)
+        fake: FakeGateway = self.server.fake  # type: ignore[attr-defined]
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        parts = path.strip("/").split("/")
+        if path == "/api/health":
+            fake.log(method="GET", path="/api/health")
+            self._json({"ok": True, "comfy_url": "http://comfy", "comfy_reachable": fake.comfy_up})
+        elif path == "/api/templates":
+            fake.log(method="GET", path="/api/templates")
             with fake.lock:
-                raw, override = fake.raw_answer, fake.history_answer
+                names = list(fake.templates)
+            self._json([{"id": i + 1, "name": n} for i, n in enumerate(names)])
+        elif path == "/api/templates/latest":
+            name = urllib.parse.parse_qs(parsed.query).get("name", [""])[0]
+            fake.log(method="GET", path="/api/templates/latest", name=name)
+            with fake.lock:
+                names = list(fake.templates)
+                roles = fake.templates.get(name)
+            if roles is None:
+                self._json({"detail": f"there is no template named '{name}'"}, status=404)
+            else:
+                description = {"roles": {r: {} for r in roles}, "role_errors": {}}
+                self._json({"id": names.index(name) + 1, "name": name, "description": description})
+        elif len(parts) == 4 and parts[:2] == ["api", "templates"] and parts[3] == "presets":
+            fake.log(method="GET", path="/api/templates/presets", template_id=parts[2])
+            names = list(fake.templates)
+            name = names[int(parts[2]) - 1]
+            self._json([{"name": p} for p in fake.presets.get(name, [])])
+        elif len(parts) == 3 and parts[:2] == ["api", "jobs"]:
+            job_id = parts[2]
+            fake.log(method="GET", path="/api/jobs/{id}", job_id=job_id)
+            with fake.lock:
+                raw, override = fake.raw_answer, fake.job_answer
+                outcome = fake.outcomes.get(job_id)
             if raw is not None:
                 self._raw(raw)
             elif override is not None:
                 self._json(override)
+            elif job_id in fake.deleted:
+                self._json({"detail": f"there is no job {job_id}"}, status=404)
+            elif outcome is None:
+                self._json({"id": int(job_id), "status": "running", "error": None, "images": []})
             else:
-                with fake.lock:
-                    entry = fake.history_entries.get(prompt_id)
-                self._json({prompt_id: entry} if entry is not None else {})
-        elif path == "/queue":
-            with fake.lock:
-                running, pending = fake.queue_running, fake.queue_pending
-            fake.log(method="GET", path="/queue")
-            self._json({"queue_running": running, "queue_pending": pending})
-        elif path == "/view":
-            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                self._json({"id": int(job_id), **outcome})
+        elif len(parts) == 5 and parts[:2] == ["api", "jobs"] and parts[3] == "images":
+            fake.log(method="GET", path="/api/jobs/{id}/images", job_id=parts[2])
             with fake.lock:
                 status, payload = fake.view_status, fake.view_bytes
-            fake.log(method="GET", path="/view", params=params)
-            self.send_response(status)
-            self.send_header("Content-Type", "image/png")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+            self._raw(payload, status=status, content_type="image/png")
         else:
-            self._json({"error": f"unknown path {path}"}, status=404)
+            self._json({"detail": f"unknown path {path}"}, status=404)
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib signature
-        fake: FakeComfyUI = self.server.fake  # type: ignore[attr-defined]
+        fake: FakeGateway = self.server.fake  # type: ignore[attr-defined]
         body = self._read_body()
-        if self.path == "/prompt":
-            fake.log(method="POST", path="/prompt", body=body)
+        parts = self.path.strip("/").split("/")
+        if self.path == "/api/jobs":
+            fake.log(method="POST", path="/api/jobs", body=body)
             # A test that armed `hold_submit` parks the request thread here,
             # so it can read the database while the submission is in flight.
             if fake.hold_submit.is_set():
@@ -117,43 +133,33 @@ class _FakeHandler(http.server.BaseHTTPRequestHandler):
             with fake.lock:
                 status, payload = fake.submit_status, fake.submit_body
             if status >= 400:
-                self._json({"error": "refused"}, status=status)
+                self._json({"detail": fake.submit_detail}, status=status)
             elif payload is not None:
                 self._json(payload)
             else:
                 # Incrementing ids under the lock: two submissions are two
-                # distinct jobs, which is what a real ComfyUI does and what
-                # the concurrency test below needs to observe.
+                # distinct jobs, as on the real gateway.
                 with fake.lock:
-                    fake._prompt_counter += 1
-                    prompt_id = f"fake-prompt-{fake._prompt_counter}"
-                self._json({"prompt_id": prompt_id, "number": 1, "node_errors": {}})
-        elif self.path == "/interrupt":
-            fake.log(method="POST", path="/interrupt")
-            self._empty_ok()
-        elif self.path == "/queue":
-            fake.log(method="POST", path="/queue", body=body)
-            self._empty_ok()
+                    fake._job_counter += 1
+                    job_id = fake._job_counter
+                self._json({"id": job_id, "status": "queued"}, status=201)
+        elif len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "cancel":
+            fake.log(method="POST", path="/api/jobs/{id}/cancel", job_id=parts[2])
+            self._json({"cancelled": True, "job": {}})
         else:
-            self._json({"error": f"unknown path {self.path}"}, status=404)
-
-    def _empty_ok(self) -> None:
-        self.send_response(200)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+            self._json({"detail": f"unknown path {self.path}"}, status=404)
 
 
-class FakeComfyUI:
-    """A fake ComfyUI on an ephemeral port whose answers each test controls.
+class FakeGateway:
+    """A fake comfy-gateway on an ephemeral port whose answers each test controls.
 
-    State is plain attributes mutated between calls: `history_entries` holds
-    what `GET /history/{id}` answers (no entry = the job is still queued or
-    running), `queue_running` / `queue_pending` hold queue entries as lists
-    whose second element is the prompt id, `submit_status` / `submit_body`
-    shape the `POST /prompt` answer, and the `hold_submit` / `release_submit`
+    State is plain attributes mutated between calls: `outcomes` holds what
+    `GET /api/jobs/{id}` answers for a finished job (no entry = still
+    running), `submit_status` / `submit_detail` / `submit_body` shape the
+    `POST /api/jobs` answer, `templates` maps a template name to its roles and
+    `presets` a name to its presets, and the `hold_submit` / `release_submit`
     event pair parks a submission until the test releases it. Each accepted
-    submission is assigned the next incrementing prompt id, so two live jobs
-    are distinguishable the way they are on the real server.
+    submission gets the next job id, so two live jobs are distinguishable.
     """
 
     def __init__(self) -> None:
@@ -161,18 +167,22 @@ class FakeComfyUI:
         self.requests: list[dict[str, Any]] = []
         self.hold_submit = threading.Event()
         self.release_submit = threading.Event()
-        self._prompt_counter = 0
-        self.submit_status = 200
+        self._job_counter = 0
+        self.submit_status = 201
+        self.submit_detail = "refused"
         self.submit_body: dict[str, Any] | None = None
-        self.history_entries: dict[str, dict[str, Any]] = {}
+        self.outcomes: dict[str, dict[str, Any]] = {}
+        # Jobs deleted from the gateway: their state answers 404.
+        self.deleted: set[str] = set()
         self.view_status = 200
         self.view_bytes = b"fake-png-bytes"
-        # Overrides for the protocol-break tests: `history_answer` replaces
-        # the whole /history JSON, `raw_answer` the whole body.
-        self.history_answer: Any = None
+        self.templates: dict[str, list[str]] = {TEMPLATE: ["prompt", "seed"]}
+        self.presets: dict[str, list[str]] = {TEMPLATE: ["fast"]}
+        self.comfy_up = True
+        # Overrides for the protocol-break tests: `job_answer` replaces the
+        # whole job JSON, `raw_answer` the whole body.
+        self.job_answer: Any = None
         self.raw_answer: bytes | None = None
-        self.queue_running: list[list[Any]] = []
-        self.queue_pending: list[list[Any]] = []
         self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), _FakeHandler)
         self._httpd.fake = self  # type: ignore[attr-defined]
         self.port = int(self._httpd.server_address[1])
@@ -198,31 +208,25 @@ class FakeComfyUI:
     def logged(self, method: str, path: str) -> bool:
         return bool(self.calls(method, path))
 
-    def complete(self, prompt_id: str, filename: str = "scene.png") -> None:
-        """Make the job succeed with one produced image to fetch from /view."""
-        self.history_entries[prompt_id] = {
-            "status": {"status_str": "success", "completed": True, "messages": []},
-            "outputs": {
-                "9": {"images": [{"filename": filename, "subfolder": "", "type": "output"}]}
-            },
-        }
+    def complete(self, job_id: str) -> None:
+        """Make the job succeed with one image to fetch."""
+        with self.lock:
+            self.outcomes[job_id] = {
+                "status": "done",
+                "error": None,
+                "images": [f"/api/jobs/{job_id}/images/0"],
+            }
 
-    def fail(self, prompt_id: str, reason: dict[str, Any]) -> None:
-        """Make the job fail with a real `execution_error` status message."""
-        self.history_entries[prompt_id] = {
-            "status": {
-                "status_str": "error",
-                "completed": False,
-                "messages": [["execution_error", reason]],
-            },
-            "outputs": {},
-        }
+    def fail(self, job_id: str, error: str) -> None:
+        """Make the job fail with the gateway's own error text."""
+        with self.lock:
+            self.outcomes[job_id] = {"status": "error", "error": error, "images": []}
 
 
 @pytest.fixture
-def comfy(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeComfyUI]:
-    fake = FakeComfyUI()
-    monkeypatch.setattr(comfyui, "COMFYUI_BASE_URL", fake.url)
+def gw(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeGateway]:
+    fake = FakeGateway()
+    monkeypatch.setattr(gateway, "GATEWAY_BASE_URL", fake.url)
     monkeypatch.setattr(generation, "POLL_INTERVAL_SECONDS", 0.05)
     yield fake
     fake.close()
@@ -230,15 +234,14 @@ def comfy(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeComfyUI]:
 
 @pytest.fixture(autouse=True)
 def _clean_state(client: TestClient) -> Iterator[None]:
-    """Fresh workflows and settings per test; the suite shares one database.
+    """Fresh settings per test; the suite shares one database.
 
     Depends on `client` so the startup migration has run first. On the way
     out it also asserts that no watcher thread leaked: a daemon thread that
-    outlives the `comfy` fixture would reach the real ComfyUI's address once
-    the fake's URL is undone.
+    outlives the `gw` fixture would reach the real gateway's address once the
+    fake's URL is undone.
     """
     with db.connect() as con:
-        con.execute("DELETE FROM workflow")
         con.execute("DELETE FROM setting")
     yield
     leaked = [t.name for t in threading.enumerate() if t.name.startswith("image-gen-")]
@@ -246,7 +249,6 @@ def _clean_state(client: TestClient) -> Iterator[None]:
     with db.connect() as con:
         con.execute("DELETE FROM image")
         con.execute("DELETE FROM instance")  # cascades messages and variants
-        con.execute("DELETE FROM workflow")
         con.execute("DELETE FROM setting")
     for path in db.IMAGES_DIR.glob("*.png"):
         path.unlink()
@@ -299,25 +301,10 @@ def _stub_stream(monkeypatch: Any, replies: list[str]) -> None:
     monkeypatch.setattr(parties_routes.ollama, "chat_stream", fake_stream)
 
 
-def _setup_ready_workflow() -> str:
-    """Insert a mapped workflow and make it active, straight in the database."""
-    workflow_id = uuid.uuid4().hex
-    graph = {
-        "4": {
-            "class_type": "CheckpointLoaderSimple",
-            "inputs": {"ckpt_name": "model.safetensors"},
-        },
-        "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "a castle", "clip": ["4", 1]}},
-        "7": {"class_type": "KSampler", "inputs": {"seed": 42, "model": ["4", 0]}},
-    }
+def _setup_ready_workflow() -> None:
+    """Choose the fake gateway's template, straight in the database."""
     with db.connect() as con:
-        con.execute(
-            "INSERT INTO workflow (id, name, graph, prompt_node, prompt_field, created_at) "
-            "VALUES (?, 'Krea', ?, '6', 'text', ?)",
-            (workflow_id, json.dumps(graph), time.time()),
-        )
-        settings.set_active_workflow_id(con, workflow_id)
-    return workflow_id
+        settings.set_image_generation(con, TEMPLATE, None)
 
 
 def _create_party(client: TestClient, monkeypatch: Any) -> str:
@@ -388,17 +375,17 @@ def _start_unfinished(client: TestClient, party_id: str) -> tuple[int, str]:
     return message_id, row["gen_id"]
 
 
-def _settle(comfy: FakeComfyUI, message_id: int, prompt_id: str) -> None:
+def _settle(gw: FakeGateway, message_id: int, prompt_id: str) -> None:
     """Finish the job successfully and wait for its watcher to be gone."""
-    comfy.complete(prompt_id)
+    gw.complete(prompt_id)
     assert _wait_watcher_done(message_id)
 
 
-# --- 1. The pending message exists before ComfyUI is ever called -----------------
+# --- 1. The pending message exists before the gateway is ever called --------------
 
 
 def test_pending_message_is_persisted_before_the_submission(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
     """Issue #17's first criterion, observed while the fake server is still
     holding the submission: the row exists, pending, stamped, and without a
@@ -406,7 +393,7 @@ def test_pending_message_is_persisted_before_the_submission(
     party_id = _create_party(client, monkeypatch)
     _setup_ready_workflow()
     # Arming the hold parks the submission; releasing it lets the route answer.
-    comfy.hold_submit.set()
+    gw.hold_submit.set()
 
     holder: dict[str, Any] = {}
 
@@ -419,7 +406,7 @@ def test_pending_message_is_persisted_before_the_submission(
     thread = threading.Thread(target=submit_request)
     thread.start()
 
-    assert _wait_until(lambda: comfy.logged("POST", "/prompt")), "the submission never arrived"
+    assert _wait_until(lambda: gw.logged("POST", "/api/jobs")), "the submission never arrived"
     rows = _image_messages(party_id)
     assert len(rows) == 1
     assert rows[0]["status"] == "pending"
@@ -427,7 +414,7 @@ def test_pending_message_is_persisted_before_the_submission(
     assert rows[0]["image_id"] is None  # the image row only exists once done
     assert rows[0]["gen_id"] is None
 
-    comfy.release_submit.set()
+    gw.release_submit.set()
     thread.join(WAIT)
     assert not thread.is_alive()
 
@@ -440,17 +427,17 @@ def test_pending_message_is_persisted_before_the_submission(
         stored = con.execute(
             "SELECT gen_id, status FROM message WHERE id = ?", (body["message_id"],)
         ).fetchone()
-    assert stored["gen_id"] == "fake-prompt-1"
+    assert stored["gen_id"] == "1"
     assert stored["status"] == "pending"
 
-    _settle(comfy, body["message_id"], "fake-prompt-1")
+    _settle(gw, body["message_id"], "1")
 
 
 # --- 2. The turn is never blocked -------------------------------------------------
 
 
 def test_the_start_returns_immediately_and_the_narrator_waits_for_the_render(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
     """The start still returns at once and the party still answers. What
     changed in V1.3 is the turn: issue #17 asked to keep chatting while an
@@ -464,7 +451,7 @@ def test_the_start_returns_immediately_and_the_narrator_waits_for_the_render(
 
     # The start returned while the job is still unfinished: the fake holds no
     # history entry for it at all.
-    assert comfy.history_entries == {}
+    assert gw.outcomes == {}
 
     # The party endpoint answers, with the pending message in place.
     detail = client.get(f"/api/parties/{party_id}")
@@ -480,18 +467,18 @@ def test_the_start_returns_immediately_and_the_narrator_waits_for_the_render(
     assert turn.json()["detail"] == generation.RENDER_IN_PROGRESS_DETAIL
     assert len(_message_rows(party_id)) == before
 
-    _settle(comfy, message_id, "fake-prompt-1")
+    _settle(gw, message_id, "1")
 
 
 # --- 3. A completion arriving after a cancellation changes nothing ----------------
 
 
 def test_a_completion_after_a_cancellation_is_discarded(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
     """A completion that lands while the message is already cancelled must
     change nothing — status, image row, and disk included. The synchronisation
-    point is the /view fetch: the watcher provably saw the completion before
+    point is the image fetch: the watcher provably saw the completion before
     the assertions below judge what it did with it."""
     party_id = _create_party(client, monkeypatch)
     _setup_ready_workflow()
@@ -502,11 +489,11 @@ def test_a_completion_after_a_cancellation_is_discarded(
     assert row["status"] == "error"
     assert row["error"] == generation.CANCEL_MESSAGE
 
-    comfy.complete(prompt_id)
+    gw.complete(prompt_id)
 
     # The watcher fetched the produced image, then attempted its write
     # against the cancelled message — and left the message exactly as it was.
-    assert _wait_until(lambda: comfy.logged("GET", "/view"))
+    assert _wait_until(lambda: gw.logged("GET", "/api/jobs/{id}/images"))
     assert _wait_watcher_done(message_id)
 
     row = _image_messages(party_id)[0]
@@ -553,18 +540,18 @@ def test_a_result_whose_gen_id_moved_on_is_discarded(client: TestClient, monkeyp
 
 
 def test_a_cancel_during_the_submit_window_stops_the_job_and_stays_cancelled(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
     """A cancel landing while the submission is in flight cannot stop the job:
     the row carries no `gen_id` yet, so the stop path has nothing to aim at.
     When the submission then returns, it must not stamp the id onto the
     cancelled row, must not start a watcher, and must stop the job itself —
-    now that the id is finally known — through the same queue-checked path
-    the cancel uses. Also names the stop path's no-id-yet line: the cancel
-    above runs it with `gen_id` still None, and ComfyUI is asked nothing."""
+    now that the id is finally known — the way the cancel does it. Also names
+    the stop path's no-id-yet line: the cancel above runs it with `gen_id`
+    still None, and the gateway is asked nothing."""
     party_id = _create_party(client, monkeypatch)
     _setup_ready_workflow()
-    comfy.hold_submit.set()
+    gw.hold_submit.set()
 
     holder: dict[str, Any] = {}
 
@@ -574,29 +561,27 @@ def test_a_cancel_during_the_submit_window_stops_the_job_and_stays_cancelled(
 
     thread = threading.Thread(target=submit_request)
     thread.start()
-    assert _wait_until(lambda: comfy.logged("POST", "/prompt")), "the submission never arrived"
+    assert _wait_until(lambda: gw.logged("POST", "/api/jobs")), "the submission never arrived"
 
     # The row is pending and id-less while the submission is held.
     rows = _image_messages(party_id)
     assert len(rows) == 1 and rows[0]["status"] == "pending" and rows[0]["gen_id"] is None
     message_id = rows[0]["id"]
 
-    # The cancel sees no gen_id: it records the cancellation and can do
-    # nothing on ComfyUI. The queue entry staged below is answered only once
-    # the id becomes known — whoever reads it then must act on it.
-    comfy.queue_running = [["entry", "fake-prompt-1"]]
+    # The cancel sees no gen_id: it records the cancellation and can ask the
+    # gateway for nothing yet.
     assert _cancel(client, party_id, message_id).status_code == 200
-    assert comfy.calls("GET", "/queue") == []
+    assert gw.calls("POST", "/api/jobs/{id}/cancel") == []
 
-    comfy.release_submit.set()
+    gw.release_submit.set()
     thread.join(WAIT)
     assert not thread.is_alive()
 
     # Whatever the implementation under test started, end it while the fake
     # is still the addressed server — a red run must never leave a watcher
     # polling the real address.
-    history_calls = comfy.calls("GET", "/history")
-    comfy.complete("fake-prompt-1")
+    history_calls = gw.calls("GET", "/api/jobs/{id}")
+    gw.complete("1")
     assert _wait_until(
         lambda: (
             not any(t.is_alive() and t.name.startswith("image-gen-") for t in threading.enumerate())
@@ -609,12 +594,12 @@ def test_a_cancel_during_the_submit_window_stops_the_job_and_stays_cancelled(
     assert row["error"] == generation.CANCEL_MESSAGE
     assert row["gen_id"] is None, "the job id must not be stamped onto a cancelled row"
     assert history_calls == [], "no watcher may poll a job the cancel already recorded"
-    assert comfy.logged("GET", "/queue"), "the stopped job must be found through the queue"
-    assert comfy.logged("POST", "/interrupt"), "the job must be interrupted once its id is known"
+    cancels = gw.calls("POST", "/api/jobs/{id}/cancel")
+    assert [c["job_id"] for c in cancels] == ["1"], "the job must be cancelled once its id is known"
 
 
 def test_a_refused_submission_after_a_cancel_keeps_the_recorded_cancellation(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
     """The other face of the same window: the submission is refused after a
     cancel already turned the row into a recorded cancellation. The refused
@@ -623,8 +608,8 @@ def test_a_refused_submission_after_a_cancel_keeps_the_recorded_cancellation(
     the story entirely."""
     party_id = _create_party(client, monkeypatch)
     _setup_ready_workflow()
-    comfy.submit_status = 500
-    comfy.hold_submit.set()
+    gw.submit_status = 500
+    gw.hold_submit.set()
 
     holder: dict[str, Any] = {}
 
@@ -634,14 +619,14 @@ def test_a_refused_submission_after_a_cancel_keeps_the_recorded_cancellation(
 
     thread = threading.Thread(target=submit_request)
     thread.start()
-    assert _wait_until(lambda: comfy.logged("POST", "/prompt")), "the submission never arrived"
+    assert _wait_until(lambda: gw.logged("POST", "/api/jobs")), "the submission never arrived"
 
     rows = _image_messages(party_id)
     assert len(rows) == 1 and rows[0]["status"] == "pending" and rows[0]["gen_id"] is None
     message_id = rows[0]["id"]
     assert _cancel(client, party_id, message_id).status_code == 200
 
-    comfy.release_submit.set()
+    gw.release_submit.set()
     thread.join(WAIT)
     assert not thread.is_alive()
 
@@ -650,77 +635,37 @@ def test_a_refused_submission_after_a_cancel_keeps_the_recorded_cancellation(
     assert len(rows) == 1, "the recorded cancellation must not be deleted"
     assert rows[0]["status"] == "error"
     assert rows[0]["error"] == generation.CANCEL_MESSAGE
-    # The job id was never known: the stop path ran with None and ComfyUI was
-    # asked for nothing at all.
-    assert comfy.calls("GET", "/queue") == []
-    assert comfy.calls("POST", "/interrupt") == []
+    # The job id was never known: the stop path ran with None and the gateway
+    # was asked for nothing at all.
+    assert gw.calls("POST", "/api/jobs/{id}/cancel") == []
 
 
-# --- 4. Cancelling acts on the queue only as far as it is safe --------------------
+# --- 4. Cancelling stops the job on the gateway, and only that job ----------------
 
 
-def test_cancelling_a_running_generation_interrupts(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+def test_cancelling_a_generation_cancels_its_gateway_job(
+    gw: FakeGateway, client: TestClient, monkeypatch: Any
 ) -> None:
-    """Our prompt id is the one running: interrupt, and nothing else."""
+    """The gateway cancels a job by id, queued or running, and touches no
+    other render: the cancel asks it for that job and nothing else."""
     party_id = _create_party(client, monkeypatch)
-    message_id = _insert_pending(party_id, "running-job")
-    comfy.queue_running = [["entry", "running-job"]]
+    message_id = _insert_pending(party_id, "41")
 
     response = _cancel(client, party_id, message_id)
 
     assert response.status_code == 200
-    assert comfy.logged("POST", "/interrupt")
-    assert not comfy.logged("POST", "/queue")
+    assert [c["job_id"] for c in gw.calls("POST", "/api/jobs/{id}/cancel")] == ["41"]
     assert _image_messages(party_id)[0]["status"] == "error"
 
 
-def test_cancelling_a_queued_generation_removes_it_without_interrupting(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
-) -> None:
-    """Our prompt id is waiting while someone else's renders: remove the
-    queue entry and do not interrupt — the interrupt would kill the
-    unrelated job. Asserted on what the fake server was asked, which is the
-    criterion itself."""
-    party_id = _create_party(client, monkeypatch)
-    message_id = _insert_pending(party_id, "queued-job")
-    comfy.queue_pending = [["entry", "queued-job"]]
-
-    response = _cancel(client, party_id, message_id)
-
-    assert response.status_code == 200
-    deletes = comfy.calls("POST", "/queue")
-    assert len(deletes) == 1
-    assert deletes[0]["body"] == {"delete": ["queued-job"]}
-    assert not comfy.logged("POST", "/interrupt")
-    assert _image_messages(party_id)[0]["status"] == "error"
-
-
-def test_cancelling_a_generation_not_on_comfyui_asks_it_for_nothing(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
-) -> None:
-    """Our prompt id is in neither list: it finished or never queued —
-    ComfyUI is never mutated. The queue read is the look that makes the
-    decision safe; nothing more is asked of it."""
-    party_id = _create_party(client, monkeypatch)
-    message_id = _insert_pending(party_id, "already-gone")
-
-    response = _cancel(client, party_id, message_id)
-
-    assert response.status_code == 200
-    assert comfy.calls("POST", "/interrupt") == []
-    assert comfy.calls("POST", "/queue") == []
-    assert _image_messages(party_id)[0]["status"] == "error"
-
-
-def test_an_unreachable_comfyui_still_leaves_a_cancelled_message(
+def test_an_unreachable_gateway_still_leaves_a_cancelled_message(
     client: TestClient, monkeypatch: Any
 ) -> None:
-    """Whatever the queue says — including silence — the message itself is
+    """Whatever the gateway says — including silence — the message itself is
     cancelled locally, so the player never sees a spinner forever."""
     party_id = _create_party(client, monkeypatch)
     message_id = _insert_pending(party_id, "some-job")
-    monkeypatch.setattr(comfyui, "COMFYUI_BASE_URL", "http://127.0.0.1:1")
+    monkeypatch.setattr(gateway, "GATEWAY_BASE_URL", "http://127.0.0.1:1")
 
     response = _cancel(client, party_id, message_id)
 
@@ -730,52 +675,44 @@ def test_an_unreachable_comfyui_still_leaves_a_cancelled_message(
     assert row["error"] == generation.CANCEL_MESSAGE
 
 
-def test_the_cancel_is_recorded_locally_before_comfyui_is_touched(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+def test_the_cancel_is_recorded_locally_before_the_gateway_is_touched(
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
     """Pins the order the module docstring states: the row is marked
-    cancelled before the queue is read, so a process death between the two
-    leaves a pending row the next startup heals — never a rendering job a
+    cancelled before the gateway is asked, so a process death between the
+    two leaves a pending row the next startup heals — never a rendering job a
     cancellation never mentioned."""
     party_id = _create_party(client, monkeypatch)
-    message_id = _insert_pending(party_id, "order-job")
-    comfy.queue_running = [["entry", "order-job"]]
+    message_id = _insert_pending(party_id, "7")
 
     observed: list[str] = []
-    real_queue = comfyui.queue
+    real_cancel = gateway.cancel
 
-    def spy_queue() -> comfyui.QueueState:
+    def spy_cancel(job_id: str) -> None:
         with db.connect() as con:
             row = con.execute("SELECT status FROM message WHERE id = ?", (message_id,)).fetchone()
         observed.append(row["status"])
-        return real_queue()
+        real_cancel(job_id)
 
-    monkeypatch.setattr(comfyui, "queue", spy_queue)
+    monkeypatch.setattr(gateway, "cancel", spy_cancel)
 
     assert _cancel(client, party_id, message_id).status_code == 200
-    assert observed == ["error"], "the queue was read before the cancellation was recorded"
+    assert observed == ["error"], "the gateway was asked before the cancellation was recorded"
     assert _image_messages(party_id)[0]["status"] == "error"
 
 
-# --- 5. A failed workflow surfaces ComfyUI's real error --------------------------
+# --- 5. A failed job surfaces the gateway's real error ---------------------------
 
 
-def test_a_failed_execution_surfaces_comfyui_real_error(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+def test_a_failed_job_surfaces_the_gateway_real_error(
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
-    """Issue #17's fifth criterion: the message carries the reason from the
-    history entry — not a timeout, not a generic failure."""
+    """Issue #17's fifth criterion: the message carries the reason the job
+    failed with — not a timeout, not a generic failure."""
     party_id = _create_party(client, monkeypatch)
     _setup_ready_workflow()
-    message_id, prompt_id = _start_unfinished(client, party_id)
-    comfy.fail(
-        prompt_id,
-        {
-            "node_type": "KSampler",
-            "exception_type": "OutOfMemoryError",
-            "exception_message": "CUDA out of memory on device 0",
-        },
-    )
+    message_id, job_id = _start_unfinished(client, party_id)
+    gw.fail(job_id, "KSampler failed: CUDA out of memory on device 0")
 
     assert _wait_until(lambda: _image_messages(party_id)[0]["status"] == "error")
     assert _wait_watcher_done(message_id)
@@ -785,17 +722,32 @@ def test_a_failed_execution_surfaces_comfyui_real_error(
     assert "did not finish within" not in error
 
 
-def test_comfyui_becoming_unreachable_mid_render_fails_the_job_with_its_reason(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+def test_a_job_cancelled_in_the_gateway_fails_the_message(
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
+) -> None:
+    """A job stopped from the gateway's own interface ends the watcher with
+    a message that says where it was stopped."""
+    party_id = _create_party(client, monkeypatch)
+    _setup_ready_workflow()
+    message_id, job_id = _start_unfinished(client, party_id)
+    gw.outcomes[job_id] = {"status": "cancelled", "error": None, "images": []}
+
+    assert _wait_until(lambda: _image_messages(party_id)[0]["status"] == "error")
+    assert _wait_watcher_done(message_id)
+    assert "cancelled in comfy-gateway" in _image_messages(party_id)[0]["error"]
+
+
+def test_the_gateway_becoming_unreachable_mid_render_fails_the_job_with_its_reason(
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
     """Criterion 5's promise applied to the failure mode nothing tested: the
-    watcher is polling and ComfyUI goes away. The first unusable answer fails
+    watcher is polling and the gateway goes away. The first unusable answer fails
     the job with the real reason — not a deadline, not a cancellation."""
     party_id = _create_party(client, monkeypatch)
     _setup_ready_workflow()
     message_id, _ = _start_unfinished(client, party_id)
 
-    monkeypatch.setattr(comfyui, "COMFYUI_BASE_URL", "http://127.0.0.1:1")
+    monkeypatch.setattr(gateway, "GATEWAY_BASE_URL", "http://127.0.0.1:1")
 
     assert _wait_until(lambda: _image_messages(party_id)[0]["status"] == "error")
     assert _wait_watcher_done(message_id)
@@ -805,29 +757,26 @@ def test_comfyui_becoming_unreachable_mid_render_fails_the_job_with_its_reason(
 
 
 def test_a_success_without_any_image_is_a_failure(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
-    """An entry that completed without any output image must not hang the
-    watcher: it is a failure with its own message."""
+    """A job done without any image must not hang the watcher: it is a
+    failure with its own message."""
     party_id = _create_party(client, monkeypatch)
     _setup_ready_workflow()
-    message_id, prompt_id = _start_unfinished(client, party_id)
-    comfy.history_entries[prompt_id] = {
-        "status": {"status_str": "success", "completed": True, "messages": []},
-        "outputs": {},
-    }
+    message_id, job_id = _start_unfinished(client, party_id)
+    gw.outcomes[job_id] = {"status": "done", "error": None, "images": []}
 
     assert _wait_until(lambda: _image_messages(party_id)[0]["status"] == "error")
     assert _wait_watcher_done(message_id)
-    assert "produced no image" in _image_messages(party_id)[0]["error"]
+    assert "returned no image" in _image_messages(party_id)[0]["error"]
     assert list(db.IMAGES_DIR.glob("*.png")) == []
 
 
 def test_the_deadline_expires_with_its_own_message(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: pytest.MonkeyPatch
+    client: TestClient, gw: FakeGateway, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A deadline that genuinely expires is its own message: not ComfyUI's
-    error, not a cancellation."""
+    """A deadline that genuinely expires is its own message: not the
+    gateway's error, not a cancellation."""
     monkeypatch.setattr(generation, "DEADLINE_SECONDS", 0.2)
     party_id = _create_party(client, monkeypatch)
     _setup_ready_workflow()
@@ -838,13 +787,15 @@ def test_the_deadline_expires_with_its_own_message(
     error = _image_messages(party_id)[0]["error"]
     assert "did not finish within" in error
     assert list(db.IMAGES_DIR.glob("*.png")) == []
+    # Abandoned, the job must stop rendering: the narrator is unblocked now.
+    assert gw.logged("POST", "/api/jobs/{id}/cancel")
 
 
 # --- 6. A reload sees the pending image with its original started_at -------------
 
 
 def test_a_reload_sees_the_pending_image_with_its_original_started_at(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
     """The elapsed time comes from the stored `started_at`, so a reload shows
     the true age of the job rather than restarting from zero."""
@@ -865,19 +816,19 @@ def test_a_reload_sees_the_pending_image_with_its_original_started_at(
     assert image_messages[0]["started_at"] == started_at
     assert image_messages[0]["image_id"] is None  # the image row only exists once done
 
-    _settle(comfy, message_id, "fake-prompt-1")
+    _settle(gw, message_id, "1")
 
 
-# --- 7. An unreachable ComfyUI fails the start cleanly ---------------------------
+# --- 7. An unreachable gateway fails the start cleanly ---------------------------
 
 
-def test_an_unreachable_comfyui_leaves_no_pending_message(
+def test_an_unreachable_gateway_leaves_no_pending_message(
     client: TestClient, monkeypatch: Any
 ) -> None:
     party_id = _create_party(client, monkeypatch)
     _setup_ready_workflow()
     before = len(_message_rows(party_id))
-    monkeypatch.setattr(comfyui, "COMFYUI_BASE_URL", "http://127.0.0.1:1")
+    monkeypatch.setattr(gateway, "GATEWAY_BASE_URL", "http://127.0.0.1:1")
 
     response = _start(client, party_id)
 
@@ -888,14 +839,14 @@ def test_an_unreachable_comfyui_leaves_no_pending_message(
 
 
 def test_a_refused_submission_leaves_no_pending_message(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
-    """A ComfyUI that accepts the connection but answers an HTTP error is the
-    same clean failure: 502, nothing left behind."""
+    """A gateway that accepts the connection but answers a server error is
+    the same clean failure: 502, nothing left behind."""
     party_id = _create_party(client, monkeypatch)
     _setup_ready_workflow()
     before = len(_message_rows(party_id))
-    comfy.submit_status = 500
+    gw.submit_status = 500
 
     response = _start(client, party_id)
 
@@ -904,11 +855,11 @@ def test_a_refused_submission_leaves_no_pending_message(
 
 
 def test_a_garbage_submission_answer_is_502(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
     party_id = _create_party(client, monkeypatch)
     _setup_ready_workflow()
-    comfy.submit_body = {"unexpected": "shape"}
+    gw.submit_body = {"unexpected": "shape"}
 
     response = _start(client, party_id)
 
@@ -971,38 +922,52 @@ def test_the_image_route_404s_an_unknown_id(client: TestClient) -> None:
     assert client.get(f"/api/images/{uuid.uuid4().hex}/file").status_code == 404
 
 
-# --- 9. A workflow that cannot generate refuses before anything is written -------
+# --- 9. A setup that cannot generate refuses, and leaves nothing ------------------
 
 
-def test_an_unmapped_workflow_refuses_before_anything_is_written(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+def test_a_template_the_gateway_refuses_leaves_no_pending_message(
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
-    """An imported but unmapped workflow — the refusal carries the exact
-    message the settings page shows — and nothing reaches ComfyUI or the
-    database."""
+    """The gateway refuses the job and says why — here, a template without a
+    prompt role. The player gets that reason as a setup problem (400), and
+    the pending row the start wrote is gone again."""
+    party_id = _create_party(client, monkeypatch)
+    _setup_ready_workflow()
+    gw.submit_status = 400
+    gw.submit_detail = "this template has no 'prompt' role group"
+    before = len(_message_rows(party_id))
+
+    response = _start(client, party_id)
+
+    assert response.status_code == 400
+    assert "has no 'prompt' role group" in response.json()["detail"]
+    assert len(_message_rows(party_id)) == before
+
+
+def test_the_job_names_the_template_its_preset_and_the_prompt(
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
+) -> None:
+    """What reaches the gateway: the chosen template and preset, the prompt
+    as the `prompt` role exactly as the player wrote it, this application's
+    client name, and the request to empty ComfyUI once the job is over, so
+    the narrator finds the card free. Nothing else is sent."""
     party_id = _create_party(client, monkeypatch)
     with db.connect() as con:
-        con.execute(
-            "INSERT INTO workflow (id, name, graph, created_at) VALUES (?, 'Krea', ?, ?)",
-            (
-                uuid.uuid4().hex,
-                json.dumps({"6": {"class_type": "CLIPTextEncode", "inputs": {"text": "x"}}}),
-                time.time(),
-            ),
-        )
-        # The first insert became active on its own; it is unmapped.
-    before = len(_message_rows(party_id))
+        settings.set_image_generation(con, TEMPLATE, "fast")
+    message_id, job_id = _start_unfinished(client, party_id)
 
-    response = _start(client, party_id)
-
-    assert response.status_code == 400
-    assert "No prompt field" in response.json()["detail"]
-    assert len(_message_rows(party_id)) == before
-    assert not comfy.logged("POST", "/prompt")
+    assert gw.calls("POST", "/api/jobs")[0]["body"] == {
+        "template": TEMPLATE,
+        "preset": "fast",
+        "roles": {"prompt": PROMPT},
+        "client": "persona-studio",
+        "free_after": "all",
+    }
+    _settle(gw, message_id, job_id)
 
 
-def test_no_workflow_at_all_refuses_before_anything_is_written(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+def test_no_template_chosen_refuses_before_anything_is_written(
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
     party_id = _create_party(client, monkeypatch)
     before = len(_message_rows(party_id))
@@ -1010,21 +975,22 @@ def test_no_workflow_at_all_refuses_before_anything_is_written(
     response = _start(client, party_id)
 
     assert response.status_code == 400
-    assert "No workflow" in response.json()["detail"]
+    assert "No image template" in response.json()["detail"]
     assert len(_message_rows(party_id)) == before
+    assert not gw.logged("POST", "/api/jobs")
 
 
 # --- The happy path ---------------------------------------------------------------
 
 
 def test_a_completed_render_writes_everything_and_bumps_updated_at(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
     party_id = _create_party(client, monkeypatch)
     _setup_ready_workflow()
     updated_at_before = client.get(f"/api/parties/{party_id}").json()["updated_at"]
     message_id, prompt_id = _start_unfinished(client, party_id)
-    comfy.complete(prompt_id, filename="the-scene.png")
+    gw.complete(prompt_id)
 
     assert _wait_until(lambda: _image_messages(party_id)[0]["status"] == "done")
     assert _wait_watcher_done(message_id)
@@ -1033,7 +999,7 @@ def test_a_completed_render_writes_everything_and_bumps_updated_at(
     image_id = row["image_id"]
     assert image_id is not None
     assert row["error"] is None
-    assert db.image_path(image_id).read_bytes() == comfy.view_bytes
+    assert db.image_path(image_id).read_bytes() == gw.view_bytes
     with db.connect() as con:
         image = con.execute("SELECT * FROM image WHERE id = ?", (image_id,)).fetchone()
         updated_at = con.execute(
@@ -1047,7 +1013,7 @@ def test_a_completed_render_writes_everything_and_bumps_updated_at(
 
 
 def test_a_cancelled_message_then_reloaded_stays_cancelled(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
     """After a cancel, a reload shows the message — not a spinner: the party
     endpoint reports `error` status with the cancellation as its message."""
@@ -1062,96 +1028,66 @@ def test_a_cancelled_message_then_reloaded_stays_cancelled(
     assert message["status"] == "error"
     assert message["error"] == generation.CANCEL_MESSAGE
 
-    # The watcher keeps polling until ComfyUI reports anything; letting the
+    # The watcher keeps polling until the gateway reports anything; letting the
     # (already discarded) completion through is what ends it.
-    comfy.complete("fake-prompt-1")
+    gw.complete("1")
     assert _wait_watcher_done(message_id)
 
 
 # --- The client against the fake: the shapes the watcher relies on -----------------
 
 
-def test_the_client_parses_a_complete_history_entry(comfy: FakeComfyUI) -> None:
-    """A real entry's `outputs` map is read tolerantly: malformed nodes and
-    items are skipped, and missing subfolder/type fall back to what /view
-    needs to be asked with."""
-    comfy.history_entries["p1"] = {
-        "status": {"status_str": "success", "completed": True, "messages": []},
-        "outputs": {
-            "9": {
-                "images": [
-                    {"filename": "a.png", "subfolder": "out", "type": "output"},
-                    {"filename": "b.png"},
-                    "junk",
-                ]
-            },
-            "junk-node": "not an object",
-            "10": {"images": "not a list"},
-        },
-    }
-    entry = comfyui.history("p1")
-    assert entry is not None
-    assert entry.completed is True
-    assert entry.error is None
-    assert entry.images == [
-        comfyui.ImageRef("a.png", "out", "output"),
-        comfyui.ImageRef("b.png", "", "output"),
-    ]
+def test_the_client_reads_a_job_tolerantly(gw: FakeGateway) -> None:
+    """Missing or malformed fields read as absent rather than breaking."""
+    gw.job_answer = {"status": "done", "error": 3, "images": ["/a", 4, "/b"]}
+    state = gateway.job("1")
+    assert state == gateway.JobState(status="done", error=None, images=["/a", "/b"])
 
 
-def test_a_history_entry_without_a_status_object_is_a_protocol_break(comfy: FakeComfyUI) -> None:
-    comfy.history_entries["p1"] = {"outputs": {}}
-    with pytest.raises(comfyui.ComfyUIError, match="status object"):
-        comfyui.history("p1")
+def test_a_job_answer_without_a_status_is_a_protocol_break(gw: FakeGateway) -> None:
+    gw.job_answer = {"images": []}
+    with pytest.raises(gateway.GatewayError, match="job response shape"):
+        gateway.job("1")
 
 
-def test_a_history_entry_that_is_not_an_object_is_a_protocol_break(comfy: FakeComfyUI) -> None:
-    comfy.history_entries["p1"] = "junk"
-    with pytest.raises(comfyui.ComfyUIError, match="entry shape"):
-        comfyui.history("p1")
+def test_a_non_json_answer_is_a_protocol_break(gw: FakeGateway) -> None:
+    gw.raw_answer = b"<html>oops</html>"
+    with pytest.raises(gateway.GatewayError, match="non-JSON"):
+        gateway.job("1")
 
 
-def test_a_history_answer_that_is_not_an_object_is_a_protocol_break(comfy: FakeComfyUI) -> None:
-    comfy.history_answer = ["a", "list"]
-    with pytest.raises(comfyui.ComfyUIError, match="history response"):
-        comfyui.history("p1")
+def test_a_job_deleted_from_the_gateway_fails_the_message_with_its_reason(
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
+) -> None:
+    party_id = _create_party(client, monkeypatch)
+    _setup_ready_workflow()
+    message_id, job_id = _start_unfinished(client, party_id)
+    gw.deleted.add(job_id)
+
+    assert _wait_until(lambda: _image_messages(party_id)[0]["status"] == "error")
+    assert _wait_watcher_done(message_id)
+    assert f"there is no job {job_id}" in _image_messages(party_id)[0]["error"]
 
 
-def test_a_non_json_answer_is_a_protocol_break(comfy: FakeComfyUI) -> None:
-    comfy.raw_answer = b"<html>oops</html>"
-    with pytest.raises(comfyui.ComfyUIError, match="non-JSON"):
-        comfyui.history("p1")
+def test_an_image_error_is_surfaced_with_its_status(gw: FakeGateway) -> None:
+    gw.view_status = 503
+    with pytest.raises(gateway.GatewayError, match="503"):
+        gateway.image_bytes("/api/jobs/1/images/0")
 
 
-def test_a_view_error_is_surfaced_with_its_status(comfy: FakeComfyUI) -> None:
-    comfy.view_status = 503
-    with pytest.raises(comfyui.ComfyUIError, match="/view"):
-        comfyui.image_bytes(comfyui.ImageRef("a.png", "", "output"))
+def test_an_unreachable_gateway_is_surfaced(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gateway, "GATEWAY_BASE_URL", "http://127.0.0.1:1")
+    with pytest.raises(gateway.GatewayUnreachable, match="unreachable"):
+        gateway.image_bytes("/api/jobs/1/images/0")
 
 
-def test_an_unreachable_view_is_surfaced(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(comfyui, "COMFYUI_BASE_URL", "http://127.0.0.1:1")
-    with pytest.raises(comfyui.ComfyUIUnreachable):
-        comfyui.image_bytes(comfyui.ImageRef("a.png", "", "output"))
-
-
-def test_queue_entries_that_carry_no_prompt_id_are_skipped(comfy: FakeComfyUI) -> None:
-    comfy.queue_running = [["x"], ["x", 3], "junk", ["a", "b", "c"]]
-    comfy.queue_pending = [["ok", "waiting"]]
-    state = comfyui.queue()
-    assert state.running == ["b"]
-    assert state.pending == ["waiting"]
-
-
-def test_the_error_reason_falls_back_when_the_fields_are_missing() -> None:
-    assert comfyui._error_from_messages("junk") is None
-    assert comfyui._error_from_messages([["other", {}]]) is None
-    assert comfyui._error_from_messages([["execution_error", {"node_id": "9"}]]) == (
-        "9: unknown error"
-    )
-    assert comfyui._error_from_messages([["execution_error", {"exception_type": "OOM"}]]) == (
-        "?: OOM"
-    )
+def test_a_template_without_a_prompt_role_says_so(gw: FakeGateway) -> None:
+    gw.templates["Bare"] = ["seed"]
+    assert gateway.template(TEMPLATE).problem is None
+    problem = gateway.template("Bare").problem
+    assert problem is not None and "no prompt role" in problem
+    with pytest.raises(gateway.GatewayRefused, match="no template named"):
+        gateway.template("Unknown")
 
 
 # --- The startup recovery ----------------------------------------------------------
@@ -1175,53 +1111,32 @@ def test_recovery_marks_every_pending_image_failed(client: TestClient, monkeypat
     assert any("while the image was rendering" in error for error in errors)
 
 
-def test_startup_stops_a_render_that_was_still_live(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+def test_startup_cancels_a_job_that_was_still_live(
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
     """A restart abandons a live render's record — the prompt lived only in
-    the dead thread's memory — but the render itself can still be stopped.
-    Before a pending row is marked error, its job goes through the same
-    queue-checked stop the cancel uses: running means interrupt."""
+    the dead thread's memory — but the job itself can still be stopped.
+    Before a pending row is marked error, its job is cancelled on the
+    gateway, the way the cancel does it."""
     party_id = _create_party(client, monkeypatch)
-    _insert_pending(party_id, "still-live-job")
-    comfy.queue_running = [["entry", "still-live-job"]]
+    _insert_pending(party_id, "12")
 
     generation.recover_pending()
 
-    assert comfy.logged("GET", "/queue")
-    assert comfy.logged("POST", "/interrupt")
-    assert not comfy.logged("POST", "/queue")
+    assert [c["job_id"] for c in gw.calls("POST", "/api/jobs/{id}/cancel")] == ["12"]
     row = _image_messages(party_id)[0]
     assert row["status"] == "error"
     assert "while the image was rendering" in row["error"]
 
 
-def test_startup_stops_a_merely_queued_job_by_removing_it(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
-) -> None:
-    """The same recovery, for a job that never started rendering: removed
-    from the queue, and never interrupted."""
-    party_id = _create_party(client, monkeypatch)
-    _insert_pending(party_id, "still-queued-job")
-    comfy.queue_pending = [["entry", "still-queued-job"]]
-
-    generation.recover_pending()
-
-    deletes = comfy.calls("POST", "/queue")
-    assert len(deletes) == 1
-    assert deletes[0]["body"] == {"delete": ["still-queued-job"]}
-    assert not comfy.logged("POST", "/interrupt")
-    assert _image_messages(party_id)[0]["status"] == "error"
-
-
-def test_startup_recovery_completes_even_when_comfyui_is_unreachable(
+def test_startup_recovery_completes_even_when_the_gateway_is_unreachable(
     client: TestClient, monkeypatch: Any
 ) -> None:
-    """The stop attempt must not prevent the recovery: an unreachable ComfyUI
+    """The stop attempt must not prevent the recovery: an unreachable gateway
     still leaves every pending row marked failed."""
     party_id = _create_party(client, monkeypatch)
     _insert_pending(party_id, "unreachable-job")
-    monkeypatch.setattr(comfyui, "COMFYUI_BASE_URL", "http://127.0.0.1:1")
+    monkeypatch.setattr(gateway, "GATEWAY_BASE_URL", "http://127.0.0.1:1")
 
     generation.recover_pending()
 
@@ -1265,7 +1180,7 @@ def test_a_done_message_whose_file_is_missing_becomes_an_error_at_startup(
 
 
 def test_two_live_generations_keep_their_own_rows_files_and_outcomes(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
     """Two concurrent generations are independent end to end: their own rows,
     their own `gen_id`s (the fake assigns incrementing ids), their own files.
@@ -1291,8 +1206,8 @@ def test_two_live_generations_keep_their_own_rows_files_and_outcomes(
     assert rows[0]["status"] == "error"
     assert rows[1]["status"] == "pending"
 
-    comfy.complete(first_prompt)
-    comfy.complete(second_prompt, filename="second.png")
+    gw.complete(first_prompt)
+    gw.complete(second_prompt)
 
     assert _wait_watcher_done(first_id)
     assert _wait_watcher_done(second_id)
@@ -1301,7 +1216,7 @@ def test_two_live_generations_keep_their_own_rows_files_and_outcomes(
     assert rows[0]["image_id"] is None
     assert rows[1]["status"] == "done"
     assert rows[1]["gen_id"] == second_prompt
-    assert db.image_path(rows[1]["image_id"]).read_bytes() == comfy.view_bytes
+    assert db.image_path(rows[1]["image_id"]).read_bytes() == gw.view_bytes
     assert [p.name for p in db.IMAGES_DIR.glob("*.png")] == [f"{rows[1]['image_id']}.png"]
 
 
@@ -1334,58 +1249,56 @@ def test_cancelling_a_done_or_text_message_is_400(client: TestClient, monkeypatc
     assert _cancel(client, party_id, opening_id).status_code == 400
 
 
-# --- Freeing the narrator's VRAM before a render --------------------------------
+# --- Freeing Ollama's VRAM before a render ---------------------------------------
 #
-# Measured by the user on this machine: a chat model still resident when a
-# diffusion pipeline loads is an out-of-memory error, not a slowdown.
+# Measured on this machine: a chat model still resident when a diffusion
+# pipeline loads is an out-of-memory error, or layers pushed onto the CPU.
 
 
-def test_starting_a_generation_evicts_the_narration_model(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+def test_starting_a_generation_empties_ollama_before_submitting(
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
-    """The wiring, through the real `start`: the eviction happens, and it
-    happens before ComfyUI is asked to render anything."""
-    unloaded: list[str] = []
-    monkeypatch.setattr(generation.ollama, "unload", lambda model: unloaded.append(model))
+    """The wiring, through the real `start`: every Ollama model is unloaded,
+    and before the gateway is asked to render anything."""
+    order: list[str] = []
+    monkeypatch.setattr(
+        generation.gpu.ollama, "unload_all", lambda: order.append("unload_all") or []
+    )
+    real_submit = gateway.submit
+
+    def spy_submit(*args: Any, **kwargs: Any) -> str:
+        order.append("submit")
+        return real_submit(*args, **kwargs)
+
+    monkeypatch.setattr(gateway, "submit", spy_submit)
     _setup_ready_workflow()
     party_id = _create_party(client, monkeypatch)
 
     message_id, prompt_id = _start_unfinished(client, party_id)
     try:
-        assert unloaded == ["test-model"], "the narrator was not evicted before the submission"
+        assert order == ["unload_all", "submit"]
     finally:
-        _settle(comfy, message_id, prompt_id)
+        _settle(gw, message_id, prompt_id)
 
 
 def test_an_eviction_that_fails_does_not_fail_the_generation(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
     """Best effort on purpose. At that point the pending message is committed
     and the player has asked for a render: an unreachable Ollama must not turn
     that into an error, and it is holding no VRAM to begin with."""
 
-    def boom(model: str) -> None:
-        raise generation.ollama.OllamaUnreachable("Ollama est injoignable")
+    def boom() -> list[str]:
+        raise generation.gpu.ollama.OllamaUnreachable("Ollama est injoignable")
 
-    monkeypatch.setattr(generation.ollama, "unload", boom)
+    monkeypatch.setattr(generation.gpu.ollama, "unload_all", boom)
     _setup_ready_workflow()
     party_id = _create_party(client, monkeypatch)
 
     message_id, prompt_id = _start_unfinished(client, party_id)
-    _settle(comfy, message_id, prompt_id)
+    _settle(gw, message_id, prompt_id)
 
     assert _image_messages(party_id)[0]["status"] == "done"
-
-
-def test_no_configured_model_means_nothing_to_evict(monkeypatch: Any) -> None:
-    """Nothing is loaded, so there is nothing to unload and Ollama is not
-    contacted at all."""
-    called: list[str] = []
-    monkeypatch.setattr(generation.ollama, "unload", lambda model: called.append(model))
-
-    generation._evict_narrator(None)
-
-    assert called == []
 
 
 # --- Deleting an image (V1.2) ----------------------------------------------------
@@ -1394,23 +1307,21 @@ def test_no_configured_model_means_nothing_to_evict(monkeypatch: Any) -> None:
 # this. The PNG goes with the row, and only after the transaction commits.
 
 
-def _completed_image(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
-) -> tuple[str, int, str]:
+def _completed_image(client: TestClient, gw: FakeGateway, monkeypatch: Any) -> tuple[str, int, str]:
     """A party with one finished image. Returns (party_id, message_id, image_id)."""
     _setup_ready_workflow()
     party_id = _create_party(client, monkeypatch)
     message_id, prompt_id = _start_unfinished(client, party_id)
-    _settle(comfy, message_id, prompt_id)
+    _settle(gw, message_id, prompt_id)
     row = _image_messages(party_id)[0]
     assert row["status"] == "done"
     return party_id, message_id, row["image_id"]
 
 
 def test_deleting_an_image_removes_its_message_row_and_file(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
-    party_id, message_id, image_id = _completed_image(client, comfy, monkeypatch)
+    party_id, message_id, image_id = _completed_image(client, gw, monkeypatch)
     assert db.image_path(image_id).is_file()
 
     response = client.delete(f"/api/parties/{party_id}/images/{message_id}")
@@ -1423,11 +1334,11 @@ def test_deleting_an_image_removes_its_message_row_and_file(
 
 
 def test_deleting_an_image_leaves_the_story_alone(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
     """Images are messages, so a delete that reached too far would take the
     narration with it."""
-    party_id, message_id, _ = _completed_image(client, comfy, monkeypatch)
+    party_id, message_id, _ = _completed_image(client, gw, monkeypatch)
     before = [row["id"] for row in _message_rows(party_id) if row["kind"] == "text"]
 
     client.delete(f"/api/parties/{party_id}/images/{message_id}")
@@ -1437,7 +1348,7 @@ def test_deleting_an_image_leaves_the_story_alone(
 
 
 def test_a_generation_still_running_is_refused_rather_than_torn_out(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
     """Its watcher is about to write to that row. A completion landing on a
     deleted message is a state nothing here handles, so the delete refuses and
@@ -1452,11 +1363,11 @@ def test_a_generation_still_running_is_refused_rather_than_torn_out(
         assert "Cancel it" in response.json()["detail"]
         assert _image_messages(party_id)[0]["status"] == "pending"
     finally:
-        _settle(comfy, message_id, prompt_id)
+        _settle(gw, message_id, prompt_id)
 
 
 def test_a_cancelled_image_can_be_deleted(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
     """The way out the refusal names has to actually work.
 
@@ -1468,7 +1379,7 @@ def test_a_cancelled_image_can_be_deleted(
     party_id = _create_party(client, monkeypatch)
     message_id, prompt_id = _start_unfinished(client, party_id)
     assert _cancel(client, party_id, message_id).status_code == 200
-    comfy.complete(prompt_id)
+    gw.complete(prompt_id)
     assert _wait_watcher_done(message_id)
     assert _image_messages(party_id)[0]["status"] == "error"
 
@@ -1477,7 +1388,7 @@ def test_a_cancelled_image_can_be_deleted(
 
 
 def test_deleting_a_text_message_through_the_image_route_is_refused(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
     _setup_ready_workflow()
     party_id = _create_party(client, monkeypatch)
@@ -1490,7 +1401,7 @@ def test_deleting_a_text_message_through_the_image_route_is_refused(
 
 
 def test_deleting_an_unknown_image_is_404(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
     _setup_ready_workflow()
     party_id = _create_party(client, monkeypatch)
@@ -1506,7 +1417,7 @@ def test_deleting_an_unknown_image_is_404(
 
 
 def test_every_narrator_call_is_refused_during_a_render(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
     _setup_ready_workflow()
     party_id = _create_party(client, monkeypatch)
@@ -1530,17 +1441,17 @@ def test_every_narrator_call_is_refused_during_a_render(
             assert response.status_code == 409, f"{name} answered {response.status_code}"
             assert response.json()["detail"] == generation.RENDER_IN_PROGRESS_DETAIL
     finally:
-        _settle(comfy, message_id, prompt_id)
+        _settle(gw, message_id, prompt_id)
 
 
 def test_the_narrator_answers_again_once_the_render_is_done(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
     """A guard that never lets go would be worse than the out-of-memory."""
     _setup_ready_workflow()
     party_id = _create_party(client, monkeypatch)
     message_id, prompt_id = _start_unfinished(client, party_id)
-    _settle(comfy, message_id, prompt_id)
+    _settle(gw, message_id, prompt_id)
 
     _stub_stream(monkeypatch, ["Le quai s'éveille."])
     turn = client.post(f"/api/parties/{party_id}/messages", json={"content": "J'avance."})
@@ -1550,7 +1461,7 @@ def test_the_narrator_answers_again_once_the_render_is_done(
 
 
 def test_a_render_in_another_party_blocks_this_one_too(
-    client: TestClient, comfy: FakeComfyUI, monkeypatch: Any
+    client: TestClient, gw: FakeGateway, monkeypatch: Any
 ) -> None:
     """The GPU is one card, not one per party."""
     _setup_ready_workflow()
@@ -1562,4 +1473,4 @@ def test_a_render_in_another_party_blocks_this_one_too(
         turn = client.post(f"/api/parties/{other}/messages", json={"content": "J'avance."})
         assert turn.status_code == 409
     finally:
-        _settle(comfy, message_id, prompt_id)
+        _settle(gw, message_id, prompt_id)

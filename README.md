@@ -23,7 +23,7 @@ leaving the host.
 | [uv](https://docs.astral.sh/uv/) | installs and pins Python 3.14 |
 | [pnpm](https://pnpm.io/) | Node 24 |
 | [Ollama](https://ollama.com/) | narration — needs at least one chat model pulled |
-| [ComfyUI](https://github.com/comfyanonymous/ComfyUI) | images — optional, chat works without it |
+| comfy-gateway (`~/Projets/comfy-gateway`), with [ComfyUI](https://github.com/comfyanonymous/ComfyUI) behind it | images — optional, chat works without it. Send a workflow to the gateway, then choose it in the settings |
 
 ## Getting started
 

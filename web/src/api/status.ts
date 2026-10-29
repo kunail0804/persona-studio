@@ -9,7 +9,7 @@ export interface ServiceState {
 
 export interface ServiceStatus {
   ollama: ServiceState;
-  comfyui: ServiceState;
+  gateway: ServiceState;
 }
 
 function parseServiceState(data: unknown, field: string): ServiceState {
@@ -27,7 +27,7 @@ export function getServiceStatus(signal?: AbortSignal): Promise<ServiceStatus> {
       if (!isRecord(data)) throw new Error("Expected a service status object");
       return {
         ollama: parseServiceState(data.ollama, "ollama"),
-        comfyui: parseServiceState(data.comfyui, "comfyui"),
+        gateway: parseServiceState(data.gateway, "gateway"),
       };
     },
     { signal },

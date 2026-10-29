@@ -13,8 +13,10 @@ rules are enforced here rather than trusted to callers:
 from __future__ import annotations
 
 import json
+import time
 import weakref
 from collections.abc import Generator, Iterator
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -35,8 +37,14 @@ class OllamaUnreachable(OllamaError):
     """Ollama could not be reached. The message carries the underlying reason."""
 
 
-def _request_json(method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
-    with httpx.Client(base_url=OLLAMA_BASE_URL, timeout=TIMEOUT) as client:
+def _request_json(
+    method: str,
+    path: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    timeout: httpx.Timeout = TIMEOUT,
+) -> Any:
+    with httpx.Client(base_url=OLLAMA_BASE_URL, timeout=timeout) as client:
         try:
             response = client.request(method, path, json=payload)
         except httpx.HTTPError as exc:
@@ -118,6 +126,58 @@ def unload(model: str) -> None:
     if response.status_code >= 400:
         detail = response.text.strip()[:500] or response.reason_phrase
         raise OllamaError(f"Ollama returned HTTP {response.status_code}: {detail}")
+
+
+@dataclass(frozen=True)
+class LoadedModel:
+    """One model Ollama holds in memory, and how much of it sits in VRAM."""
+
+    name: str
+    size_vram: int
+
+
+def loaded_models() -> list[LoadedModel]:
+    """The models Ollama holds in memory right now (`GET /api/ps`)."""
+    data = _request_json("GET", "/api/ps", timeout=UNLOAD_TIMEOUT)
+    if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+        raise OllamaError("Unexpected /api/ps response shape")
+    loaded = []
+    for entry in data["models"]:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("model") or entry.get("name")
+        size_vram = entry.get("size_vram")
+        if isinstance(name, str) and name:
+            loaded.append(
+                LoadedModel(name=name, size_vram=size_vram if isinstance(size_vram, int) else 0)
+            )
+    return loaded
+
+
+# How long `unload_all` waits for Ollama to let go of its models. Ollama
+# answers the unload request before the model is gone; `/api/ps` is what
+# says when it is.
+UNLOAD_WAIT_SECONDS = 15.0
+UNLOAD_POLL_SECONDS = 0.25
+
+
+def unload_all() -> list[str]:
+    """Unload every model Ollama holds, not only the narrator's, and wait.
+
+    Any loaded model takes VRAM a render needs: one left by another
+    application, or the previous narration model after a change in the
+    settings. Returns the names still loaded once the wait is over, so an
+    empty list means the memory was given back. Raises the module's two
+    errors when Ollama cannot be asked.
+    """
+    for model in loaded_models():
+        unload(model.name)
+    deadline = time.monotonic() + UNLOAD_WAIT_SECONDS
+    while True:
+        remaining = [model.name for model in loaded_models()]
+        if not remaining or time.monotonic() >= deadline:
+            return remaining
+        time.sleep(UNLOAD_POLL_SECONDS)
 
 
 def chat(
